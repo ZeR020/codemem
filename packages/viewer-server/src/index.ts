@@ -21,6 +21,7 @@ import {
 } from "./request-rate-limit.js";
 import { configRoutes } from "./routes/config.js";
 import { memoryRoutes } from "./routes/memory.js";
+import { memoryToolRoutes } from "./routes/memory-tools.js";
 import { observerStatusRoutes } from "./routes/observer-status.js";
 import { rawEventsRoutes } from "./routes/raw-events.js";
 import { statsRoutes } from "./routes/stats.js";
@@ -106,6 +107,7 @@ export function createApp(opts?: AppOptions) {
 	// API routes
 	app.route("/", statsRoutes(storeFactory));
 	app.route("/", memoryRoutes(storeFactory));
+	app.route("/", memoryToolRoutes(storeFactory));
 	app.route(
 		"/",
 		observerStatusRoutes({
