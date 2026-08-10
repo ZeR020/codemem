@@ -497,13 +497,13 @@ export function rawEventsRoutes(getStore: StoreFactory, sweeper?: RawEventSweepe
 
 		const store = getStore();
 		try {
-			const opencodeSessionId = envelope.session_stream_id;
+			const sessionStreamId = envelope.session_stream_id;
 			// Assert/normalize source server-side — never trust a caller-supplied source.
 			const source = "pi";
 			const strippedPayload = stripPrivateObj(envelope.payload) as Record<string, unknown>;
 
 			const inserted = store.recordRawEvent({
-				opencodeSessionId,
+				opencodeSessionId: sessionStreamId,
 				source,
 				eventId: envelope.event_id,
 				eventType: envelope.event_type,
@@ -512,7 +512,7 @@ export function rawEventsRoutes(getStore: StoreFactory, sweeper?: RawEventSweepe
 			});
 
 			store.updateRawEventSessionMeta({
-				opencodeSessionId,
+				opencodeSessionId: sessionStreamId,
 				source,
 				cwd: envelope.cwd,
 				project: envelope.project,
@@ -520,7 +520,7 @@ export function rawEventsRoutes(getStore: StoreFactory, sweeper?: RawEventSweepe
 				lastSeenTsWallMs: envelope.ts_wall_ms,
 			});
 
-			nudgeSweeper(sweeper, [opencodeSessionId], source);
+			nudgeSweeper(sweeper, [sessionStreamId], source);
 
 			return c.json({ inserted: inserted ? 1 : 0, skipped: 0 });
 		} catch (err) {

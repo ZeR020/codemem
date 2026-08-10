@@ -70,21 +70,51 @@ async function httpOrCli(
 	return cli();
 }
 
-function parseCliJson(stdout: string): unknown {
+/**
+ * Parse CLI stdout that may contain log lines before a JSON payload.
+ * Scans candidate JSON value starts in document order and returns the first
+ * suffix that parses — handling nested top-level objects/arrays correctly
+ * (lastIndexOf picks inner objects and breaks on `{"items":[{"id":1}]}`).
+ */
+export function parseCliJson(stdout: string): unknown {
 	const trimmed = stdout.trim();
 	if (!trimmed) return null;
-	// CLI may emit logs before JSON — take the last {...} or [...] block.
-	const objStart = trimmed.lastIndexOf("{");
-	const arrStart = trimmed.lastIndexOf("[");
-	const start = Math.max(objStart, arrStart);
-	if (start < 0) return trimmed;
-	return JSON.parse(trimmed.slice(start));
+	for (let i = 0; i < trimmed.length; i++) {
+		const ch = trimmed[i];
+		if (ch !== "{" && ch !== "[") continue;
+		try {
+			return JSON.parse(trimmed.slice(i));
+		} catch {
+			// not a parseable suffix — keep scanning
+		}
+	}
+	return trimmed;
 }
 
 function paramsOf(params: unknown): Record<string, unknown> {
 	return params != null && typeof params === "object" && !Array.isArray(params)
 		? (params as Record<string, unknown>)
 		: {};
+}
+
+/**
+ * Build a memory_distill_candidates request body. `all_projects` and `project`
+ * are mutually exclusive server-side (memory-tools.ts / MCP distill guard), so
+ * client/session project must NOT be attached when all_projects is requested.
+ */
+export function buildDistillBody(
+	params: Record<string, unknown>,
+	clientProject?: string,
+): Record<string, unknown> {
+	const body = { ...(params as Record<string, unknown>) };
+	if (params.all_projects === true || params.all_projects === "true") {
+		delete body.project;
+		return body;
+	}
+	if (typeof body.project !== "string" || !body.project.trim()) {
+		if (clientProject) body.project = clientProject;
+	}
+	return body;
 }
 
 export function registerMemoryTools(pi: ExtensionAPI, client: PiCodememClient): string[] {
@@ -821,12 +851,10 @@ export function registerMemoryTools(pi: ExtensionAPI, client: PiCodememClient): 
 			async execute(_id, rawParams, signal) {
 				const params = paramsOf(rawParams);
 				return withToolError("memory_distill_candidates", async () => {
-					const body = {
-						...(params as Record<string, unknown>),
-						project:
-							projectOrClient(params as Record<string, unknown>, client) ??
-							(params as { project?: string }).project,
-					};
+					const body = buildDistillBody(
+						params as Record<string, unknown>,
+						client.project ?? undefined,
+					);
 					return httpOrCli(
 						client,
 						signal,
