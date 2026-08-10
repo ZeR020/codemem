@@ -36,6 +36,8 @@ import {
 	showMemoryCommand,
 } from "./commands/memory.js";
 import { packCommand, promptPackLedgerCommand } from "./commands/pack.js";
+import { piHookIngestCommand } from "./commands/pi-hook-ingest.js";
+import { piHookInjectCommand } from "./commands/pi-hook-inject.js";
 import { recentCommand } from "./commands/recent.js";
 import { searchCommand } from "./commands/search.js";
 import { serveCommand } from "./commands/serve.js";
@@ -59,6 +61,8 @@ completion.on("command", ({ reply }) => {
 		"claude-hook-ingest",
 		"codex-hook-inject",
 		"codex-hook-ingest",
+		"pi-hook-inject",
+		"pi-hook-ingest",
 		"config",
 		"coordinator",
 		"db",
@@ -202,6 +206,8 @@ program.addCommand(claudeHookIngestCommand);
 program.addCommand(claudeHookFileContextCommand);
 program.addCommand(codexHookInjectCommand);
 program.addCommand(codexHookIngestCommand);
+program.addCommand(piHookInjectCommand);
+program.addCommand(piHookIngestCommand);
 program.addCommand(dbCommand);
 program.addCommand(distillCommand);
 program.addCommand(exportMemoriesCommand);
