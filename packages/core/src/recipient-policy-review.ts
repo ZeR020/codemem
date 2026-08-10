@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import type { Database } from "./db.js";
 import {
+	isLegacyUmbrellaScopeKind,
 	type LegacyRecipientPolicyConditionCodeV1,
 	type LegacyRecipientPolicyConditionV1,
 	type LegacyRecipientPolicyProjectionV1,
@@ -76,6 +77,10 @@ export interface RecipientPolicyReviewBulkResultV1 {
 export interface RecipientPolicyDerivedReviewState {
 	allReviewItems: RecipientPolicyActionableReviewItemV1[];
 	blockedItems: RecipientPolicyBlockedItemV1[];
+	preservedDiagnosticFindings: Array<{
+		canonicalProjectIdentity: string;
+		conditionCode: LegacyRecipientPolicyConditionCodeV1;
+	}>;
 }
 
 interface StoredResolution {
@@ -95,6 +100,39 @@ const DECISIONS = new Set<RecipientPolicyReviewDecisionV1>([
 	"create_identity",
 	"remove_stale_device",
 ]);
+
+type RecipientPolicyConditionPresentation =
+	| "actionable"
+	| "repairable_blocked"
+	| "preserved_continuity";
+
+const CONDITION_PRESENTATION = {
+	suggest_local_identity: "actionable",
+	suggest_team_candidate: "actionable",
+	unassigned_effective_device: "actionable",
+	ambiguous_multi_project_scope: "repairable_blocked",
+	wildcard_scope_mapping: "preserved_continuity",
+	noncanonical_project_identity: "repairable_blocked",
+	ambiguous_scope_mapping: "repairable_blocked",
+	inactive_scope_boundary: "repairable_blocked",
+} as const satisfies Record<
+	LegacyRecipientPolicyConditionCodeV1,
+	RecipientPolicyConditionPresentation
+>;
+
+function conditionPresentation(
+	condition: LegacyRecipientPolicyConditionV1,
+): RecipientPolicyConditionPresentation {
+	if (
+		condition.code === "ambiguous_multi_project_scope" &&
+		condition.scopeKinds != null &&
+		condition.scopeKinds.length > 0 &&
+		condition.scopeKinds.every(isLegacyUmbrellaScopeKind)
+	) {
+		return "preserved_continuity";
+	}
+	return CONDITION_PRESENTATION[condition.code];
+}
 
 function canonicalJson(value: unknown): string {
 	if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
@@ -306,22 +344,34 @@ function blockedOwner(code: LegacyRecipientPolicyConditionCodeV1): {
 	ownerLabel: string;
 	repairAction: string;
 } {
-	if (code === "noncanonical_project_identity") {
-		return {
-			ownerLabel: "Project owner",
-			repairAction: "Assign a stable canonical Project identity.",
-		};
+	switch (code) {
+		case "noncanonical_project_identity":
+			return {
+				ownerLabel: "Project owner",
+				repairAction: "Assign a stable canonical Project identity.",
+			};
+		case "inactive_scope_boundary":
+			return {
+				ownerLabel: "Scope owner",
+				repairAction: "Restore or replace the inactive enforcement boundary.",
+			};
+		case "ambiguous_multi_project_scope":
+			return {
+				ownerLabel: "Local administrator",
+				repairAction:
+					"Assign each Project to its own managed scope and move its memories out of the shared boundary.",
+			};
+		case "ambiguous_scope_mapping":
+			return {
+				ownerLabel: "Local administrator",
+				repairAction: "Repair the ambiguous legacy Project-to-scope mapping in Advanced settings.",
+			};
+		case "suggest_local_identity":
+		case "suggest_team_candidate":
+		case "unassigned_effective_device":
+		case "wildcard_scope_mapping":
+			throw new Error(`Condition ${code} is not repairable.`);
 	}
-	if (code === "inactive_scope_boundary") {
-		return {
-			ownerLabel: "Scope owner",
-			repairAction: "Restore or replace the inactive enforcement boundary.",
-		};
-	}
-	return {
-		ownerLabel: "Local administrator",
-		repairAction: "Repair the ambiguous legacy Project-to-scope mapping in Advanced settings.",
-	};
 }
 
 export function deriveRecipientPolicyReviewState(
@@ -332,13 +382,23 @@ export function deriveRecipientPolicyReviewState(
 	const memoryCounts = memoryCountsByProject(db);
 	const allReviewItems: RecipientPolicyActionableReviewItemV1[] = [];
 	const blockedItems: RecipientPolicyBlockedItemV1[] = [];
+	const preservedDiagnosticFindings: RecipientPolicyDerivedReviewState["preservedDiagnosticFindings"] =
+		[];
 	for (const projection of projections) {
 		const memoryCount = memoryCounts.get(projection.project.canonicalIdentity) ?? 0;
 		const hasDiagnostic = projection.conditions.some(
 			(condition) => condition.kind === "diagnostic",
 		);
 		for (const condition of projection.conditions) {
-			if (condition.kind === "diagnostic") {
+			const presentation = conditionPresentation(condition);
+			if (presentation === "preserved_continuity") {
+				preservedDiagnosticFindings.push({
+					canonicalProjectIdentity: projection.project.canonicalIdentity,
+					conditionCode: condition.code,
+				});
+				continue;
+			}
+			if (presentation === "repairable_blocked") {
 				blockedItems.push({
 					version: RECIPIENT_POLICY_CONTRACT_VERSION,
 					blockedItemId: digest("recipient-policy-blocked-v1", [
@@ -391,7 +451,7 @@ export function deriveRecipientPolicyReviewState(
 			}
 		}
 	}
-	return { allReviewItems, blockedItems };
+	return { allReviewItems, blockedItems, preservedDiagnosticFindings };
 }
 
 function hasResolution(db: Database, item: RecipientPolicyActionableReviewItemV1): boolean {
@@ -411,7 +471,7 @@ export function listRecipientPolicyReview(
 ): RecipientPolicyReviewListV1 {
 	const state = deriveRecipientPolicyReviewState(db, context);
 	const reviewItems = state.allReviewItems.filter((item) => !hasResolution(db, item));
-	const findingCount = reviewItems.length;
+	const findingCount = reviewItems.length + state.preservedDiagnosticFindings.length;
 	return {
 		version: RECIPIENT_POLICY_CONTRACT_VERSION,
 		reviewItems,
