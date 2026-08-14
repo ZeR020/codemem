@@ -13,6 +13,12 @@ export interface DeviceAvailabilityInput {
 	state: DeviceAvailabilityState;
 }
 
+export interface DevicePeerRuntimeMetadataInput {
+	deviceId: string;
+	runtimeVersion: string | null;
+	runtimeVersionObservedAt: string | null;
+}
+
 export interface DevicesProjectInput {
 	canonicalProjectIdentity: string;
 	displayName: string;
@@ -23,11 +29,12 @@ export interface DevicesRendererOptions {
 	loadError?: boolean;
 	refreshError?: boolean;
 	onNavigate?: (target: DevicesNavigationTarget) => void;
+	peerRuntimeMetadata?: DevicePeerRuntimeMetadataInput[];
 }
 
 export interface DeviceProjectProjection {
+	canonicalProjectIdentity: string;
 	displayName: string;
-	teamNames: string[];
 	state: RecipientPolicyReconciliationReadState;
 	statusLabel: string;
 	statusCopy: string;
@@ -40,6 +47,9 @@ export interface DeviceProjection {
 	identityName: string;
 	availability: DeviceAvailabilityState;
 	availabilityLabel: string;
+	isPairedPeer: boolean;
+	reportedRuntimeVersion: string | null;
+	runtimeVersionObservedAt: string | null;
 	directProjects: DeviceProjectProjection[];
 	inheritedProjects: DeviceProjectProjection[];
 	unavailableProjectCount: number;
@@ -118,21 +128,20 @@ export function projectDevices(
 	reconciliation: RecipientPolicyReconciliationStatusV1,
 	projects: DevicesProjectInput[],
 	availabilityInput: DeviceAvailabilityInput[],
+	peerRuntimeMetadataInput: DevicePeerRuntimeMetadataInput[] = [],
 ): DevicesProjection {
 	const identityNames = new Map(
 		intent.identities
 			.filter((item) => item.status === "active" && item.mergedIntoIdentityId === null)
 			.map((item) => [item.identityId, item.displayName]),
 	);
-	const teamNames = new Map(
-		intent.teams
-			.filter((item) => item.status === "active")
-			.map((item) => [item.teamId, item.displayName]),
-	);
 	const projectNames = new Map(
 		projects.map((item) => [item.canonicalProjectIdentity, item.displayName]),
 	);
 	const availability = new Map(availabilityInput.map((item) => [item.deviceId, item.state]));
+	const peerRuntimeMetadata = new Map(
+		peerRuntimeMetadataInput.map((item) => [item.deviceId, item]),
+	);
 	const statuses = new Map(
 		reconciliation.items.map((item) => [item.canonicalProjectIdentity, item]),
 	);
@@ -140,16 +149,7 @@ export function projectDevices(
 	const devices = intent.identityDevices
 		.filter((device) => device.status === "active" && identityNames.has(device.identityId))
 		.map((device): DeviceProjection => {
-			const activeTeamIds = new Set(
-				intent.teamMemberships
-					.filter(
-						(item) =>
-							item.status === "active" &&
-							item.identityId === device.identityId &&
-							teamNames.has(item.teamId),
-					)
-					.map((item) => item.teamId),
-			);
+			const runtimeMetadata = peerRuntimeMetadata.get(device.deviceId);
 			const directProjectIds = uniqueSorted(
 				intent.projectRecipients
 					.filter(
@@ -160,31 +160,13 @@ export function projectDevices(
 					)
 					.map((item) => item.canonicalProjectIdentity),
 			);
-			const inheritedTeamIdsByProject = new Map<string, Set<string>>();
-			for (const edge of intent.projectRecipients) {
-				if (
-					edge.status !== "active" ||
-					edge.recipientKind !== "team" ||
-					!activeTeamIds.has(edge.teamId)
-				) {
-					continue;
-				}
-				const ids = inheritedTeamIdsByProject.get(edge.canonicalProjectIdentity) ?? new Set();
-				ids.add(edge.teamId);
-				inheritedTeamIdsByProject.set(edge.canonicalProjectIdentity, ids);
-			}
-			const toProject = (projectId: string, inheritedTeamIds: Iterable<string> = []) => {
+			const toProject = (projectId: string) => {
 				const displayName = projectNames.get(projectId);
 				if (!displayName) return null;
 				const status = projectStatus(projectId, statuses);
 				return {
+					canonicalProjectIdentity: projectId,
 					displayName,
-					teamNames: uniqueSorted(
-						[...inheritedTeamIds].flatMap((teamId) => {
-							const name = teamNames.get(teamId);
-							return name ? [name] : [];
-						}),
-					),
 					state: status.state,
 					statusLabel: status.label,
 					statusCopy: status.explanation,
@@ -195,12 +177,9 @@ export function projectDevices(
 				const project = toProject(projectId);
 				return project ? [project] : [];
 			});
-			const inheritedProjects = uniqueSorted(inheritedTeamIdsByProject.keys()).flatMap(
-				(projectId) => {
-					const project = toProject(projectId, inheritedTeamIdsByProject.get(projectId));
-					return project ? [project] : [];
-				},
-			);
+			// Team eligibility is intentionally absent until this surface receives
+			// authoritative effective-device facts rather than membership intent.
+			const inheritedProjects: DeviceProjectProjection[] = [];
 			const allProjects = [...directProjects, ...inheritedProjects];
 			const status = overallStatus(allProjects);
 			const deviceAvailability = availability.get(device.deviceId) ?? "unknown";
@@ -210,13 +189,17 @@ export function projectDevices(
 				identityName: identityNames.get(device.identityId) ?? "Identity unavailable",
 				availability: deviceAvailability,
 				availabilityLabel: AVAILABILITY_LABELS[deviceAvailability],
+				isPairedPeer: runtimeMetadata !== undefined,
+				reportedRuntimeVersion: runtimeMetadata?.runtimeVersion ?? null,
+				runtimeVersionObservedAt: runtimeMetadata?.runtimeVersionObservedAt ?? null,
 				directProjects,
 				inheritedProjects,
-				unavailableProjectCount:
-					directProjectIds.length + inheritedTeamIdsByProject.size - allProjects.length,
+				unavailableProjectCount: directProjectIds.length - directProjects.length,
 				statusState: status?.state ?? "no_projects",
-				statusLabel: status?.statusLabel ?? "No shared Projects",
-				statusCopy: status?.statusCopy ?? "This device has no current Project access.",
+				statusLabel: status?.statusLabel ?? "No directly shared Projects",
+				statusCopy:
+					status?.statusCopy ??
+					"Team access is not shown here without authoritative per-device eligibility.",
 				deliveredCopiesMayRemain: allProjects.some((project) => project.deliveredCopiesMayRemain),
 				action: actionForDevice(deviceAvailability, status?.state ?? "no_projects"),
 			};
@@ -239,9 +222,8 @@ function ProjectList({ empty, projects }: { empty: string; projects: DeviceProje
 	return (
 		<ul>
 			{projects.map((project) => (
-				<li key={`${project.displayName}:${project.teamNames.join(":")}`}>
+				<li key={project.canonicalProjectIdentity}>
 					<strong>{project.displayName}</strong>
-					{project.teamNames.length ? ` through ${project.teamNames.join(", ")}` : ""}
 					<span className="small">
 						{" "}
 						— {project.statusLabel}. {project.statusCopy}
@@ -317,6 +299,12 @@ function DevicesView({
 										<dt>Availability</dt>
 										<dd>{device.availabilityLabel}</dd>
 									</div>
+									{device.isPairedPeer ? (
+										<div>
+											<dt>Codemem version</dt>
+											<dd>{device.reportedRuntimeVersion ?? "Not reported"}</dd>
+										</div>
+									) : null}
 									<div>
 										<dt>Sharing status</dt>
 										<dd>
@@ -334,7 +322,7 @@ function DevicesView({
 								<section aria-labelledby={`${titleId}-teams`}>
 									<h4 id={`${titleId}-teams`}>Projects through Teams</h4>
 									<ProjectList
-										empty="No Projects are inherited through Teams."
+										empty="Per-device Team access is not shown because Team membership alone does not prove this device receives the Team’s Projects."
 										projects={device.inheritedProjects}
 									/>
 								</section>
@@ -396,7 +384,13 @@ export function mountDevices(
 		focusedElement instanceof HTMLElement && mount.contains(focusedElement)
 			? deviceActionFocusIdentities.get(focusedElement)
 			: undefined;
-	const projection = projectDevices(intent, reconciliation, projects, availability);
+	const projection = projectDevices(
+		intent,
+		reconciliation,
+		projects,
+		availability,
+		options.peerRuntimeMetadata,
+	);
 	render(
 		<section
 			aria-labelledby="devices-heading"

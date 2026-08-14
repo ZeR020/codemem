@@ -15,6 +15,7 @@ import {
 	resolveDbPath,
 	runSyncDaemon,
 } from "@codemem/core";
+import type { ReconcileConfiguredCoordinatorEnrollmentResult } from "@codemem/server";
 import { Command, Option } from "commander";
 import { helpStyle } from "../help-style.js";
 import {
@@ -24,17 +25,18 @@ import {
 	emitDeprecationWarning,
 } from "../shared-options.js";
 import {
+	isLoopbackHost,
+	parseViewerPidRecord,
+	probeCodememViewerLiveness,
+	type ViewerPidRecord,
+	viewerUrl,
+} from "../viewer-runtime.js";
+import {
 	type LegacyServeOptions,
 	type ResolvedServeInvocation,
 	resolveServeInvocation,
 	type ServeAction,
 } from "./serve-invocation.js";
-
-interface ViewerPidRecord {
-	pid: number;
-	host: string;
-	port: number;
-}
 
 export function extractViewerPid(payload: unknown): number | null {
 	if (!payload || typeof payload !== "object") return null;
@@ -55,13 +57,7 @@ export function isLocalHost(host: string): boolean {
 }
 
 export function isLoopbackOnlyHost(host: string): boolean {
-	const normalized = host.trim().toLowerCase();
-	return (
-		normalized === "localhost" ||
-		/^127(?:\.\d{1,3}){0,3}$/.test(normalized) ||
-		normalized === "::1" ||
-		normalized === "0:0:0:0:0:0:0:1"
-	);
+	return isLoopbackHost(host);
 }
 
 function warnIfViewerExposed(host: string, port: number): void {
@@ -193,22 +189,11 @@ export function commandHasExactDbPath(command: string, dbPath: string): boolean 
 function readViewerPidRecord(dbPath: string): ViewerPidRecord | null {
 	const pidPath = pidFilePath(dbPath);
 	if (!existsSync(pidPath)) return null;
-	const raw = readFileSync(pidPath, "utf-8").trim();
-	try {
-		const parsed = JSON.parse(raw) as Partial<ViewerPidRecord>;
-		if (
-			typeof parsed.pid === "number" &&
-			typeof parsed.host === "string" &&
-			typeof parsed.port === "number"
-		) {
-			return { pid: parsed.pid, host: parsed.host, port: parsed.port };
-		}
-	} catch {
-		const pid = Number.parseInt(raw, 10);
-		if (Number.isFinite(pid) && pid > 0) {
-			return { pid, host: "127.0.0.1", port: 38888 };
-		}
-	}
+	// Shared strict parser keeps `serve` and `codemem status` agreeing on
+	// what counts as a valid viewer PID record.
+	const parsed = parseViewerPidRecord(readFileSync(pidPath, "utf-8"));
+	if (parsed.state === "valid") return parsed.record;
+	if (parsed.state === "legacy") return { pid: parsed.pid, host: "127.0.0.1", port: 38888 };
 	return null;
 }
 function normalizeViewerHost(host: string): string {
@@ -249,28 +234,22 @@ function isProcessRunning(pid: number): boolean {
 	}
 }
 
-async function respondsLikeCodememViewer(record: ViewerPidRecord): Promise<boolean> {
-	try {
-		const controller = new AbortController();
-		const timer = setTimeout(() => controller.abort(), 1000);
-		const res = await fetch(`http://${record.host}:${record.port}/api/stats`, {
-			signal: controller.signal,
-		});
-		clearTimeout(timer);
-		return res.ok;
-	} catch {
-		return false;
-	}
+export async function respondsLikeCodememViewer(
+	record: ViewerPidRecord,
+	fetchImpl: typeof fetch = fetch,
+): Promise<boolean> {
+	const result = await probeCodememViewerLiveness(record, {
+		fetch: fetchImpl,
+		timeoutMs: 1000,
+	});
+	return result.state === "live";
 }
 
 async function lookupViewerPidFromStats(host: string, port: number): Promise<number | null> {
 	try {
-		const controller = new AbortController();
-		const timer = setTimeout(() => controller.abort(), 1000);
-		const res = await fetch(`http://${host}:${port}/api/stats`, {
-			signal: controller.signal,
+		const res = await fetch(viewerUrl({ host, port }, "/api/stats"), {
+			signal: AbortSignal.timeout(1000),
 		});
-		clearTimeout(timer);
 		if (!res.ok) return null;
 		const payload = await res.json();
 		return extractViewerPid(payload);
@@ -517,7 +496,12 @@ export function sqliteVecFailureDiagnostics(error: unknown, dbPath: string): str
 
 export interface ServeCoordinatorMaintenanceResult {
 	projectShares: { processed: number; failed: number };
-	coordinatorEnrollment: { groupsProcessed: number; failedGroups: number; issues?: number };
+	coordinatorEnrollment: {
+		groupsProcessed: number;
+		failedGroups: number;
+		issues?: number;
+		failures?: ReconcileConfiguredCoordinatorEnrollmentResult["failures"];
+	};
 	recipientPolicies: { processed: number; failed: number };
 }
 
@@ -532,9 +516,12 @@ export async function runServeCoordinatorMaintenance(
 			store: MemoryStore,
 			options: { limit: number },
 		) => Promise<{ processed: number; failed: number }>;
-		reconcileConfiguredCoordinatorEnrollment: (
-			store: MemoryStore,
-		) => Promise<{ groupsProcessed: number; failedGroups: number; issues?: number }>;
+		reconcileConfiguredCoordinatorEnrollment: (store: MemoryStore) => Promise<{
+			groupsProcessed: number;
+			failedGroups: number;
+			issues?: number;
+			failures?: ReconcileConfiguredCoordinatorEnrollmentResult["failures"];
+		}>;
 	},
 ): Promise<ServeCoordinatorMaintenanceResult> {
 	const projectShares = await dependencies.advancePendingProjectShares(store, { limit: 3 });
@@ -548,11 +535,24 @@ export async function runServeCoordinatorMaintenance(
 			`share operation maintenance failed for ${projectShares.failed} of ${projectShares.processed} operations`,
 		);
 	}
-	if (coordinatorEnrollment.failedGroups > 0 || enrollmentIssues > 0) {
+	if (coordinatorEnrollment.failedGroups > 0) {
 		const groupLabel = coordinatorEnrollment.failedGroups === 1 ? "group" : "groups";
 		const issueLabel = enrollmentIssues === 1 ? "issue" : "issues";
+		const failures = coordinatorEnrollment.failures ?? [];
+		const failureDetail = failures.length
+			? ` [${failures
+					.slice(0, 3)
+					.map((failure) => `${failure.groupId}:${failure.stage}:${failure.code}`)
+					.join(", ")}${failures.length > 3 ? `, +${failures.length - 3} more` : ""}]`
+			: "";
 		throw new Error(
-			`coordinator enrollment maintenance failed for ${coordinatorEnrollment.failedGroups} ${groupLabel} with ${enrollmentIssues} reconciliation ${issueLabel}`,
+			`coordinator enrollment maintenance failed for ${coordinatorEnrollment.failedGroups} ${groupLabel} with ${enrollmentIssues} reconciliation ${issueLabel}${failureDetail}`,
+		);
+	}
+	if (enrollmentIssues > 0) {
+		const issueLabel = enrollmentIssues === 1 ? "issue" : "issues";
+		throw new Error(
+			`coordinator enrollment reconciliation found ${enrollmentIssues} ${issueLabel}`,
 		);
 	}
 	if (recipientPolicies.failed > 0) {

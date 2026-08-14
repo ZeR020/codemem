@@ -29,9 +29,9 @@ On the coordinator host:
 
 ```fish
 rm ~/.codemem/coordinator.sqlite
-codemem sync coordinator group-create my-team --db-path ~/.codemem/coordinator.sqlite
+codemem coordinator group-create my-team --db-path ~/.codemem/coordinator.sqlite
 set -x CODEMEM_SYNC_COORDINATOR_ADMIN_SECRET (openssl rand -base64 32)
-codemem sync coordinator serve --db-path ~/.codemem/coordinator.sqlite --host 0.0.0.0 --port 7347
+codemem coordinator serve --db-path ~/.codemem/coordinator.sqlite --coordinator-host 0.0.0.0 --coordinator-port 7347
 ```
 
 If you do not want to expose the raw host directly, put it behind Tailscale Funnel or Cloudflare Tunnel and use that
@@ -60,7 +60,7 @@ block you because private-network deployments can still be valid.
 On the admin device:
 
 ```fish
-codemem sync coordinator create-invite my-team --db-path ~/.codemem/coordinator.sqlite
+codemem coordinator create-invite my-team --db-path ~/.codemem/coordinator.sqlite
 ```
 
 This returns:
@@ -76,7 +76,7 @@ Share the encoded invite with the teammate device.
 On the teammate device:
 
 ```fish
-codemem sync coordinator import-invite <encoded-invite>
+codemem coordinator import-invite <encoded-invite>
 ```
 
 Expected result:
@@ -94,8 +94,8 @@ out, check reachability of the invite’s `coordinator_url` from the teammate ma
 If the invite policy is `approval_required`, on the admin host:
 
 ```fish
-codemem sync coordinator list-join-requests my-team --db-path ~/.codemem/coordinator.sqlite
-codemem sync coordinator approve-join-request <request-id> --db-path ~/.codemem/coordinator.sqlite
+codemem coordinator list-join-requests my-team --db-path ~/.codemem/coordinator.sqlite
+codemem coordinator approve-join-request <request-id> --db-path ~/.codemem/coordinator.sqlite
 ```
 
 ## 6. Inspect the discovered device (Advanced)
@@ -122,7 +122,8 @@ discovered device again once the row refreshes.
 For the normal teammate workflow, share exact Projects in **Sharing**, then inspect **Devices** and **Health**:
 
 - the device has an owning **Identity**
-- each Project is labeled **Direct** or **Team** inheritance
+- Projects shared directly appear in **Devices** under **Direct Projects**
+- Team recipient intent appears in **Sharing**; authoritative per-device Team eligibility remains in Team policy administration
 - an unavailable device is **Waiting**, not failed
 - **Needs attention** means a terminal setup failure and exposes a retry action
 
@@ -188,7 +189,7 @@ Treat the Linux/Node path as validated only when all of this is true:
 - teammate can import the invite successfully
 - devices appear in coordinator discovery
 - discovered device can be accepted into `sync_peers`
-- Devices shows the owning Identity and Direct/Team Project inheritance
+- Devices shows the owning Identity and direct Project access; Sharing shows Team inheritance
 - Health distinguishes waiting from needs-attention recovery
 - a direct sync run is triggered successfully
 - data actually replicates between devices

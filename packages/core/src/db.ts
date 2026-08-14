@@ -36,7 +36,7 @@ import {
 export type { DatabaseType as Database };
 
 /** Current schema version this TS runtime was built against. */
-export const SCHEMA_VERSION = 17;
+export const SCHEMA_VERSION = 19;
 
 /**
  * Minimum schema version the TS runtime can operate with.
@@ -251,7 +251,14 @@ export function connect(dbPath: string = DEFAULT_DB_PATH): DatabaseType {
  * Read-tuning pragmas are still applied because they are per-connection and do
  * not write to the file. Schema readiness is validated read-only.
  */
-export function connectReadOnly(dbPath: string = DEFAULT_DB_PATH): DatabaseType {
+export interface ReadOnlyConnectionOptions {
+	warn?: (message: string) => void;
+}
+
+export function connectReadOnly(
+	dbPath: string = DEFAULT_DB_PATH,
+	options: ReadOnlyConnectionOptions = {},
+): DatabaseType {
 	const db = new Database(dbPath, { readonly: true, fileMustExist: true });
 	try {
 		db.pragma("foreign_keys = ON");
@@ -260,7 +267,7 @@ export function connectReadOnly(dbPath: string = DEFAULT_DB_PATH): DatabaseType 
 		db.pragma("cache_size = -65536");
 		db.pragma("mmap_size = 1073741824");
 		db.pragma("temp_store = MEMORY");
-		assertSchemaReadyReadOnly(db);
+		assertSchemaReadyReadOnly(db, options.warn);
 		return db;
 	} catch (error) {
 		db.close();
@@ -272,7 +279,10 @@ export function connectReadOnly(dbPath: string = DEFAULT_DB_PATH): DatabaseType 
  * Validate schema readiness without any writes (no bootstrap, no migration).
  * Mirrors {@link assertSchemaReady} but is safe on read-only connections.
  */
-export function assertSchemaReadyReadOnly(db: DatabaseType): void {
+export function assertSchemaReadyReadOnly(
+	db: DatabaseType,
+	warn: (message: string) => void = console.warn,
+): void {
 	const version = getSchemaVersion(db);
 	if (version === 0) {
 		throw new Error(
@@ -286,7 +296,7 @@ export function assertSchemaReadyReadOnly(db: DatabaseType): void {
 		);
 	}
 	if (version > SCHEMA_VERSION) {
-		console.warn(
+		warn(
 			`Database schema version ${version} is newer than this TS runtime (${SCHEMA_VERSION}). ` +
 				"Running in read-only compatibility mode.",
 		);
@@ -578,6 +588,87 @@ function addColumnIfMissing(
 	}
 }
 
+const RECIPIENT_POLICY_DEVICE_ELIGIBILITY_COMPATIBILITY_ERROR =
+	"recipient_policy_device_eligibility_schema_incompatible";
+
+export const IDENTITY_DEVICE_ASSIGNMENT_TRIGGERS_DDL = `
+	DROP TRIGGER IF EXISTS trg_identity_devices_assignment_version;
+	CREATE TRIGGER trg_identity_devices_assignment_version
+	AFTER UPDATE OF identity_id ON identity_devices
+	WHEN NEW.identity_id <> OLD.identity_id
+	BEGIN
+		UPDATE identity_devices
+		SET assignment_version = OLD.assignment_version + 1
+		WHERE device_id = NEW.device_id;
+	END;
+	DROP TRIGGER IF EXISTS trg_identity_devices_purge_decisions;
+	CREATE TRIGGER trg_identity_devices_purge_decisions
+	AFTER DELETE ON identity_devices
+	BEGIN
+		DELETE FROM policy_team_device_decisions WHERE device_id = OLD.device_id;
+	END;
+`;
+
+function ensureIdentityDeviceAssignmentVersionTriggers(db: DatabaseType): void {
+	if (
+		!tableExists(db, "identity_devices") ||
+		!columnExists(db, "identity_devices", "identity_id") ||
+		!columnExists(db, "identity_devices", "assignment_version") ||
+		!tableExists(db, "policy_team_device_decisions") ||
+		!columnExists(db, "policy_team_device_decisions", "device_id")
+	) {
+		return;
+	}
+	db.transaction(() => db.exec(IDENTITY_DEVICE_ASSIGNMENT_TRIGGERS_DDL)).immediate();
+}
+
+function assertRecipientPolicyDeviceEligibilityCompatibility(db: DatabaseType): void {
+	const recipientPolicySchemaPresent = [
+		"policy_teams",
+		"policy_team_memberships",
+		"identity_devices",
+		"project_recipients",
+		"policy_team_device_decisions",
+	].some((table) => tableExists(db, table));
+	if (!recipientPolicySchemaPresent) return;
+
+	const missing: string[] = [];
+	for (const [table, column] of [
+		["policy_teams", "device_eligibility_mode"],
+		["identity_devices", "assignment_version"],
+	] as const) {
+		try {
+			if (!columnExists(db, table, column)) missing.push(`${table}.${column}`);
+		} catch {
+			missing.push(`${table}.${column}`);
+		}
+	}
+	for (const column of ["team_id", "device_id", "decision", "assignment_version"]) {
+		try {
+			if (!columnExists(db, "policy_team_device_decisions", column)) {
+				missing.push(`policy_team_device_decisions.${column}`);
+			}
+		} catch {
+			missing.push(`policy_team_device_decisions.${column}`);
+		}
+	}
+	if (missing.length > 0) {
+		throw new Error(
+			`${RECIPIENT_POLICY_DEVICE_ELIGIBILITY_COMPATIBILITY_ERROR}:${missing.join(",")}`,
+		);
+	}
+}
+
+/**
+ * Repair display-only peer version metadata independently of the compatibility
+ * marker because these additive columns intentionally do not bump the schema.
+ */
+function ensureSyncPeerRuntimeVersionColumns(db: DatabaseType): void {
+	if (!tableExists(db, "sync_peers")) return;
+	addColumnIfMissing(db, "sync_peers", "runtime_version", "TEXT");
+	addColumnIfMissing(db, "sync_peers", "runtime_version_observed_at", "TEXT");
+}
+
 /**
  * Has the additive compatibility shim already run for the current SCHEMA_VERSION?
  *
@@ -733,6 +824,9 @@ export function ensureAdditiveSchemaCompatibility(db: DatabaseType): void {
 			);
 		}
 	}
+	// Always run: current-marker databases may predate these no-version-bump
+	// columns, so the schema_compat_state gate cannot prove they exist.
+	ensureSyncPeerRuntimeVersionColumns(db);
 	const compatAlreadyApplied = schemaCompatAlreadyApplied(db);
 	if (!compatAlreadyApplied) {
 		// IMPORTANT: any NEW DDL added to this gated block REQUIRES bumping
@@ -786,6 +880,7 @@ export function ensureAdditiveSchemaCompatibility(db: DatabaseType): void {
 				team_id TEXT PRIMARY KEY NOT NULL,
 				display_name TEXT NOT NULL,
 				status TEXT NOT NULL,
+				device_eligibility_mode TEXT NOT NULL DEFAULT 'person_all_devices',
 				provenance TEXT NOT NULL,
 				revision TEXT NOT NULL,
 				migration_state TEXT NOT NULL,
@@ -816,11 +911,25 @@ export function ensureAdditiveSchemaCompatibility(db: DatabaseType): void {
 				provenance TEXT NOT NULL,
 				revision TEXT NOT NULL,
 				migration_state TEXT NOT NULL,
+				assignment_version INTEGER NOT NULL DEFAULT 0,
 				source_fingerprint TEXT,
 				idempotency_key TEXT NOT NULL UNIQUE,
 				created_at TEXT NOT NULL,
 				updated_at TEXT NOT NULL
 			);
+			CREATE TABLE IF NOT EXISTS policy_team_device_decisions (
+				team_id TEXT NOT NULL REFERENCES policy_teams(team_id) ON DELETE CASCADE,
+				device_id TEXT NOT NULL,
+				decision TEXT NOT NULL,
+				assignment_version INTEGER NOT NULL DEFAULT 0,
+				provenance TEXT NOT NULL,
+				revision TEXT NOT NULL,
+				created_at TEXT NOT NULL,
+				updated_at TEXT NOT NULL,
+				PRIMARY KEY (team_id, device_id)
+			);
+			CREATE INDEX IF NOT EXISTS idx_policy_team_device_decisions_device
+				ON policy_team_device_decisions(device_id);
 			CREATE TABLE IF NOT EXISTS project_recipients (
 				canonical_project_identity TEXT NOT NULL,
 				recipient_kind TEXT NOT NULL,
@@ -903,6 +1012,8 @@ export function ensureAdditiveSchemaCompatibility(db: DatabaseType): void {
 				ON identity_devices(identity_id, status);
 			CREATE INDEX IF NOT EXISTS idx_project_recipients_project_status
 				ON project_recipients(canonical_project_identity, status);
+			CREATE INDEX IF NOT EXISTS idx_project_recipients_recipient_status
+				ON project_recipients(recipient_kind, recipient_id, status);
 			CREATE TABLE IF NOT EXISTS recipient_managed_project_projections (
 				canonical_project_identity TEXT NOT NULL,
 				display_name TEXT NOT NULL,
@@ -978,6 +1089,17 @@ export function ensureAdditiveSchemaCompatibility(db: DatabaseType): void {
 		`);
 		} catch {
 			// Keep compatibility shim fail-open for additive share-operation state.
+		}
+		for (const [table, name, definition] of [
+			["policy_teams", "device_eligibility_mode", "TEXT NOT NULL DEFAULT 'person_all_devices'"],
+			["identity_devices", "assignment_version", "INTEGER NOT NULL DEFAULT 0"],
+			["policy_team_device_decisions", "assignment_version", "INTEGER NOT NULL DEFAULT 0"],
+		] as const) {
+			try {
+				addColumnIfMissing(db, table, name, definition);
+			} catch {
+				// Continue repairing independent recipient-policy columns.
+			}
 		}
 		const shareOperationColumns = [
 			["state", "TEXT NOT NULL DEFAULT 'waiting_for_acceptance'"],
@@ -1499,6 +1621,7 @@ export function ensureAdditiveSchemaCompatibility(db: DatabaseType): void {
 			"coordinator_enrollment_reconciliation_issues",
 			"policy_teams",
 			"policy_team_memberships",
+			"policy_team_device_decisions",
 			"identity_devices",
 			"project_recipients",
 			"recipient_managed_project_projections",
@@ -1510,8 +1633,14 @@ export function ensureAdditiveSchemaCompatibility(db: DatabaseType): void {
 		if (recipientPolicyTablesReady && currentVersion > 0 && currentVersion < SCHEMA_VERSION) {
 			db.pragma(`user_version = ${SCHEMA_VERSION}`);
 		}
-		markSchemaCompatApplied(db);
 	}
+	// Intentionally fail the whole connect path: no runtime surface may open a
+	// partially upgraded authorization schema and discover the drift via raw SELECTs.
+	assertRecipientPolicyDeviceEligibilityCompatibility(db);
+	// Reinstall outside the compatibility marker so a missing or stale security
+	// trigger self-heals before any authorization reader can use the connection.
+	ensureIdentityDeviceAssignmentVersionTriggers(db);
+	if (!compatAlreadyApplied) markSchemaCompatApplied(db);
 	try {
 		repairShareOperationEffectIdIndex(db);
 	} catch {

@@ -176,7 +176,8 @@ For architecture details, see [docs/architecture.md](docs/architecture.md).
 
 | Group | Command | Description |
 |-------|---------|-------------|
-| **Core** | `codemem stats` | Database statistics |
+| **Core** | `codemem status` | Local operational roll-up (`--json` supported) |
+| | `codemem stats` | Database statistics |
 | | `codemem stats --attribution` | Bounded local retrieval-attribution diagnostics (`--json` supported) |
 | | `codemem recent` | Recent memories |
 | | `codemem search <query>` | Search memories |
@@ -197,6 +198,7 @@ For architecture details, see [docs/architecture.md](docs/architecture.md).
 | | `codemem sync once` | Run one immediate sync pass |
 | | `codemem sync doctor` | Diagnose sync configuration issues |
 | | `codemem sync bootstrap` | Bootstrap sync from a peer snapshot |
+| **Updates** | `codemem update check` | Check the npm registry for a newer stable release (`--json` and `--refresh` supported) |
 | **Coordinator** | `codemem coordinator` | Self-hosted coordinator admin (groups, devices, invites) |
 | **Database** | `codemem db prune-memories` | Deactivate low-signal memories (`--dry-run` to preview) |
 | | `codemem db prune-observations` | Deactivate low-signal observations |
@@ -212,7 +214,26 @@ For architecture details, see [docs/architecture.md](docs/architecture.md).
 | | `codemem pi-hook-ingest` | Pi extension event ingestion (stdin) |
 | | `codemem pi-hook-inject` | Pi prompt-time memory injection (stdin / JSON) |
 
-Run `codemem --help` for the full list. Legacy top-level aliases (`export-memories`, `import-memories`, `show`, `forget`, `remember`) still work but are hidden from help.
+Run `codemem --help` for the full list. `show`, `forget`, and `remember` still work as hidden top-level aliases. `export-memories` and `import-memories` remain visible but are deprecated — they warn on stderr and will be hidden from help and completion in a future release; use `codemem memory export` / `codemem memory import`.
+
+Use `codemem status` to answer whether the local database, viewer, sync, maintenance,
+semantic index, raw-event ingestion, and observer need attention. It is observational:
+it does not create a missing database, repair state, inspect credentials, or contact
+peers, coordinators, registries, or non-loopback hosts. Use `codemem status --json`
+for the stable machine-readable report. `codemem stats` remains the inventory and
+usage command; use `sync status`/`sync doctor`, `maintenance status`, and
+`db raw-events-status` for subsystem detail.
+
+`codemem update check` is read-only: it reports the latest validated stable release and
+installation-specific guidance. Results are cached for six hours;
+pass `--refresh` to force a registry request or `--json` for one stable status object.
+The Viewer Health page reads the same status from `/api/update-status`. The OpenCode plugin
+checks it after startup and shows at most one best-effort notification for each newly discovered
+release. `notify` is the default. Explicit `auto` policy may run `codemem update install` only for
+a fresh, validated npm release observed for at least 24 hours and an installation whose npm origin
+can be proven. Pinned, prerelease, downgrade, repository-development, stale, Docker, and unknown
+installs refuse execution. Set `CODEMEM_BACKEND_UPDATE_POLICY=off` to disable release checks.
+Docker guidance is always rebuild-and-restart guidance, never an in-container update.
 
 Pack rendering defaults to self-contained context. For token-constrained experiments, `codemem pack <context> --compact` renders an index plus top details. Near-related compression is controlled by `--compression-mode off|compact|ids` (or `CODEMEM_PACK_COMPRESSION`); MCP `memory_pack` exposes the same setting as `compression_mode`. Use `ids` only when the agent can follow up with `memory_get_observations`.
 
@@ -240,7 +261,7 @@ codemem setup --opencode-only
 
 This updates your OpenCode config to install the plugin and register the MCP server. Restart OpenCode to activate.
 
-The standalone `codemem-mcp-ts` binary runs the same stdio server used by `codemem mcp`. Viewer autostart is on by default for both invocation paths; set `CODEMEM_VIEWER=0` or `CODEMEM_VIEWER_AUTO=0` to disable.
+The standalone `codemem-mcp-ts` binary runs the same stdio server used by `codemem mcp`. Viewer autostart is on by default for both invocation paths; set `CODEMEM_VIEWER=0` or `CODEMEM_VIEWER_AUTO=0` to disable. MCP autostart and the `serve start`/`stop`/`restart` lifecycle identify a running viewer through `GET /api/health` (service discriminator `codemem-viewer`), with one bounded `GET /api/stats` compatibility probe when an older viewer returns `404`.
 
 For local HTTP transport testing, run `codemem mcp http`. It listens on `127.0.0.1:38889` by default and exposes Streamable HTTP at `POST /mcp`; use `--host`, `--port`, and `--db-path` to override those values. OAuth discovery metadata and Dynamic Client Registration are available at `/.well-known/oauth-authorization-server`, `/.well-known/oauth-protected-resource/mcp`, and `/register`; set `--public-url` or `CODEMEM_MCP_HTTP_PUBLIC_URL` to the externally reachable `/mcp` URL so advertised endpoints use the public origin. `/authorize` redirects through a configured upstream OIDC provider before issuing public-client authorization codes, `/token` supports PKCE S256 exchange, and `/oauth/revoke` revokes access tokens. When a public URL or OIDC configuration is present, `POST /mcp` requires a valid bearer token; local-only HTTP mode remains unauthenticated for development and still applies loopback Host/Origin checks. Non-loopback binds are rejected unless you explicitly pass `--unsafe-public` or set `CODEMEM_MCP_HTTP_UNSAFE_PUBLIC=1`.
 
@@ -272,6 +293,7 @@ Common overrides:
 Viewer note:
 
 - The plugin manages one explicit viewer target per runtime. If you run multiple viewers, give each one its own DB/runtime folder instead of sharing `viewer.pid` state next to the same SQLite file.
+- The OpenCode plugin monitors viewer liveness through `GET /api/health`. When an older viewer returns `404`, it makes one compatibility probe to the legacy raw-event status endpoint; raw-event ingest preflight remains separate and is bounded by a 5-second timeout.
 
 The viewer includes a grouped Settings modal (`Connection`, `Processing`, `Device Sync`) with shell-agnostic labels and an advanced-controls toggle for technical fields.
 - Settings show effective values (configured or default) and only persist changed fields on save.
@@ -305,7 +327,7 @@ codemem memory export project.json
 codemem memory import project.json --remap-project ~/workspace/myproject
 ```
 
-See `codemem memory export --help` and `codemem memory import --help` for full options. Legacy top-level aliases still work but are hidden from help.
+See `codemem memory export --help` and `codemem memory import --help` for full options. The legacy top-level `export-memories` / `import-memories` forms still work but emit a deprecation warning.
 
 ## Sharing and devices
 
@@ -357,7 +379,7 @@ Use manual pairing only for a same-person device, an existing integration, or a 
 ```text
 codemem sync enable        # generate device keys
 codemem sync pair          # generate pairing payload
-codemem sync start         # start the viewer-backed sync runtime
+codemem serve start        # start it; use serve stop/restart for lifecycle management
 codemem sync once          # run one immediate sync pass
 ```
 

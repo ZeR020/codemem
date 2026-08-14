@@ -3,10 +3,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
 	connect,
+	ensureDeviceIdentity,
 	fingerprintPublicKey,
 	initTestSchema,
 	loadPublicKey,
 	MemoryStore,
+	resolveKeyPaths,
 	startMaintenanceJob,
 } from "@codemem/core";
 import { describe, expect, it, vi } from "vitest";
@@ -514,7 +516,7 @@ describe("formatSyncAttempt", () => {
 				store.db
 					.prepare(
 						`INSERT INTO replication_scopes(scope_id, label, kind, authority_type, membership_epoch, status, created_at, updated_at)
-						 VALUES (?, ?, 'user', 'local', 1, 'active', ?, ?)`,
+						 VALUES (?, ?, 'user', 'coordinator', 1, 'active', ?, ?)`,
 					)
 					.run(scopeId, label, now, now);
 				for (const deviceId of ["local-device", "peer-device"]) {
@@ -573,6 +575,40 @@ describe("formatSyncAttempt", () => {
 		} finally {
 			logSpy.mockRestore();
 			store.close();
+			rmSync(tmpDbDir, { recursive: true, force: true });
+		}
+	});
+
+	it("reports missing restored identity keys in sync doctor output", async () => {
+		const tmpDbDir = mkdtempSync(join(tmpdir(), "sync-doctor-identity-test-"));
+		const dbPath = join(tmpDbDir, "mem.sqlite");
+		const keysDir = join(tmpDbDir, "keys");
+		const rawDb = connect(dbPath);
+		initTestSchema(rawDb);
+		ensureDeviceIdentity(rawDb, { keysDir });
+		rawDb.close();
+		const [privatePath] = resolveKeyPaths(keysDir);
+		rmSync(privatePath);
+		const previousKeysDir = process.env.CODEMEM_KEYS_DIR;
+		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+		try {
+			process.env.CODEMEM_KEYS_DIR = keysDir;
+			await syncCommand.parseAsync(["doctor", "--db-path", dbPath, "--json"], {
+				from: "user",
+			});
+
+			const payload = JSON.parse(String(logSpy.mock.calls[0]?.[0])) as {
+				identity_error?: string | null;
+				issues?: string[];
+			};
+			expect(payload.identity_error).toContain("device_identity_private_key_missing");
+			expect(payload.issues).toEqual(
+				expect.arrayContaining([expect.stringContaining("device_identity_private_key_missing")]),
+			);
+		} finally {
+			logSpy.mockRestore();
+			if (previousKeysDir == null) delete process.env.CODEMEM_KEYS_DIR;
+			else process.env.CODEMEM_KEYS_DIR = previousKeysDir;
 			rmSync(tmpDbDir, { recursive: true, force: true });
 		}
 	});

@@ -1,5 +1,27 @@
 # User Guide
 
+## Check for updates
+
+Use the read-only release check to compare the running CLI with the latest stable npm release:
+
+```fish
+codemem update check
+codemem update check --refresh
+codemem update check --json
+```
+
+- Results are cached locally for six hours; `--refresh` bypasses a fresh cache.
+- `--json` prints one stable status object and uses a non-zero exit code when no validated fresh
+  or stale status is available.
+- Stale validated cache data remains clearly labeled and may provide guidance when the registry is
+  unavailable.
+- This command never installs or executes an update. Release installation remains outside this
+  read-only check. `codemem update install` is the separate, fail-closed installer: it refreshes
+  release status, requires a proven global npm installation and a stable release observed for at
+  least 24 hours, installs the exact validated version from the public npm registry, and verifies
+  the active `codemem` command. It refuses npx, Docker, pinned, development, stale, prerelease,
+  downgrade, and unknown installations.
+
 ## Start or restart the viewer
 - `codemem serve` runs the viewer in the foreground.
 - `codemem serve start` runs it in the background.
@@ -13,6 +35,26 @@
 - Binding the viewer to `0.0.0.0`, putting it behind a reverse proxy, or exposing it through a tunnel can make local APIs reachable in ways the current trust model was not built for.
 - Treat the viewer as a local tool. If you must expose it beyond loopback, add your own auth and network restrictions first.
 - This warning applies to the viewer HTTP service, not the separate sync/coordinator listeners documented elsewhere.
+
+## Check local operational status
+
+`codemem status` is the local operational roll-up. It reports database readiness,
+viewer state, sync, maintenance, semantic indexing, raw-event ingestion, and the
+observer without changing configuration or stored data.
+
+```fish
+codemem status
+codemem status --json
+codemem status --db-path ./codemem.sqlite --config ./codemem.json
+```
+
+- `status` answers whether codemem can do useful local work; `stats` reports database inventory and usage.
+- Collection is offline and local-only. It does not contact peers, coordinators, registries, update services, or non-loopback viewer hosts.
+- A missing database is reported without creating it. Existing databases are opened read-only.
+- With no viewer PID record, status probes the configured loopback viewer address; a malformed or non-loopback record reports `unknown` and is not fetched.
+- Warnings and errors appear in the bounded `attention` list. A collected report exits `0` even when `ok` is false; collection failures exit `1`, and usage errors exit `2`.
+- Terminal raw-event and observer failures affect `ok` for 24 hours; use `codemem db raw-events-gate` for the detailed reliability window.
+- Use `codemem sync status` or `codemem sync doctor`, `codemem maintenance status`, and `codemem db raw-events-status` for detailed subsystem diagnostics.
 
 ## Seeing UI changes
 - The viewer UI is built from `packages/ui/` and served by `packages/viewer-server/`.
@@ -206,7 +248,7 @@ The recipient accepts on the new device. Codemem links it to the same Identity, 
 
 ### Devices, status, and recovery
 
-**Devices** is a read-only view of where Project access can arrive. Each device shows its **Owning Identity**. Projects are labeled **Direct** when shared with that Identity and **Team** when inherited through a Team policy; both are limited to exact canonical Projects selected in Sharing.
+**Devices** is a read-only view of registered devices and Projects shared directly with their **Owning Identity**. It does not infer per-device Team access from Identity membership; use Team policy administration when you need to review authoritative device decisions. Both direct and Team access remain limited to exact canonical Projects selected in Sharing.
 
 **Availability** tells you whether the device can currently receive work. It does not change ownership or Project access:
 
@@ -231,7 +273,7 @@ Legacy `#sync` and `#sync/diagnostics` viewer links remain valid Advanced routes
 ### Sync runtime
 
 - `codemem sync enable` generates keys and writes config.
-- `codemem sync start` starts the viewer-backed sync runtime.
+- `codemem serve start|stop|restart` manages the viewer-backed sync runtime.
 - `codemem sync status` shows device info and peer health.
 
 ### Manual pairing
@@ -350,6 +392,15 @@ When selected history may already have replicated, all participating owner devic
 - `codemem sync doctor` diagnoses sync configuration issues (keys, config, peer reachability).
 - `codemem sync bootstrap <peer-device-id>` bootstraps sync state from a peer's snapshot.
 - `codemem sync attempts` shows recent sync attempt history per peer.
+- A restored peer requires its SQLite database and original signing key together.
+  If no matching key exists in `device.key` or the configured platform keychain,
+  sync fails closed with a `device_identity_*` diagnostic instead of silently
+  replacing the enrolled key.
+- The daemon records an `identity_error` state and retries without blocking local
+  memory capture. Restore the original key, then restart the service if mDNS
+  advertisement also needs to be re-established.
+- See [Anchor-peer deployment](anchor-peer-deployment.md#storage-and-backups) for
+  the complete backup and restore contract.
 
 ### Service helpers
 
@@ -369,9 +420,16 @@ When selected history may already have replicated, all participating owner devic
 
 ### Keychain (optional)
 
-- `sync_key_store=keychain` (or `CODEMEM_SYNC_KEY_STORE=keychain`) stores the private key in Secret Service (Linux) or Keychain (macOS).
+- `CODEMEM_SYNC_KEY_STORE=keychain` stores the private key in Secret Service (Linux) or Keychain (macOS).
 - Falls back to file-based storage if the platform tooling is unavailable.
-- On macOS, the Keychain storage uses the `security` CLI and may expose the key in process arguments; use `sync_key_store=file` if that is a concern.
+- On macOS, the Keychain storage uses the `security` CLI and may expose the key in process arguments; use `CODEMEM_SYNC_KEY_STORE=file` if that is a concern.
+- Keep the protected `device.key` file as the portable restore artifact even in
+  keychain mode; codemem can repopulate the keychain from a matching restored
+  file. A matching private key that remains in the platform keychain can also
+  authenticate a local installation if `device.key` is missing, corrupt, or
+  belongs to another identity. That is not a portable migration: moving a
+  keychain-only credential requires platform-supported secure tooling. The
+  database and public-key file alone cannot authenticate the original identity.
 
 ## Troubleshooting
 - If sessions are missing, confirm the viewer and plugin share the same DB path.

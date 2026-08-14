@@ -10,6 +10,7 @@ import { and, desc, eq, gt, or } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/better-sqlite3";
 import type { Database } from "./db.js";
 import { ensureAdditiveSchemaCompatibility } from "./db.js";
+import { isStableReleaseVersion } from "./release-discovery.js";
 import * as schema from "./schema.js";
 import type { SecretScanner } from "./secret-scanner.js";
 import { buildAuthHeaders } from "./sync-auth.js";
@@ -149,6 +150,7 @@ export interface SyncScopeResult {
 export interface SyncPassOptions {
 	limit?: number;
 	keysDir?: string;
+	dbPath?: string;
 	refreshAuthorization?: boolean;
 	/**
 	 * Secret scanner used to redact peer-shipped content on apply. Callers that
@@ -286,6 +288,27 @@ function defaultCapabilityDiagnostics(): SyncCapabilityDiagnostics {
 	return capabilityDiagnostics("unsupported");
 }
 
+function persistPeerRuntimeVersion(
+	db: Database,
+	peerDeviceId: string,
+	statusPayload: Record<string, unknown>,
+): void {
+	const matchingDevice = statusPayload.device_id === peerDeviceId;
+	const runtimeVersion =
+		matchingDevice && isStableReleaseVersion(statusPayload.runtime_version)
+			? statusPayload.runtime_version
+			: null;
+	try {
+		db.prepare(
+			`UPDATE sync_peers
+			 SET runtime_version = ?, runtime_version_observed_at = ?
+			 WHERE peer_device_id = ?`,
+		).run(runtimeVersion, runtimeVersion ? new Date().toISOString() : null, peerDeviceId);
+	} catch {
+		// Informational metadata must never affect sync availability or trust.
+	}
+}
+
 async function reconcilePeerRowsBeforeExchange(
 	db: Database,
 	options: { localDeviceId: string; peerDeviceId: string },
@@ -408,6 +431,7 @@ async function pushOps(
 	deviceId: string,
 	ops: ReplicationOp[],
 	keysDir?: string,
+	dbPath?: string,
 	depth = 0,
 ): Promise<void> {
 	if (ops.length === 0) return;
@@ -425,6 +449,7 @@ async function pushOps(
 			url: postUrl,
 			bodyBytes,
 			keysDir,
+			dbPath,
 		}),
 		...capabilityHeader(),
 	};
@@ -444,8 +469,8 @@ async function pushOps(
 		(detail === "payload_too_large" || detail === "too_many_ops")
 	) {
 		const mid = Math.floor(ops.length / 2);
-		await pushOps(postUrl, deviceId, ops.slice(0, mid), keysDir, depth + 1);
-		await pushOps(postUrl, deviceId, ops.slice(mid), keysDir, depth + 1);
+		await pushOps(postUrl, deviceId, ops.slice(0, mid), keysDir, dbPath, depth + 1);
+		await pushOps(postUrl, deviceId, ops.slice(mid), keysDir, dbPath, depth + 1);
 		return;
 	}
 
@@ -654,6 +679,7 @@ async function runScopedSync(
 		deviceId: string;
 		statusPayload: Record<string, unknown>;
 		keysDir?: string;
+		dbPath?: string;
 		scanner?: SecretScanner;
 		limit: number;
 	},
@@ -671,6 +697,7 @@ async function runScopedSync(
 			deviceId: options.deviceId,
 			scope,
 			keysDir: options.keysDir,
+			dbPath: options.dbPath,
 			scanner: options.scanner,
 			limit: options.limit,
 		});
@@ -707,11 +734,12 @@ async function syncOneScope(
 		deviceId: string;
 		scope: PeerAuthorizedScope;
 		keysDir?: string;
+		dbPath?: string;
 		scanner?: SecretScanner;
 		limit: number;
 	},
 ): Promise<SyncScopeResult> {
-	const { peerDeviceId, baseUrl, deviceId, scope, keysDir, scanner, limit } = options;
+	const { peerDeviceId, baseUrl, deviceId, scope, keysDir, dbPath, scanner, limit } = options;
 	const scopeId = scope.scope_id;
 	const [lastApplied, lastAcked] = getReplicationCursor(db, peerDeviceId, scopeId);
 	const hasNullBaselineBootstrapMarker = lastAcked === SCOPED_NULL_BASELINE_BOOTSTRAP_CURSOR_MARKER;
@@ -770,6 +798,7 @@ async function syncOneScope(
 			};
 			const { items } = await fetchAllSnapshotPages(baseUrl, resetInfo, deviceId, {
 				keysDir,
+				dbPath,
 				pageSize: BOOTSTRAP_PAGE_SIZE,
 				timeoutS: BOOTSTRAP_REQUEST_TIMEOUT_S,
 			});
@@ -827,6 +856,7 @@ async function syncOneScope(
 			};
 			const { items } = await fetchAllSnapshotPages(baseUrl, resetInfo, deviceId, {
 				keysDir,
+				dbPath,
 				pageSize: BOOTSTRAP_PAGE_SIZE,
 				timeoutS: BOOTSTRAP_REQUEST_TIMEOUT_S,
 			});
@@ -908,6 +938,7 @@ async function syncOneScope(
 				url,
 				bodyBytes: Buffer.alloc(0),
 				keysDir,
+				dbPath,
 			}),
 			...capabilityHeader(),
 		};
@@ -1139,6 +1170,7 @@ export async function syncOnce(
 	ensureAdditiveSchemaCompatibility(db);
 	const limit = options?.limit ?? DEFAULT_LIMIT;
 	const keysDir = options?.keysDir;
+	const dbPath = options?.dbPath;
 	const scanner = options?.scanner;
 	if (!scanner && !syncOnceScannerWarned) {
 		syncOnceScannerWarned = true;
@@ -1203,6 +1235,7 @@ export async function syncOnce(
 					url: statusUrl,
 					bodyBytes: Buffer.alloc(0),
 					keysDir,
+					dbPath,
 					bootstrapGrantId: pendingBootstrapGrantId,
 				}),
 				...capabilityHeader(),
@@ -1219,6 +1252,7 @@ export async function syncOnce(
 			if (statusPayload.fingerprint !== pinnedFingerprint) {
 				throw new Error("peer fingerprint mismatch");
 			}
+			persistPeerRuntimeVersion(db, peerDeviceId, statusPayload);
 			lastCapabilityDiagnostics = capabilityDiagnostics(statusPayload.sync_capability);
 			if (String(statusPayload.protocol_version ?? "") !== EXPECTED_SYNC_PROTOCOL_VERSION) {
 				throw new Error(
@@ -1282,6 +1316,7 @@ export async function syncOnce(
 						}
 						const { items } = await fetchAllSnapshotPages(baseUrl, resetInfo, deviceId, {
 							keysDir,
+							dbPath,
 							pageSize: BOOTSTRAP_PAGE_SIZE,
 							timeoutS: BOOTSTRAP_REQUEST_TIMEOUT_S,
 						});
@@ -1335,6 +1370,7 @@ export async function syncOnce(
 										deviceId,
 										statusPayload,
 										keysDir,
+										dbPath,
 										scanner,
 										limit,
 									})
@@ -1392,6 +1428,7 @@ export async function syncOnce(
 					url: getUrl,
 					bodyBytes: Buffer.alloc(0),
 					keysDir,
+					dbPath,
 				}),
 				...capabilityHeader(),
 			};
@@ -1461,6 +1498,7 @@ export async function syncOnce(
 					}
 					const { items } = await fetchAllSnapshotPages(baseUrl, resetRequired, deviceId, {
 						keysDir,
+						dbPath,
 						timeoutS: BOOTSTRAP_REQUEST_TIMEOUT_S,
 					});
 
@@ -1603,7 +1641,7 @@ export async function syncOnce(
 			if (outboundOps.length > 0) {
 				const batches = chunkOpsBySize(outboundOps, MAX_SYNC_BODY_BYTES);
 				for (const batch of batches) {
-					await pushOps(postUrl, deviceId, batch, keysDir);
+					await pushOps(postUrl, deviceId, batch, keysDir, dbPath);
 				}
 			}
 			const ackCursor = filteredOutboundCursor ?? outboundCursor;
@@ -1629,6 +1667,7 @@ export async function syncOnce(
 							deviceId,
 							statusPayload,
 							keysDir,
+							dbPath,
 							scanner,
 							limit,
 						})

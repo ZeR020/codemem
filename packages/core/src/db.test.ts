@@ -2,10 +2,11 @@ import { existsSync, mkdtempSync, readdirSync, rmSync, utimesSync, writeFileSync
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import BetterSqlite3 from "better-sqlite3";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Database } from "./db.js";
 import {
 	assertSchemaReady,
+	assertSchemaReadyReadOnly,
 	backupOnFirstAccess,
 	columnExists,
 	connect,
@@ -136,12 +137,21 @@ describe("connect", () => {
 		expect(tableExists(db, "recipient_policy_authority_states")).toBe(true);
 		expect(tableExists(db, "recipient_policy_reconciliation_steps")).toBe(true);
 		expect(tableExists(db, "recipient_policy_deny_overlays")).toBe(true);
+		expect(tableExists(db, "policy_team_device_decisions")).toBe(true);
 		expect(tableExists(db, "coordinator_enrollment_reconciliation_issues")).toBe(true);
 		expect(tableExists(db, "recipient_managed_project_projections")).toBe(true);
 		expect(hasIndex(db, "idx_recipient_managed_projects_identity_status")).toBe(true);
 		expect(hasIndex(db, "idx_recipient_managed_projects_scope_authority")).toBe(true);
 		expect(columnExists(db, "memory_items", "scope_id")).toBe(true);
 		expect(columnExists(db, "replication_ops", "scope_id")).toBe(true);
+		expect(columnExists(db, "policy_teams", "device_eligibility_mode")).toBe(true);
+		expect(columnExists(db, "identity_devices", "assignment_version")).toBe(true);
+		expect(columnExists(db, "policy_team_device_decisions", "assignment_version")).toBe(true);
+		expect(hasIndex(db, "idx_policy_team_device_decisions_device")).toBe(true);
+		expect(columnInfo(db, "sync_peers", "runtime_version")).toEqual({ is_not_null: 0 });
+		expect(columnInfo(db, "sync_peers", "runtime_version_observed_at")).toEqual({
+			is_not_null: 0,
+		});
 		expect(hasIndex(db, "idx_memory_items_origin_device_active")).toBe(true);
 		expect(hasIndex(db, "idx_memory_items_scope_visibility_created")).toBe(true);
 		expect(hasIndex(db, "idx_memory_items_scope_backfill_pending")).toBe(true);
@@ -151,6 +161,110 @@ describe("connect", () => {
 		expect(hasIndex(db, "idx_coordinator_enrollment_issues_status_recent")).toBe(true);
 		expect(hasIndex(db, "idx_recipient_policy_reconciliation_steps_pending_refresh")).toBe(true);
 		expect(() => assertSchemaReady(db)).not.toThrow();
+	});
+
+	it("increments assignment version when a device is reassigned", () => {
+		db = connect(join(tmpDir, "reassigned.sqlite"));
+		db.exec(`
+			INSERT INTO identity_devices(
+				device_id, identity_id, display_name, status, provenance, revision,
+				migration_state, idempotency_key, created_at, updated_at
+			) VALUES (
+				'device-reassigned', 'identity-a', 'Laptop', 'active', 'user', 'revision-device',
+				'user_managed', 'key-device-reassigned', '2026-08-12T00:00:00Z', '2026-08-12T00:00:00Z'
+			);
+		`);
+
+		db.prepare("UPDATE identity_devices SET identity_id = ? WHERE device_id = ?").run(
+			"identity-b",
+			"device-reassigned",
+		);
+
+		expect(
+			db
+				.prepare("SELECT assignment_version FROM identity_devices WHERE device_id = ?")
+				.pluck()
+				.get("device-reassigned"),
+		).toBe(1);
+
+		db.prepare("UPDATE identity_devices SET display_name = ? WHERE device_id = ?").run(
+			"Renamed laptop",
+			"device-reassigned",
+		);
+		expect(
+			db
+				.prepare("SELECT assignment_version FROM identity_devices WHERE device_id = ?")
+				.pluck()
+				.get("device-reassigned"),
+		).toBe(1);
+	});
+
+	it("removes reviewed decisions when a device is deleted", () => {
+		db = connect(join(tmpDir, "deleted-device.sqlite"));
+		db.exec(`
+			INSERT INTO policy_teams(
+				team_id, display_name, status, provenance, revision, migration_state,
+				idempotency_key, created_at, updated_at
+			) VALUES (
+				'team-a', 'Team A', 'active', 'user', 'revision-team', 'user_managed',
+				'key-team-a', '2026-08-12T00:00:00Z', '2026-08-12T00:00:00Z'
+			);
+			INSERT INTO identity_devices(
+				device_id, identity_id, display_name, status, provenance, revision,
+				migration_state, idempotency_key, created_at, updated_at
+			) VALUES (
+				'device-deleted', 'identity-a', 'Laptop', 'active', 'user', 'revision-device',
+				'user_managed', 'key-device-deleted', '2026-08-12T00:00:00Z', '2026-08-12T00:00:00Z'
+			);
+			INSERT INTO policy_team_device_decisions(
+				team_id, device_id, decision, assignment_version, provenance, revision, created_at, updated_at
+			) VALUES (
+				'team-a', 'device-deleted', 'included', 0, 'user', 'revision-decision',
+				'2026-08-12T00:00:00Z', '2026-08-12T00:00:00Z'
+			);
+		`);
+
+		db.prepare("DELETE FROM identity_devices WHERE device_id = ?").run("device-deleted");
+
+		expect(
+			db
+				.prepare("SELECT COUNT(*) FROM policy_team_device_decisions WHERE device_id = ?")
+				.pluck()
+				.get("device-deleted"),
+		).toBe(0);
+
+		db.exec(`
+			INSERT INTO identity_devices(
+				device_id, identity_id, display_name, status, provenance, revision,
+				migration_state, idempotency_key, created_at, updated_at
+			) VALUES (
+				'device-deleted', 'identity-b', 'Replacement', 'active', 'user', 'revision-replacement',
+				'user_managed', 'key-device-replacement', '2026-08-12T00:00:00Z', '2026-08-12T00:00:00Z'
+			);
+		`);
+		expect(
+			db
+				.prepare("SELECT COUNT(*) FROM policy_team_device_decisions WHERE device_id = ?")
+				.pluck()
+				.get("device-deleted"),
+		).toBe(0);
+	});
+
+	it("reinstalls assignment security triggers inside one immediate transaction", () => {
+		db = connect(join(tmpDir, "trigger-atomicity.sqlite"));
+		db.exec("DROP TRIGGER trg_identity_devices_assignment_version");
+		const transaction = vi.spyOn(db, "transaction");
+
+		ensureAdditiveSchemaCompatibility(db);
+
+		expect(transaction).toHaveBeenCalledOnce();
+		expect(
+			db
+				.prepare(
+					"SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND name = 'trg_identity_devices_assignment_version'",
+				)
+				.get(),
+		).toBeDefined();
 	});
 
 	it("bootstraps the schema on an empty existing database file", () => {
@@ -433,6 +547,15 @@ describe("assertSchemaReady", () => {
 		expect(() => assertSchemaReady(db)).not.toThrow();
 	});
 
+	it("routes newer read-only schema warnings through the caller-provided sink", () => {
+		const warn = vi.fn();
+		db.pragma(`user_version = ${SCHEMA_VERSION + 1}`);
+
+		expect(() => assertSchemaReadyReadOnly(db, warn)).not.toThrow();
+		expect(warn).toHaveBeenCalledOnce();
+		expect(warn.mock.calls[0]?.[0]).toContain("newer than this TS runtime");
+	});
+
 	it("throws when required tables are missing", () => {
 		const missingTables = new BetterSqlite3(join(tmpDir, "missing-tables.sqlite"));
 		try {
@@ -515,6 +638,72 @@ describe("ensureAdditiveSchemaCompatibility", () => {
 		expect(columnExists(db, "raw_event_flush_batches", "attempt_count")).toBe(true);
 	});
 
+	it("adds Team device eligibility state without changing existing Team behavior", () => {
+		db.exec(`
+			CREATE TABLE policy_teams (
+				team_id TEXT PRIMARY KEY NOT NULL,
+				display_name TEXT NOT NULL,
+				status TEXT NOT NULL,
+				provenance TEXT NOT NULL,
+				revision TEXT NOT NULL,
+				migration_state TEXT NOT NULL,
+				source_fingerprint TEXT,
+				idempotency_key TEXT NOT NULL UNIQUE,
+				created_at TEXT NOT NULL,
+				updated_at TEXT NOT NULL
+			);
+			CREATE TABLE identity_devices (
+				device_id TEXT PRIMARY KEY NOT NULL,
+				identity_id TEXT NOT NULL,
+				display_name TEXT NOT NULL,
+				status TEXT NOT NULL,
+				provenance TEXT NOT NULL,
+				revision TEXT NOT NULL,
+				migration_state TEXT NOT NULL,
+				source_fingerprint TEXT,
+				idempotency_key TEXT NOT NULL UNIQUE,
+				created_at TEXT NOT NULL,
+				updated_at TEXT NOT NULL
+			);
+			INSERT INTO policy_teams VALUES (
+				'team-a', 'Team A', 'active', 'user', 'revision-team', 'user_managed',
+				NULL, 'key-team', '2026-08-10T00:00:00Z', '2026-08-10T00:00:00Z'
+			);
+			INSERT INTO identity_devices VALUES (
+				'device-a', 'identity-a', 'Laptop', 'active', 'user', 'revision-device',
+				'user_managed', NULL, 'key-device', '2026-08-10T00:00:00Z', '2026-08-10T00:00:00Z'
+			);
+		`);
+
+		ensureAdditiveSchemaCompatibility(db);
+
+		expect(tableExists(db, "policy_team_device_decisions")).toBe(true);
+		expect(hasIndex(db, "idx_policy_team_device_decisions_device")).toBe(true);
+		expect(
+			db
+				.prepare("SELECT device_eligibility_mode FROM policy_teams WHERE team_id = 'team-a'")
+				.pluck()
+				.get(),
+		).toBe("person_all_devices");
+		expect(
+			db
+				.prepare("SELECT assignment_version FROM identity_devices WHERE device_id = 'device-a'")
+				.pluck()
+				.get(),
+		).toBe(0);
+
+		db.prepare("UPDATE identity_devices SET identity_id = ? WHERE device_id = ?").run(
+			"identity-b",
+			"device-a",
+		);
+		expect(
+			db
+				.prepare("SELECT assignment_version FROM identity_devices WHERE device_id = ?")
+				.pluck()
+				.get("device-a"),
+		).toBe(1);
+	});
+
 	it("adds memory_items dedup_key column and index", () => {
 		db.exec(`
 			CREATE TABLE memory_items (
@@ -551,6 +740,9 @@ describe("ensureAdditiveSchemaCompatibility", () => {
 			pragma() {
 				return 0;
 			},
+			transaction(callback: () => void) {
+				return { immediate: callback };
+			},
 			prepare(query: string) {
 				return {
 					get(...args: unknown[]) {
@@ -585,7 +777,7 @@ describe("ensureAdditiveSchemaCompatibility", () => {
 		expect(() => ensureAdditiveSchemaCompatibility(db)).not.toThrow();
 	});
 
-	it("adds sync_peers discovery-provenance columns and creates coordinator_group_preferences", () => {
+	it("adds sync_peers metadata columns and creates coordinator_group_preferences", () => {
 		db.exec(`
 			CREATE TABLE sync_peers (
 				peer_device_id TEXT PRIMARY KEY NOT NULL,
@@ -607,6 +799,8 @@ describe("ensureAdditiveSchemaCompatibility", () => {
 		expect(columnExists(db, "sync_peers", "discovered_via_coordinator_id")).toBe(false);
 		expect(columnExists(db, "sync_peers", "discovered_via_group_id")).toBe(false);
 		expect(columnExists(db, "sync_peers", "trust_provenance")).toBe(false);
+		expect(columnExists(db, "sync_peers", "runtime_version")).toBe(false);
+		expect(columnExists(db, "sync_peers", "runtime_version_observed_at")).toBe(false);
 		expect(tableExists(db, "coordinator_group_preferences")).toBe(false);
 
 		ensureAdditiveSchemaCompatibility(db);
@@ -614,6 +808,10 @@ describe("ensureAdditiveSchemaCompatibility", () => {
 		expect(columnExists(db, "sync_peers", "discovered_via_coordinator_id")).toBe(true);
 		expect(columnExists(db, "sync_peers", "discovered_via_group_id")).toBe(true);
 		expect(columnExists(db, "sync_peers", "trust_provenance")).toBe(true);
+		expect(columnInfo(db, "sync_peers", "runtime_version")).toEqual({ is_not_null: 0 });
+		expect(columnInfo(db, "sync_peers", "runtime_version_observed_at")).toEqual({
+			is_not_null: 0,
+		});
 		expect(tableExists(db, "coordinator_group_preferences")).toBe(true);
 		expect(columnExists(db, "coordinator_group_preferences", "default_space_scope_id")).toBe(true);
 		expect(
@@ -1064,6 +1262,7 @@ describe("ensureAdditiveSchemaCompatibility schema-compat gate", () => {
 			"coordinator_enrollment_reconciliation_issues",
 			"policy_teams",
 			"policy_team_memberships",
+			"policy_team_device_decisions",
 			"identity_devices",
 			"project_recipients",
 			"recipient_managed_project_projections",
@@ -1105,6 +1304,7 @@ describe("ensureAdditiveSchemaCompatibility schema-compat gate", () => {
 			"coordinator_enrollment_reconciliation_issues",
 			"policy_teams",
 			"policy_team_memberships",
+			"policy_team_device_decisions",
 			"identity_devices",
 			"project_recipients",
 			"recipient_managed_project_projections",
@@ -1128,6 +1328,7 @@ describe("ensureAdditiveSchemaCompatibility schema-compat gate", () => {
 		expect(hasIndex(previous, "idx_coordinator_enrollment_issues_status_recent")).toBe(true);
 		expect(hasIndex(previous, "idx_recipient_managed_projects_identity_status")).toBe(true);
 		expect(hasIndex(previous, "idx_recipient_managed_projects_scope_authority")).toBe(true);
+		expect(hasIndex(previous, "idx_project_recipients_recipient_status")).toBe(true);
 		expect(hasIndex(previous, "idx_recipient_policy_reconciliation_steps_pending_refresh")).toBe(
 			true,
 		);
@@ -1165,6 +1366,29 @@ describe("ensureAdditiveSchemaCompatibility schema-compat gate", () => {
 		).toBe(1);
 		expect(appliedSchemaVersion(reopened)).toBe(SCHEMA_VERSION);
 		reopened.close();
+		db = connect(join(tmpDir, "replacement.sqlite"));
+	});
+
+	it("adds recipient lookup indexes to a database already marked at schema version 18", () => {
+		db.close();
+		const dbPath = join(tmpDir, "schema-18-recipient-index.sqlite");
+		const previous = new BetterSqlite3(dbPath);
+		previous.exec(`
+			PRAGMA user_version = 18;
+			CREATE TABLE schema_compat_state (
+				id INTEGER PRIMARY KEY,
+				applied_schema_version INTEGER NOT NULL,
+				applied_at TEXT NOT NULL
+			);
+			INSERT INTO schema_compat_state VALUES (1, 18, '2026-08-12T00:00:00Z');
+		`);
+
+		ensureAdditiveSchemaCompatibility(previous);
+
+		expect(hasIndex(previous, "idx_project_recipients_recipient_status")).toBe(true);
+		expect(getSchemaVersion(previous)).toBe(SCHEMA_VERSION);
+		expect(appliedSchemaVersion(previous)).toBe(SCHEMA_VERSION);
+		previous.close();
 		db = connect(join(tmpDir, "replacement.sqlite"));
 	});
 
@@ -1316,6 +1540,82 @@ describe("ensureAdditiveSchemaCompatibility schema-compat gate", () => {
 		expect(appliedSchemaVersion(db)).toBe(SCHEMA_VERSION);
 	});
 
+	it.each([
+		{
+			label: "Team eligibility mode",
+			mutate: (database: Database) =>
+				database.exec("ALTER TABLE policy_teams DROP COLUMN device_eligibility_mode"),
+			error:
+				"recipient_policy_device_eligibility_schema_incompatible:policy_teams.device_eligibility_mode",
+		},
+		{
+			label: "device assignment version",
+			mutate: (database: Database) =>
+				database.exec(`
+				DROP TRIGGER IF EXISTS trg_identity_devices_assignment_version;
+				DROP TRIGGER IF EXISTS trg_identity_devices_purge_decisions;
+				ALTER TABLE identity_devices DROP COLUMN assignment_version;
+			`),
+			error:
+				"recipient_policy_device_eligibility_schema_incompatible:identity_devices.assignment_version",
+		},
+		{
+			label: "Team device decisions",
+			mutate: (database: Database) => database.exec("DROP TABLE policy_team_device_decisions"),
+			error:
+				"recipient_policy_device_eligibility_schema_incompatible:policy_team_device_decisions.team_id,policy_team_device_decisions.device_id,policy_team_device_decisions.decision,policy_team_device_decisions.assignment_version",
+		},
+		{
+			label: "Team device decision column",
+			mutate: (database: Database) =>
+				database.exec("ALTER TABLE policy_team_device_decisions DROP COLUMN decision"),
+			error:
+				"recipient_policy_device_eligibility_schema_incompatible:policy_team_device_decisions.decision",
+		},
+		{
+			label: "Team device decision assignment version",
+			mutate: (database: Database) =>
+				database.exec("ALTER TABLE policy_team_device_decisions DROP COLUMN assignment_version"),
+			error:
+				"recipient_policy_device_eligibility_schema_incompatible:policy_team_device_decisions.assignment_version",
+		},
+	] as const)("surfaces a bounded compatibility error when $label repair is unavailable", ({
+		mutate,
+		error,
+	}) => {
+		ensureAdditiveSchemaCompatibility(db);
+		mutate(db);
+
+		expect(() => ensureAdditiveSchemaCompatibility(db)).toThrow(error);
+	});
+
+	it("replaces a raw additive-DDL failure with the bounded compatibility error", () => {
+		ensureAdditiveSchemaCompatibility(db);
+		db.exec("ALTER TABLE policy_teams DROP COLUMN device_eligibility_mode");
+		db.prepare("UPDATE schema_compat_state SET applied_schema_version = ? WHERE id = 1").run(
+			SCHEMA_VERSION - 1,
+		);
+		const exec = db.exec.bind(db);
+		const failingDb = new Proxy(db, {
+			get(target, property) {
+				if (property === "exec") {
+					return (sql: string) => {
+						if (sql.startsWith("ALTER TABLE policy_teams ADD COLUMN device_eligibility_mode")) {
+							throw new Error("raw sqlite repair failure");
+						}
+						return exec(sql);
+					};
+				}
+				const value = Reflect.get(target, property, target);
+				return typeof value === "function" ? value.bind(target) : value;
+			},
+		}) as Database;
+
+		expect(() => ensureAdditiveSchemaCompatibility(failingDb)).toThrow(
+			"recipient_policy_device_eligibility_schema_incompatible:policy_teams.device_eligibility_mode",
+		);
+	});
+
 	it("runs the project backfill even when gated DDL is skipped", () => {
 		db.pragma("user_version = 6");
 		// First call marks the schema-compat state so the next open is gated.
@@ -1366,6 +1666,24 @@ describe("ensureAdditiveSchemaCompatibility schema-compat gate", () => {
 
 		expect(columnExists(db, "memory_items", "project")).toBe(true);
 		expect(hasIndex(db, "idx_memory_items_project")).toBe(true);
+		expect(appliedSchemaVersion(db)).toBe(SCHEMA_VERSION);
+	});
+
+	it("always repairs missing peer runtime-version columns after the current marker is set", () => {
+		ensureAdditiveSchemaCompatibility(db);
+		expect(appliedSchemaVersion(db)).toBe(SCHEMA_VERSION);
+		db.exec("ALTER TABLE sync_peers DROP COLUMN runtime_version_observed_at");
+		db.exec("ALTER TABLE sync_peers DROP COLUMN runtime_version");
+		expect(columnExists(db, "sync_peers", "runtime_version")).toBe(false);
+		expect(columnExists(db, "sync_peers", "runtime_version_observed_at")).toBe(false);
+
+		ensureAdditiveSchemaCompatibility(db);
+
+		expect(columnInfo(db, "sync_peers", "runtime_version")).toEqual({ is_not_null: 0 });
+		expect(columnInfo(db, "sync_peers", "runtime_version_observed_at")).toEqual({
+			is_not_null: 0,
+		});
+		expect(getSchemaVersion(db)).toBe(SCHEMA_VERSION);
 		expect(appliedSchemaVersion(db)).toBe(SCHEMA_VERSION);
 	});
 

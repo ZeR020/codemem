@@ -38,21 +38,22 @@ import { reconcileConfiguredCoordinatorEnrollment } from "./routes/sync.js";
 function createTestStore(seedDevice = true): { store: MemoryStore; cleanup: () => void } {
 	const tmpDir = mkdtempSync(join(tmpdir(), "codemem-viewer-store-test-"));
 	const dbPath = join(tmpDir, "test.sqlite");
+	const previousKeysDir = process.env.CODEMEM_KEYS_DIR;
+	const keysDir = previousKeysDir?.trim() || join(tmpDir, "keys");
 	const rawDb = new Database(dbPath);
 	initTestSchema(rawDb);
 	if (seedDevice) {
-		rawDb
-			.prepare(
-				"INSERT INTO sync_device(device_id, public_key, fingerprint, created_at) VALUES (?, ?, ?, ?)",
-			)
-			.run("test-device-001", "test-public-key", "test-fingerprint", new Date().toISOString());
+		ensureDeviceIdentity(rawDb, { keysDir, deviceId: "test-device-001" });
 	}
 	rawDb.close();
+	process.env.CODEMEM_KEYS_DIR = keysDir;
 	const store = new MemoryStore(dbPath);
 	return {
 		store,
 		cleanup: () => {
 			store.close();
+			if (previousKeysDir == null) delete process.env.CODEMEM_KEYS_DIR;
+			else process.env.CODEMEM_KEYS_DIR = previousKeysDir;
 			rmSync(tmpDir, { recursive: true, force: true });
 		},
 	};
@@ -155,6 +156,7 @@ function insertTestMemory(
 function createTestApp(opts?: {
 	seedDevice?: boolean;
 	sweeper?: unknown;
+	getUpdateStatus?: (options: core.GetUpdateStatusOptions) => Promise<core.UpdateStatus>;
 	syncRequestRateLimit?: {
 		readLimit?: number;
 		mutationLimit?: number;
@@ -178,11 +180,13 @@ function createTestApp(opts?: {
 		return store;
 	};
 
-	const app = createApp({
+	const appOptions = {
 		sweeper: (opts?.sweeper ?? null) as never,
 		storeFactory,
+		getUpdateStatus: opts?.getUpdateStatus,
 		getSyncRuntimeStatus: opts?.getSyncRuntimeStatus,
-	});
+	};
+	const app = createApp(appOptions);
 
 	const syncApp = createSyncApp({
 		storeFactory,
@@ -504,10 +508,135 @@ describe("viewer-server", () => {
 				const res = await app.request("/api/runtime");
 				expect(res.status).toBe(200);
 				const body = (await res.json()) as Record<string, unknown>;
-				expect(body.version).toBe(VERSION);
-				expect(body).not.toHaveProperty("commit");
+				expect(body).toEqual({ version: VERSION });
 			} finally {
 				cleanup();
+			}
+		});
+
+		it("does not invoke release discovery", async () => {
+			// Arrange
+			const getUpdateStatus = vi.fn();
+			const { app, cleanup } = createTestApp({ getUpdateStatus });
+
+			try {
+				// Act
+				const res = await app.request("/api/runtime");
+
+				// Assert
+				expect(res.status).toBe(200);
+				expect(getUpdateStatus).not.toHaveBeenCalled();
+			} finally {
+				cleanup();
+			}
+		});
+	});
+
+	describe("GET /api/update-status", () => {
+		const availableStatus: core.UpdateStatus = {
+			current_version: "0.40.2",
+			latest_version: "0.41.0",
+			update_available: true,
+			first_seen_at: "2026-08-10T12:00:00.000Z",
+			checked_at: "2026-08-10T12:00:00.000Z",
+			stale: false,
+			install_kind: "npm-global",
+			auto_update_eligible: false,
+			recommended_action: "npm install -g codemem@0.41.0",
+			error: null,
+		};
+
+		it.each([
+			{
+				label: "current",
+				status: {
+					...availableStatus,
+					latest_version: "0.40.2",
+					update_available: false,
+					recommended_action: "No action required; codemem is up to date.",
+				},
+			},
+			{ label: "available", status: availableStatus },
+			{
+				label: "stale",
+				status: {
+					...availableStatus,
+					stale: true,
+					error: "registry offline",
+				},
+			},
+			{
+				label: "unavailable",
+				status: {
+					...availableStatus,
+					latest_version: null,
+					update_available: false,
+					first_seen_at: null,
+					checked_at: null,
+					install_kind: "unknown" as const,
+					recommended_action: "Check network access and try again.",
+					error: "registry request timed out",
+				},
+			},
+		])("returns the dedicated $label update-status payload", async ({ status }) => {
+			// Arrange
+			const getUpdateStatus = vi.fn().mockResolvedValue(status);
+			const { app, cleanup } = createTestApp({ getUpdateStatus });
+
+			try {
+				// Act
+				const res = await app.request("/api/update-status");
+
+				// Assert
+				expect(res.status).toBe(200);
+				expect(await res.json()).toEqual(status);
+				expect(getUpdateStatus).toHaveBeenCalledOnce();
+				expect(getUpdateStatus).toHaveBeenCalledWith(
+					expect.objectContaining({ currentVersion: VERSION }),
+				);
+			} finally {
+				cleanup();
+			}
+		});
+
+		it("returns a bounded service error when release discovery throws", async () => {
+			// Arrange
+			const getUpdateStatus = vi.fn().mockRejectedValue(new Error("unexpected failure"));
+			const { app, cleanup } = createTestApp({ getUpdateStatus });
+
+			try {
+				// Act
+				const res = await app.request("/api/update-status");
+
+				// Assert
+				expect(res.status).toBe(503);
+				expect(await res.json()).toEqual({ error: "Update status unavailable." });
+			} finally {
+				cleanup();
+			}
+		});
+
+		it("passes explicit Docker install detection to release discovery", async () => {
+			// Arrange
+			vi.stubEnv("CODEMEM_INSTALL_KIND", "docker");
+			const getUpdateStatus = vi.fn().mockResolvedValue({
+				...availableStatus,
+				install_kind: "docker",
+			});
+			const { app, cleanup } = createTestApp({ getUpdateStatus });
+
+			try {
+				// Act
+				const res = await app.request("/api/update-status");
+
+				// Assert
+				expect(res.status).toBe(200);
+				expect(getUpdateStatus).toHaveBeenCalledWith(
+					expect.objectContaining({ installKind: "docker" }),
+				);
+			} finally {
+				cleanup();
+				vi.unstubAllEnvs();
 			}
 		});
 	});
@@ -3426,6 +3555,52 @@ describe("viewer-server", () => {
 			}
 		});
 
+		it("returns peer runtime metadata from peer and status read models while redacted", async () => {
+			const { app, getStore, cleanup } = createTestApp();
+			try {
+				await app.request("/api/stats");
+				const store = getStore();
+				if (!store) throw new Error("store not initialized");
+				store.db
+					.prepare(
+						`INSERT INTO sync_peers (
+							peer_device_id, name, runtime_version, runtime_version_observed_at, created_at
+						) VALUES (?, ?, ?, ?, ?)`,
+					)
+					.run(
+						"peer-version",
+						"Versioned peer",
+						"0.40.2",
+						"2026-08-10T12:00:00.000Z",
+						"2026-08-10T00:00:00.000Z",
+					);
+
+				const peersResponse = await app.request("/api/sync/peers");
+				const peersBody = (await peersResponse.json()) as {
+					items: Array<Record<string, unknown>>;
+					redacted: boolean;
+				};
+				const statusResponse = await app.request("/api/sync/status");
+				const statusBody = (await statusResponse.json()) as {
+					peers: Array<Record<string, unknown>>;
+					redacted: boolean;
+				};
+
+				expect(peersBody.redacted).toBe(true);
+				expect(peersBody.items[0]).toMatchObject({
+					runtime_version: "0.40.2",
+					runtime_version_observed_at: "2026-08-10T12:00:00.000Z",
+				});
+				expect(statusBody.redacted).toBe(true);
+				expect(statusBody.peers[0]).toMatchObject({
+					runtime_version: "0.40.2",
+					runtime_version_observed_at: "2026-08-10T12:00:00.000Z",
+				});
+			} finally {
+				cleanup();
+			}
+		});
+
 		it("returns 400 (not 500) when POST /api/sync/peers/rename gets a malformed body", async () => {
 			const { app, cleanup } = createTestApp();
 			try {
@@ -4439,7 +4614,35 @@ describe("viewer-server", () => {
 				const body = (await res.json()) as Record<string, unknown>;
 				expect(body.error).toBe("unauthorized");
 				expect(body.reason).toBeUndefined();
+				expect(body.runtime_version).toBeUndefined();
 			} finally {
+				cleanup();
+			}
+		});
+
+		it("includes the canonical runtime version in authenticated peer status", async () => {
+			const { syncApp, ensureStore, cleanup } = createTestApp();
+			let peer: ReturnType<typeof createAuthenticatedSyncPeer> | null = null;
+			try {
+				const store = ensureStore();
+				const url = "http://localhost/v1/status";
+				peer = createAuthenticatedSyncPeer(store, { url });
+				const res = await syncApp.request(url, {
+					headers: buildAuthHeaders({
+						deviceId: peer.peerDeviceId,
+						method: "GET",
+						url,
+						bodyBytes: Buffer.alloc(0),
+						keysDir: peer.keysDir,
+					}),
+				});
+
+				expect(res.status).toBe(200);
+				expect((await res.json()) as Record<string, unknown>).toMatchObject({
+					runtime_version: VERSION,
+				});
+			} finally {
+				peer?.cleanup();
 				cleanup();
 			}
 		});
@@ -6112,7 +6315,7 @@ describe("viewer-server", () => {
 			}
 		});
 
-		it("accepts non-empty legacy pushes from unsupported peers", async () => {
+		it("rejects unknown scoped pushes from unsupported peers", async () => {
 			const { syncApp, ensureStore, cleanup } = createTestApp();
 			let peer: ReturnType<typeof createAuthenticatedSyncPeer> | null = null;
 			try {
@@ -6162,27 +6365,28 @@ describe("viewer-server", () => {
 					body: bodyText,
 				});
 
-				expect(res.status).toBe(200);
+				expect(res.status).toBe(403);
 				const body = (await res.json()) as Record<string, unknown>;
-				expect(body).toMatchObject({ applied: 1, skipped: 0, rejected: 0 });
+				expect(body).toMatchObject({ error: "scope_rejected", reason: "missing_scope" });
 				expect(
 					store.db
 						.prepare("SELECT title, scope_id FROM memory_items WHERE import_key = ?")
 						.get("legacy-push-key"),
-				).toMatchObject({ title: "Legacy push title", scope_id: "legacy-explicit" });
+				).toBeUndefined();
 			} finally {
 				peer?.cleanup();
 				cleanup();
 			}
 		});
 
-		it("does not outbound-scope-filter scoped pushes from unsupported peers", async () => {
+		it("accepts known authoritative scoped pushes from unsupported peers", async () => {
 			const { syncApp, ensureStore, cleanup } = createTestApp();
 			let peer: ReturnType<typeof createAuthenticatedSyncPeer> | null = null;
 			try {
 				const store = ensureStore();
 				const url = "http://localhost/v1/ops";
 				peer = createAuthenticatedSyncPeer(store, { url, method: "POST" });
+				grantSyncScopeToDevices(store, "unsupported-explicit", []);
 				const now = "2026-01-01T00:00:00Z";
 				const payload = {
 					sync_capability: "unsupported",

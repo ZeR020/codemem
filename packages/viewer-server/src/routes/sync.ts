@@ -159,6 +159,7 @@ import {
 	updatePeerAddresses,
 	upsertCoordinatorGroupPreference,
 	upsertProjectScopeSettingsMapping,
+	VERSION,
 	verifyRecipientReviewedIntent,
 	verifySignature,
 	writeCodememConfigFile,
@@ -788,13 +789,19 @@ function recipientInviteOnboardingPreview(
 		});
 	}
 	if (!targetIdentityId || teamId) throw new Error("recipient_invite_metadata_invalid");
-	return previewRecipientPolicyOnboarding(store.db, {
-		version: 1,
-		journey: "add_device",
-		invitationId,
-		identityId: targetIdentityId,
-		...binding,
-	});
+	return previewRecipientPolicyOnboarding(
+		store.db,
+		{
+			version: 1,
+			journey: "add_device",
+			invitationId,
+			identityId: targetIdentityId,
+			...binding,
+		},
+		{
+			addDeviceTeamEligibility: "prospective_device",
+		},
+	);
 }
 
 function recipientInviteReviewedIntent(
@@ -929,6 +936,7 @@ async function peerSupportsSyncRequirements(
 			const headers = {
 				...buildAuthHeaders({
 					deviceId: localDeviceId,
+					dbPath: store.dbPath,
 					method: "GET",
 					url,
 					bodyBytes: Buffer.alloc(0),
@@ -1407,6 +1415,7 @@ async function executeProjectShareProvisioning(store: MemoryStore, operationId: 
 				if (expectedGroupId !== groupId) throw new Error("operation_scope_mismatch");
 				const refreshed = await refreshConfiguredScopeMembershipCache(store.db, config, {
 					keysDir: syncKeysDir(),
+					dbPath: store.dbPath,
 				});
 				const group = refreshed.groups.find((item) => item.groupId === groupId);
 				if (group?.status !== "refreshed") throw new Error("authorization_refresh_failed");
@@ -1414,6 +1423,7 @@ async function executeProjectShareProvisioning(store: MemoryStore, operationId: 
 			runInitialSync: (recipientDeviceId) =>
 				runSyncPass(store.db, recipientDeviceId, {
 					keysDir: syncKeysDir(),
+					dbPath: store.dbPath,
 					scanner: store.scanner,
 					refreshAuthorization: true,
 				}),
@@ -1764,11 +1774,56 @@ export interface ReconcileConfiguredCoordinatorEnrollmentResult {
 	skipped: boolean;
 	groupsProcessed: number;
 	failedGroups: number;
+	failures: CoordinatorEnrollmentMaintenanceFailure[];
 	devicesAdded: number;
 	membershipsAdded: number;
 	identitiesAdded: number;
 	unchanged: number;
 	issues: number;
+}
+
+export type CoordinatorEnrollmentMaintenanceStage =
+	| "list_devices"
+	| "list_consumed_team_invites"
+	| "reconcile_snapshot";
+
+export interface CoordinatorEnrollmentMaintenanceFailure {
+	groupId: string;
+	stage: CoordinatorEnrollmentMaintenanceStage;
+	code: string;
+}
+
+function coordinatorEnrollmentFailureCode(error: unknown): string {
+	const message = (error instanceof Error ? error.message : String(error)).trim();
+	const httpStatus = message.match(/\((\d{3})(?::|\))/u)?.[1];
+	if (httpStatus) return `http_${httpStatus}`;
+	if (
+		new Set([
+			"coordinator_consumed_team_invite_invalid",
+			"coordinator_device_list_malformed",
+			"coordinator_group_id_invalid",
+			"coordinator_id_invalid",
+			"coordinator_invite_group_mismatch",
+			"coordinator_invite_list_malformed",
+			"reconciliation_time_invalid",
+		]).has(message)
+	) {
+		return message;
+	}
+	if (/timeout|timed out|abort/iu.test(message)) return "request_timeout";
+	if (/fetch failed|network|econn|enotfound/iu.test(message)) return "network_error";
+	return "unexpected_error";
+}
+
+function coordinatorEnrollmentFailure(
+	groupId: string,
+	stage: CoordinatorEnrollmentMaintenanceStage,
+	error: unknown,
+): CoordinatorEnrollmentMaintenanceFailure {
+	const safeGroupId = /^[A-Za-z0-9._-]{1,64}$/u.test(groupId)
+		? groupId
+		: `group_${createHash("sha256").update(groupId).digest("hex").slice(0, 12)}`;
+	return { groupId: safeGroupId, stage, code: coordinatorEnrollmentFailureCode(error) };
 }
 
 export async function reconcileConfiguredCoordinatorEnrollment(
@@ -1798,6 +1853,7 @@ export async function reconcileConfiguredCoordinatorEnrollment(
 			skipped: true,
 			groupsProcessed: 0,
 			failedGroups: 0,
+			failures: [],
 			devicesAdded: 0,
 			membershipsAdded: 0,
 			identitiesAdded: 0,
@@ -1815,6 +1871,7 @@ export async function reconcileConfiguredCoordinatorEnrollment(
 		skipped: false,
 		groupsProcessed: 0,
 		failedGroups: 0,
+		failures: [],
 		devicesAdded: 0,
 		membershipsAdded: 0,
 		identitiesAdded: 0,
@@ -1822,16 +1879,37 @@ export async function reconcileConfiguredCoordinatorEnrollment(
 		issues: 0,
 	};
 	for (const groupId of config.syncCoordinatorGroups) {
+		const [enrollmentsResult, consumedTeamInvitesResult] = await Promise.allSettled([
+			listDevices({ groupId, remoteUrl, adminSecret }),
+			listConsumedTeamInvites({ groupId, remoteUrl, adminSecret }),
+		]);
+		if (enrollmentsResult.status === "rejected") {
+			total.failures.push(
+				coordinatorEnrollmentFailure(groupId, "list_devices", enrollmentsResult.reason),
+			);
+		}
+		if (consumedTeamInvitesResult.status === "rejected") {
+			total.failures.push(
+				coordinatorEnrollmentFailure(
+					groupId,
+					"list_consumed_team_invites",
+					consumedTeamInvitesResult.reason,
+				),
+			);
+		}
+		if (
+			enrollmentsResult.status === "rejected" ||
+			consumedTeamInvitesResult.status === "rejected"
+		) {
+			total.failedGroups += 1;
+			continue;
+		}
 		try {
-			const [enrollments, consumedTeamInvites] = await Promise.all([
-				listDevices({ groupId, remoteUrl, adminSecret }),
-				listConsumedTeamInvites({ groupId, remoteUrl, adminSecret }),
-			]);
 			const result = reconcileSnapshot({
 				coordinatorId: buildBaseUrl(remoteUrl),
 				groupId,
-				enrollments,
-				consumedTeamInvites,
+				enrollments: enrollmentsResult.value,
+				consumedTeamInvites: consumedTeamInvitesResult.value,
 				localDeviceId: store.deviceId,
 			});
 			total.groupsProcessed += 1;
@@ -1840,8 +1918,9 @@ export async function reconcileConfiguredCoordinatorEnrollment(
 			total.identitiesAdded += result.identitiesAdded;
 			total.unchanged += result.unchanged;
 			total.issues += result.issues.length;
-		} catch {
+		} catch (error) {
 			total.failedGroups += 1;
+			total.failures.push(coordinatorEnrollmentFailure(groupId, "reconcile_snapshot", error));
 		}
 	}
 	return total;
@@ -2203,6 +2282,7 @@ export function createRecipientPolicyReconcilerEffects(
 			const boundary = target(scopeId);
 			const refreshed = await refreshConfiguredScopeMembershipCache(store.db, config, {
 				keysDir: syncKeysDir(),
+				dbPath: store.dbPath,
 			});
 			const group = refreshed.groups.find((item) => item.groupId === boundary.groupId);
 			if (group?.status !== "refreshed") throw new Error("recipient_policy_effect_failed");
@@ -2675,6 +2755,7 @@ async function authorizeBootstrapGrantRequest(
 				const [status, signedPayload] = await requestJson("GET", lookupUrl, {
 					headers: buildAuthHeaders({
 						deviceId: localDeviceId,
+						dbPath: store.dbPath,
 						method: "GET",
 						url: lookupUrl,
 						bodyBytes: Buffer.alloc(0),
@@ -3386,6 +3467,8 @@ function mapPeerRow(
 		last_seen_at: row.last_seen_at,
 		last_sync_at: row.last_sync_at,
 		last_error: showDiag ? row.last_error : null,
+		runtime_version: row.runtime_version ?? null,
+		runtime_version_observed_at: row.runtime_version_observed_at ?? null,
 		has_error: Boolean(row.last_error),
 		claimed_local_actor: Boolean(row.claimed_local_actor),
 		claimed_local_actor_scope: claimedLocalActorScopeStatus(store, row),
@@ -4082,6 +4165,7 @@ function readViewerBinding(dbPath: string): { host: string; port: number } | nul
 const PEERS_QUERY = `
 	SELECT p.peer_device_id, p.name, p.pinned_fingerprint, p.addresses_json,
 	       p.last_seen_at, p.last_sync_at, p.last_error,
+	       p.runtime_version, p.runtime_version_observed_at,
 	       p.projects_include_json, p.projects_exclude_json, p.claimed_local_actor,
 	       p.actor_id, p.discovered_via_coordinator_id, p.discovered_via_group_id,
 	       a.display_name AS actor_display_name
@@ -4210,6 +4294,7 @@ export function syncProtocolRoutes(getStore: StoreFactory, opts: SyncProtocolRou
 					// the same initial sync pass instead of waiting for the daemon interval.
 					await refreshConfiguredScopeMembershipCache(store.db, undefined, {
 						keysDir: syncKeysDir(),
+						dbPath: store.dbPath,
 					});
 				}
 				const [deviceId, fingerprint] = ensureDeviceIdentity(store.db, {
@@ -4227,6 +4312,7 @@ export function syncProtocolRoutes(getStore: StoreFactory, opts: SyncProtocolRou
 					device_id: deviceId,
 					protocol_version: SYNC_PROTOCOL_VERSION,
 					fingerprint,
+					runtime_version: VERSION,
 					sync_reset: addSyncScopeToBoundary(syncReset, null),
 					sync_capability: LOCAL_SYNC_CAPABILITY,
 					sync_features: LOCAL_SYNC_FEATURES,
@@ -5176,6 +5262,7 @@ export function syncRoutes(
 			// was set, so manual sync runs failed peer auth while daemon syncs worked.
 			const result = await runSyncPass(store.db, peerId, {
 				keysDir: syncKeysDir(),
+				dbPath: store.dbPath,
 				scanner: store.scanner,
 			});
 			items.push({

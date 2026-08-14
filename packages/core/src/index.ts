@@ -158,6 +158,7 @@ export type { Database } from "./db.js";
 export {
 	assertSchemaReady,
 	connect,
+	connectReadOnly,
 	DEFAULT_DB_PATH,
 	fromJson,
 	fromJsonStrict,
@@ -538,6 +539,7 @@ export {
 	writeCodememConfigFile,
 	writeWorkspaceCodememConfigFile,
 } from "./observer-config.js";
+export * from "./operational-status.js";
 export * from "./outcome-evidence.js";
 export type { PackArtifacts } from "./pack.js";
 export {
@@ -575,6 +577,26 @@ export {
 	resolvePiAgentDir,
 	resolvePiObserverConfig,
 } from "./pi-observer-config.js";
+export type {
+	BlockedPolicyTeamDeviceEligibilityResult,
+	DerivePolicyTeamDeviceEligibilityInput,
+	EligiblePolicyTeamDeviceEligibilityResult,
+	PolicyTeamDeviceDecision,
+	PolicyTeamDeviceEligibilityBlock,
+	PolicyTeamDeviceEligibilityBlockCode,
+	PolicyTeamDeviceEligibilityDecision,
+	PolicyTeamDeviceEligibilityDevice,
+	PolicyTeamDeviceEligibilityIdentity,
+	PolicyTeamDeviceEligibilityMembership,
+	PolicyTeamDeviceEligibilityMode,
+	PolicyTeamDeviceEligibilityResult,
+} from "./policy-team-device-eligibility.js";
+export {
+	derivePolicyTeamDeviceEligibility,
+	isPolicyTeamMembershipActiveForMode,
+	POLICY_TEAM_DEVICE_DECISIONS,
+	POLICY_TEAM_DEVICE_ELIGIBILITY_MODES,
+} from "./policy-team-device-eligibility.js";
 export {
 	projectBasename,
 	projectClause,
@@ -734,6 +756,7 @@ export type {
 	RecipientPolicyDerivationIdentityDevice,
 	RecipientPolicyDerivationProjectRecipient,
 	RecipientPolicyDerivationTeam,
+	RecipientPolicyDerivationTeamDeviceDecision,
 	RecipientPolicyDerivationTeamMembership,
 	RecipientPolicyEffectiveDeviceSource,
 	RecipientPolicyReconciliationStepRecord,
@@ -802,6 +825,7 @@ export {
 export { clearMemoryRefs, normalizeConcept, populateMemoryRefs } from "./ref-populate.js";
 export type { RefQueryOptions, RefQueryResult } from "./ref-queries.js";
 export { findByConcept, findByFile } from "./ref-queries.js";
+export * from "./release-discovery.js";
 export * from "./retrieval-ledger.js";
 export * from "./retrieval-surface-ledger.js";
 export type {
@@ -810,6 +834,7 @@ export type {
 	NewIdentityDevice,
 	NewMaintenanceJob,
 	NewPolicyTeam,
+	NewPolicyTeamDeviceDecisionRow,
 	NewPolicyTeamMembership,
 	NewProjectRecipient,
 	NewRecipientPolicyAuthorityStateRow,
@@ -817,6 +842,7 @@ export type {
 	NewRecipientPolicyReconciliationStep,
 	NewRecipientPolicyReviewResolution,
 	PolicyTeam,
+	PolicyTeamDeviceDecisionRow,
 	PolicyTeamMembership,
 	ProjectRecipient,
 	RecipientPolicyAuthorityStateRow,
@@ -1028,8 +1054,9 @@ export {
 } from "./sync-discovery.js";
 export type { RequestJsonOptions } from "./sync-http-client.js";
 export { buildBaseUrl, requestJson } from "./sync-http-client.js";
-export type { EnsureDeviceIdentityOptions } from "./sync-identity.js";
+export type { DeviceIdentityErrorCode, EnsureDeviceIdentityOptions } from "./sync-identity.js";
 export {
+	DeviceIdentityError,
 	ensureDeviceIdentity,
 	fingerprintPublicKey,
 	generateKeypair,
@@ -1194,3 +1221,13 @@ export {
 	semanticSearch,
 	storeVectors,
 } from "./vectors.js";
+export type {
+	ViewerLivenessProbeDependencies,
+	ViewerLivenessProbeResult,
+	ViewerTarget,
+} from "./viewer-probe.js";
+export {
+	probeCodememViewerLiveness,
+	VIEWER_SERVICE_DISCRIMINATOR,
+	viewerUrl,
+} from "./viewer-probe.js";

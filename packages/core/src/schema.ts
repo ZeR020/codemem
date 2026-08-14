@@ -719,6 +719,8 @@ export const syncPeers = sqliteTable("sync_peers", {
 	last_seen_at: text("last_seen_at"),
 	last_sync_at: text("last_sync_at"),
 	last_error: text("last_error"),
+	runtime_version: text("runtime_version"),
+	runtime_version_observed_at: text("runtime_version_observed_at"),
 	discovered_via_coordinator_id: text("discovered_via_coordinator_id"),
 	discovered_via_group_id: text("discovered_via_group_id"),
 	trust_provenance: text("trust_provenance"),
@@ -982,6 +984,7 @@ export const policyTeams = sqliteTable("policy_teams", {
 	team_id: text("team_id").primaryKey(),
 	display_name: text("display_name").notNull(),
 	status: text("status").notNull(),
+	device_eligibility_mode: text("device_eligibility_mode").notNull().default("person_all_devices"),
 	provenance: text("provenance").notNull(),
 	revision: text("revision").notNull(),
 	migration_state: text("migration_state").notNull(),
@@ -1021,6 +1024,29 @@ export const policyTeamMemberships = sqliteTable(
 export type PolicyTeamMembership = typeof policyTeamMemberships.$inferSelect;
 export type NewPolicyTeamMembership = typeof policyTeamMemberships.$inferInsert;
 
+export const policyTeamDeviceDecisions = sqliteTable(
+	"policy_team_device_decisions",
+	{
+		team_id: text("team_id")
+			.notNull()
+			.references(() => policyTeams.team_id, { onDelete: "cascade" }),
+		device_id: text("device_id").notNull(),
+		decision: text("decision").notNull(),
+		assignment_version: integer("assignment_version").notNull().default(0),
+		provenance: text("provenance").notNull(),
+		revision: text("revision").notNull(),
+		created_at: text("created_at").notNull(),
+		updated_at: text("updated_at").notNull(),
+	},
+	(table) => [
+		primaryKey({ columns: [table.team_id, table.device_id] }),
+		index("idx_policy_team_device_decisions_device").on(table.device_id),
+	],
+);
+
+export type PolicyTeamDeviceDecisionRow = typeof policyTeamDeviceDecisions.$inferSelect;
+export type NewPolicyTeamDeviceDecisionRow = typeof policyTeamDeviceDecisions.$inferInsert;
+
 export const identityDevices = sqliteTable(
 	"identity_devices",
 	{
@@ -1031,6 +1057,7 @@ export const identityDevices = sqliteTable(
 		provenance: text("provenance").notNull(),
 		revision: text("revision").notNull(),
 		migration_state: text("migration_state").notNull(),
+		assignment_version: integer("assignment_version").notNull().default(0),
 		source_fingerprint: text("source_fingerprint"),
 		idempotency_key: text("idempotency_key").notNull().unique(),
 		created_at: text("created_at").notNull(),
@@ -1068,6 +1095,11 @@ export const projectRecipients = sqliteTable(
 		}),
 		projectStatusIdx: index("idx_project_recipients_project_status").on(
 			table.canonical_project_identity,
+			table.status,
+		),
+		recipientStatusIdx: index("idx_project_recipients_recipient_status").on(
+			table.recipient_kind,
+			table.recipient_id,
 			table.status,
 		),
 	}),
@@ -1249,6 +1281,7 @@ export const schema = {
 	coordinatorEnrollmentReconciliationIssues,
 	policyTeams,
 	policyTeamMemberships,
+	policyTeamDeviceDecisions,
 	identityDevices,
 	projectRecipients,
 	recipientManagedProjectProjections,
