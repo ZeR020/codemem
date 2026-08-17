@@ -14,6 +14,7 @@ import {
 	titleCase,
 } from "../../../lib/format";
 import { healthData, healthResourceIsStale, state } from "../../../lib/state";
+import { formatAgentClientList } from "../../settings/data/value-helpers";
 import {
 	buildHealthCard,
 	renderActionList,
@@ -330,8 +331,8 @@ export function renderHealthOverview() {
 			actionLabel: "View diagnostics",
 		});
 		recommendations.push({
-			label: "Then retry failed batches for impacted sessions.",
-			command: "codemem db raw-events-retry <opencode_session_id>",
+			label: `Then retry failed batches for impacted sessions (${formatAgentClientList()}).`,
+			command: "codemem db raw-events-retry",
 		});
 	} else if (syncState === "stopped") {
 		recommendations.push({
