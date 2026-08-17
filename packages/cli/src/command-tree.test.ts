@@ -55,6 +55,8 @@ describe("root command tree", () => {
 				"claude-hook-ingest",
 				"codex-hook-inject",
 				"codex-hook-ingest",
+				"pi-hook-inject",
+				"pi-hook-ingest",
 				"enqueue-raw-event",
 			].sort(),
 		);
@@ -78,6 +80,8 @@ describe("root command tree", () => {
 			"claude-hook-ingest",
 			"codex-hook-inject",
 			"codex-hook-ingest",
+			"pi-hook-inject",
+			"pi-hook-ingest",
 			"enqueue-raw-event",
 		]) {
 			expect(help).not.toMatch(new RegExp(`^\\s+${hiddenName}(?:\\s|$)`, "m"));
