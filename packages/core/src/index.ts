@@ -611,6 +611,15 @@ export {
 	buildMemoryPackWithTraceAsync,
 	estimateTokens,
 } from "./pack.js";
+export type { PiFlushSignal, PiHookAdapterEvent, PiHookRawEventEnvelope } from "./pi-hooks.js";
+export {
+	buildIngestPayloadFromPiEvent,
+	buildPiFlushSignalFromEvent,
+	buildRawEventEnvelopeFromPiEvent,
+	MAPPABLE_PI_EVENTS,
+	mapPiEventPayload,
+	PI_FLUSH_ONLY_EVENTS,
+} from "./pi-hooks.js";
 export type {
 	BlockedPolicyTeamDeviceEligibilityResult,
 	DerivePolicyTeamDeviceEligibilityInput,
