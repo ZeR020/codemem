@@ -2,6 +2,7 @@ packages:
   - packages/*
 
 allowBuilds:
+  '@google/genai': set this to true or false
   '@opencode/cli': true
   better-sqlite3: false
   esbuild: true
