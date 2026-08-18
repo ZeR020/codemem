@@ -198,7 +198,7 @@ describe("recipient-policy invitations", () => {
 	it("inspects and accepts add-device access with direct, inherited, and excluded Projects", async () => {
 		vi.mocked(api.inspectCoordinatorInvite).mockResolvedValue({
 			kind: "add_device",
-			recipient_name: "Local Identity",
+			recipient_name: "local:0ea043cc-c61c-427d-8b77-572331b9855c",
 			device_name: "Travel Laptop",
 			onboarding: addDevicePreview,
 		});
@@ -232,7 +232,6 @@ describe("recipient-policy invitations", () => {
 		act(() => button("Accept invitation", dialog).click());
 		await vi.waitFor(() => expect(api.importCoordinatorInvite).toHaveBeenCalledOnce());
 		expect(api.importCoordinatorInvite).toHaveBeenCalledWith("recipient-invite", {
-			recipient_name: "Local Identity",
 			device_name: "Travel Laptop",
 			reviewed_onboarding_digest: addDevicePreview.reviewedOnboardingDigest,
 		});
@@ -337,6 +336,47 @@ describe("recipient-policy invitations", () => {
 		expect(reopenedInvite.value).toBe("");
 		expect(reopenedDialog.querySelector("#recipient-invitation-result")).toBeNull();
 		expect(button("Review invitation", reopenedDialog).disabled).toBe(false);
+	});
+
+	it("requires a human Identity name before accepting a Team invitation", async () => {
+		vi.mocked(api.inspectCoordinatorInvite).mockResolvedValue({
+			kind: "team_member",
+			recipient_name: "local:0ea043cc-c61c-427d-8b77-572331b9855c",
+			device_name: "Work Laptop",
+			onboarding: teamPreview,
+		});
+		vi.mocked(api.importCoordinatorInvite).mockResolvedValue({ status: "accepted" });
+		mount();
+
+		act(() => button("Review invitation").click());
+		const textarea = document.querySelector<HTMLTextAreaElement>("textarea");
+		const dialog = document.querySelector('[role="dialog"]');
+		if (!textarea || !dialog) throw new Error("acceptance dialog missing");
+		act(() => {
+			textarea.value = "team-member-invite";
+			textarea.dispatchEvent(new Event("input", { bubbles: true }));
+		});
+		act(() => button("Review invitation", dialog).click());
+		await vi.waitFor(() => expect(dialog.textContent).toContain("Current Projects for"));
+
+		const recipientName = dialog.querySelector<HTMLInputElement>("#recipient-onboarding-name");
+		if (!recipientName) throw new Error("recipient Identity name field missing");
+		expect(recipientName.value).toBe("");
+		expect(dialog.textContent).toContain("Identity display name is required");
+		expect(button("Accept invitation", dialog).disabled).toBe(true);
+
+		act(() => {
+			recipientName.value = "Fresh Recipient";
+			recipientName.dispatchEvent(new Event("input", { bubbles: true }));
+		});
+		expect(button("Accept invitation", dialog).disabled).toBe(false);
+		act(() => button("Accept invitation", dialog).click());
+		await vi.waitFor(() => expect(api.importCoordinatorInvite).toHaveBeenCalledOnce());
+		expect(api.importCoordinatorInvite).toHaveBeenCalledWith("team-member-invite", {
+			recipient_name: "Fresh Recipient",
+			device_name: "Work Laptop",
+			reviewed_onboarding_digest: teamPreview.reviewedOnboardingDigest,
+		});
 	});
 
 	it("surfaces restart guidance when Team acceptance enables sync", async () => {
@@ -556,6 +596,13 @@ describe("recipient-policy invitations", () => {
 
 	it.each([
 		["empty names", "project-share-recipient-name", "   ", "Identity display name is required"],
+		["machine actor names", "project-share-recipient-name", "actor:peer", "human-readable name"],
+		[
+			"machine device names",
+			"project-share-device-name",
+			"device_abc123def",
+			"human-readable name",
+		],
 		[
 			"names over 120 Unicode code points",
 			"project-share-recipient-name",

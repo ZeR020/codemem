@@ -272,6 +272,54 @@ describe("createCoordinatorApp dependency injection", () => {
 		expect(store.close).toHaveBeenCalledTimes(1);
 	});
 
+	it("validates human device names at the coordinator rename boundary", async () => {
+		const renameDevice = vi.fn(async () => true);
+		const store = createMockStore({
+			renameDevice,
+			getEnrollment: vi.fn(async () => ({
+				...enrolledDevice(),
+				display_name: "Desk laptop",
+			})),
+		});
+		const app = createCoordinatorApp({
+			storeFactory: () => store,
+			runtime: {
+				adminSecret: () => "test-secret",
+				now: () => "2026-03-28T00:00:00Z",
+			},
+			requestVerifier: allowRequest,
+		});
+		const headers = {
+			"X-Codemem-Coordinator-Admin": "test-secret",
+			"Content-Type": "application/json",
+		};
+
+		const invalid = await app.request("/v1/admin/devices/rename", {
+			method: "POST",
+			headers,
+			body: JSON.stringify({
+				group_id: "g1",
+				device_id: "device-a",
+				display_name: "local:a57f7c7c-d531-4148-9917-78acb586caad",
+			}),
+		});
+		expect(invalid.status).toBe(400);
+		expect(await invalid.json()).toEqual({ error: "display_name_invalid" });
+		expect(renameDevice).not.toHaveBeenCalled();
+
+		const valid = await app.request("/v1/admin/devices/rename", {
+			method: "POST",
+			headers,
+			body: JSON.stringify({
+				group_id: "g1",
+				device_id: "device-a",
+				display_name: "  Desk   laptop  ",
+			}),
+		});
+		expect(valid.status).toBe(200);
+		expect(renameDevice).toHaveBeenCalledWith("g1", "device-a", "Desk laptop");
+	});
+
 	it("rejects an invalid invite expires_at with 400 instead of a 500", async () => {
 		const store = createMockStore({});
 		const app = createCoordinatorApp({
@@ -395,6 +443,31 @@ describe("createCoordinatorApp dependency injection", () => {
 		);
 
 		const callsBeforeInvalidIntent = createInvite.mock.calls.length;
+		const machineInviterName = await app.request("/v1/admin/invites", {
+			method: "POST",
+			headers,
+			body: JSON.stringify({
+				...base,
+				operation_id: `share_${"e".repeat(40)}`,
+				reviewed_project_set_digest: "f".repeat(64),
+				inviter_actor_id: "actor-adam",
+				inviter_display_name: "local:a57f7c7c-d531-4148-9917-78acb586caad",
+				inviter_device_id: "device-adam",
+				pending_person_id: "pending-brian",
+				project_summaries: [{ display_name: "codemem", existing_memory_count: 3 }],
+				project_intent: [
+					{
+						canonical_identity: "git:https://example.test/codemem",
+						display_name: "codemem",
+						existing_memory_count: 3,
+					},
+				],
+			}),
+		});
+		expect(machineInviterName.status).toBe(400);
+		expect(await machineInviterName.json()).toEqual({ error: "inviter_display_name_invalid" });
+		expect(createInvite).toHaveBeenCalledTimes(callsBeforeInvalidIntent);
+
 		const invalidCanonicalIntent = await app.request("/v1/admin/invites", {
 			method: "POST",
 			headers,
@@ -1021,6 +1094,12 @@ describe("createCoordinatorApp dependency injection", () => {
 	it.each([
 		["recipient_display_name", "Brian\u0000", "recipient_display_name_invalid"],
 		["device_display_name", "x".repeat(121), "device_display_name_too_long"],
+		[
+			"recipient_display_name",
+			"local:a57f7c7c-d531-4148-9917-78acb586caad",
+			"recipient_display_name_invalid",
+		],
+		["device_display_name", "e67fda8c4b44", "device_display_name_invalid"],
 	])("rejects malformed Team invite %s values", async (field, value, expectedError) => {
 		const publicKey = "recipient-public-key";
 		const consumeRecipientInvite = vi.fn();
@@ -1064,6 +1143,62 @@ describe("createCoordinatorApp dependency injection", () => {
 		expect(response.status).toBe(400);
 		expect(await response.json()).toEqual({ error: expectedError });
 		expect(consumeRecipientInvite).not.toHaveBeenCalled();
+	});
+
+	it.each([
+		[
+			"recipient_display_name",
+			"identity:S5gx0LqXsmllifW-1XvXiLfZ",
+			"recipient_display_name_invalid",
+		],
+		["device_display_name", "a57f7c7c-d531-4148-9917-78acb586caad", "device_display_name_invalid"],
+	])("rejects machine-shaped Project invite %s values", async (field, value, expectedError) => {
+		const publicKey = "recipient-public-key";
+		const operationId = `share_${"c".repeat(40)}`;
+		const consumeProjectInvite = vi.fn();
+		const store = createMockStore({
+			getInviteByTokenForInspection: vi.fn(async () => ({
+				invite_id: "invite-project-invalid-name",
+				group_id: "g1",
+				token: "project-token",
+				policy: "auto_admit",
+				expires_at: "2099-01-01T00:00:00Z",
+				created_at: "2026-03-28T00:00:00Z",
+				created_by: null,
+				team_name_snapshot: "Coordinator One",
+				revoked_at: null,
+				operation_id: operationId,
+				reviewed_project_set_digest: acceptedProjectDigest(),
+				project_intent_json: JSON.stringify([ACCEPTED_PROJECT]),
+				inviter_device_id: "device-adam",
+			})),
+			consumeProjectInvite,
+		});
+		const app = createCoordinatorApp({
+			storeFactory: () => store,
+			runtime: { adminSecret: () => "test-secret", now: () => "2026-03-28T00:00:00Z" },
+			requestVerifier: allowRequest,
+		});
+
+		const response = await app.request("/v1/join", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({
+				token: "project-token",
+				operation_id: operationId,
+				device_id: "device-brian",
+				public_key: publicKey,
+				fingerprint: fingerprintPublicKey(publicKey),
+				recipient_actor_id: "actor-brian",
+				recipient_display_name: "Brian Example",
+				device_display_name: "Brian's MacBook",
+				[field]: value,
+			}),
+		});
+
+		expect(response.status).toBe(400);
+		expect(await response.json()).toEqual({ error: expectedError });
+		expect(consumeProjectInvite).not.toHaveBeenCalled();
 	});
 
 	it("fails closed when project-first acceptance omits identity confirmation", async () => {
