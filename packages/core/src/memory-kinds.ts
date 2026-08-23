@@ -6,7 +6,7 @@
  * the kinds never drift.
  */
 
-export const MEMORY_KIND_DESCRIPTIONS: Record<string, string> = {
+export const MEMORY_KIND_DESCRIPTIONS = {
 	discovery: "Something learned about the codebase, architecture, or tools",
 	change: "A code change that was made",
 	feature: "A new feature that was implemented",
@@ -14,10 +14,15 @@ export const MEMORY_KIND_DESCRIPTIONS: Record<string, string> = {
 	refactor: "Code that was refactored or restructured",
 	decision: "A design or architecture decision",
 	exploration: "An experiment or investigation (may not have shipped)",
-};
+} as const satisfies Record<string, string>;
+
+export type RememberMemoryKind = keyof typeof MEMORY_KIND_DESCRIPTIONS;
 
 /** The seven kinds the MCP remember tools accept. */
-export const REMEMBER_MEMORY_KINDS = Object.keys(MEMORY_KIND_DESCRIPTIONS);
+export const REMEMBER_MEMORY_KINDS = Object.keys(MEMORY_KIND_DESCRIPTIONS) as [
+	RememberMemoryKind,
+	...RememberMemoryKind[],
+];
 
 /** Kinds accepted by the store: remembers plus the observer's session_summary. */
 export const ALLOWED_MEMORY_KINDS = new Set<string>([...REMEMBER_MEMORY_KINDS, "session_summary"]);
