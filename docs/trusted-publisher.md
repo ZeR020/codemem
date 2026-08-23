@@ -18,7 +18,7 @@ Trusted publishing must be configured for every package the workflow publishes:
 - `@codemem/server`
 - `codemem`
 - `@codemem/opencode-plugin`
-
+- `@codemem/pi-extension`
 ## GitHub workflow behavior
 
 `.github/workflows/release.yml` publishes from two triggers:
@@ -36,7 +36,7 @@ dependency order:
 3. `@codemem/server`
 4. `codemem`
 5. `@codemem/opencode-plugin`
-
+6. `@codemem/pi-extension`
 Publish command shape:
 
 - `pnpm --filter <package> publish --provenance --access public --tag <dist-tag>`
@@ -72,7 +72,7 @@ on one package), use the `workflow_dispatch` path instead of retagging:
 ## Verification checklist
 
 - Tag push `vX.Y.Z` runs `Release` and `publish-npm` succeeds
-- All five package versions on npm match the release tag
+- All six package versions on npm match the release tag
 - npm provenance attestation is present for published artifacts
 - For recovery: `workflow_dispatch` rerun completes with `skip:` lines for
   packages already at the tag's version and `publish:` lines for any that
