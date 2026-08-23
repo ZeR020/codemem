@@ -11,11 +11,13 @@
  * Surfaces:
  *   - Ingest → POST /api/pi-hooks → CLI pi-hook-ingest
  *   - Injection → before_agent_start systemPrompt append only (never message)
- *   - Native memory tools are not registered in this slice
-
+ *   - Tools → pi.registerTool × 14 when pi.tools_mode === "native"
  *   - session_before_compact → flush signal only (never return compaction)
  */
 
+import { existsSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { isAbsolute, join } from "node:path";
 import type {
 	BeforeAgentStartEvent,
 	ExtensionAPI,
@@ -49,6 +51,7 @@ import {
 	serializeToolOutput,
 	stableMessageEntryId,
 } from "./payloads.js";
+import { registerMemoryTools } from "./tools.js";
 import { createViewerRuntime, stopViewerTracking, type ViewerRuntime } from "./viewer.js";
 
 /** Test-only CLI override. Null in production. */
@@ -179,6 +182,56 @@ async function safeIngest(
 	}
 }
 
+/** Resolve pi agent dir (~/.pi/agent), honoring PI_CODING_AGENT_DIR. */
+function resolvePiAgentDirForMcp(): string {
+	const fromEnv = process.env.PI_CODING_AGENT_DIR?.trim();
+	if (fromEnv) {
+		if (fromEnv.startsWith("~/")) return join(homedir(), fromEnv.slice(2));
+		return isAbsolute(fromEnv) ? fromEnv : join(homedir(), fromEnv);
+	}
+	return join(homedir(), ".pi", "agent");
+}
+
+function mcpJsonHasCodememEntry(path: string): boolean {
+	if (!existsSync(path)) return false;
+	try {
+		const raw = readFileSync(path, "utf8");
+		const parsed = JSON.parse(raw) as unknown;
+		if (parsed == null || typeof parsed !== "object" || Array.isArray(parsed)) return false;
+		const servers = (parsed as Record<string, unknown>).mcpServers;
+		if (servers == null || typeof servers !== "object" || Array.isArray(servers)) return false;
+		return Object.hasOwn(servers as object, "codemem");
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * D6: when native tools are registered but a codemem mcp.json entry also exists,
+ * warn once so the user can pick a single surface via pi.tools_mode.
+ */
+function warnDuplicateToolSurface(ctx: ExtensionContext, cwd: string): void {
+	try {
+		const candidates = [join(resolvePiAgentDirForMcp(), "mcp.json"), join(cwd, ".pi", "mcp.json")];
+		const hit = candidates.some((p) => mcpJsonHasCodememEntry(p));
+		if (!hit) return;
+		const msg =
+			'codemem: both native tools and an mcp.json codemem entry are present. Pick one surface: set pi.tools_mode to "mcp-adapter" (or CODEMEM_PI_TOOLS_MODE=mcp-adapter) to use MCP only, or remove the codemem entry from mcp.json to keep native tools.';
+		try {
+			const ui = (ctx as { ui?: { notify?: (m: string) => void } }).ui;
+			if (ui && typeof ui.notify === "function") {
+				ui.notify(msg);
+				return;
+			}
+		} catch {
+			// fall through to console
+		}
+		console.warn(msg);
+	} catch {
+		// best-effort; never break session_start
+	}
+}
+
 function resolveProject(cwd: string, envProject?: string | null): string | null {
 	const fromEnv = envProject?.trim() || process.env.CODEMEM_PROJECT?.trim();
 	if (fromEnv) return fromEnv;
@@ -191,6 +244,16 @@ function readPathFromToolInput(input: Record<string, unknown>): string | null {
 		if (typeof value === "string" && value.trim()) return value.trim();
 	}
 	return null;
+}
+/**
+ * Runtime tool_result content may arrive as an array (declared type) or as a
+ * plain string. Normalize to text blocks before appending file context so a
+ * string body is never dropped (maintainer blocker #2).
+ */
+function normalizeToolResultContent(content: unknown): Array<{ type: "text"; text: string }> {
+	if (typeof content === "string" && content) return [{ type: "text", text: content }];
+	if (Array.isArray(content)) return content as Array<{ type: "text"; text: string }>;
+	return [];
 }
 
 /**
@@ -207,6 +270,11 @@ export default function codememPiExtension(pi: ExtensionAPI): void {
 		execImpl: testExecImpl,
 	});
 
+	// Native tools only when not in mcp-adapter mode (D6).
+	if (config.toolsMode === "native") {
+		registerMemoryTools(pi, client);
+	}
+
 	// ---- session_start ----
 	pi.on("session_start", async (event: SessionStartEvent, ctx: ExtensionContext) => {
 		const sessionId = ctx.sessionManager.getSessionId();
@@ -220,6 +288,11 @@ export default function codememPiExtension(pi: ExtensionAPI): void {
 		state.toolCalls.clear();
 		state.seenEventKeys = loadCursorsFromSession(ctx, sessionId);
 		client.rekey(sessionId, cwd, project);
+
+		// D6: warn once when native mode coexists with an mcp.json codemem entry.
+		if (config.toolsMode === "native") {
+			warnDuplicateToolSurface(ctx, cwd);
+		}
 
 		// Start viewer on first session need (not in factory).
 		void client.ensureViewer(ctx.signal).catch(() => {});
@@ -349,7 +422,7 @@ export default function codememPiExtension(pi: ExtensionAPI): void {
 						const block = fileCtx.preformatted
 							? fileCtx.text
 							: formatPiInjectionBlock(fileCtx.text, 4_000);
-						const existing = Array.isArray(event.content) ? [...event.content] : [];
+						const existing = normalizeToolResultContent(event.content);
 						return {
 							content: [...existing, { type: "text" as const, text: `\n\n${block}` }],
 						};
@@ -467,3 +540,4 @@ export {
 	formatPiInjectionBlock,
 	stableMessageEntryId,
 } from "./payloads.js";
+export { expectedToolNames, registerMemoryTools } from "./tools.js";
