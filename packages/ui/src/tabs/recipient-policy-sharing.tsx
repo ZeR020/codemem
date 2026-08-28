@@ -1,4 +1,5 @@
-import { render } from "preact";
+// biome-ignore-all lint/a11y/noNoninteractiveTabindex: APG requires empty tab panels to remain keyboard-reachable.
+import { Fragment, render } from "preact";
 import { useEffect, useRef, useState } from "preact/hooks";
 import { LoadingCardList } from "../components/LoadingCardList";
 import type {
@@ -9,12 +10,17 @@ import type {
 	RecipientPolicyIntentGraphV1,
 } from "../lib/api/sync";
 import { deviceIdentityAttentionItems } from "../lib/device-identity-inventory";
+import {
+	type ProjectIdentityPresentationItem,
+	projectIdentitySummaryGroups,
+} from "../lib/project-identity-presentation";
 import { RecipientPolicyInvitations } from "./recipient-policy-invitations";
 import {
 	openRecipientPolicyManagement,
 	type RecipientPolicyManagementProject,
 } from "./recipient-policy-management";
 import type { ReceivedProjectShare } from "./recipient-policy-projects";
+import { RecipientPolicyTeamSettings } from "./recipient-policy-team-settings";
 
 export interface RecipientPolicySharingOptions {
 	loading?: boolean;
@@ -25,6 +31,8 @@ export interface RecipientPolicySharingOptions {
 	deviceInventory?: DeviceIdentityInventoryV1;
 	onOpenTeamSetup?: (candidateRef: string) => void;
 	onReviewDevices?: (deviceId?: string) => void;
+	onTeamRenamed?: () => Promise<unknown> | unknown;
+	renameTeam?: typeof import("../lib/api/sync").renameRecipientPolicyTeam;
 	coordinatorEnrollmentIssueCount?: number;
 	teamSetupSummary?: LegacyTeamSetupSummaryResponseV1;
 	teamSetupLoading?: boolean;
@@ -32,10 +40,10 @@ export interface RecipientPolicySharingOptions {
 }
 
 const TEAM_SETUP_STATUS_LABELS: Record<LegacyTeamSetupStatusV1, string> = {
-	needs_setup: "Needs setup",
-	in_progress: "In progress",
-	stale: "Needs setup",
-	ready: "Ready",
+	needs_setup: "Ready to review",
+	in_progress: "Migration in progress",
+	stale: "Migration review needs update",
+	ready: "Migrated",
 };
 
 const TEAM_SETUP_STATUS_CLASSES: Record<LegacyTeamSetupStatusV1, string> = {
@@ -45,16 +53,43 @@ const TEAM_SETUP_STATUS_CLASSES: Record<LegacyTeamSetupStatusV1, string> = {
 	ready: "",
 };
 
+// Safari/VoiceOver can drop list semantics when CSS removes native markers.
+const EXPLICIT_LIST_ROLE = { role: "list" } as const;
+const EXPLICIT_LIST_ITEM_ROLE = { role: "listitem" } as const;
+
 function teamSetupStatusLabel(status: unknown): string {
 	return typeof status === "string" && Object.hasOwn(TEAM_SETUP_STATUS_LABELS, status)
 		? TEAM_SETUP_STATUS_LABELS[status as LegacyTeamSetupStatusV1]
-		: "Needs setup";
+		: "Ready to review";
 }
 
 function teamSetupStatusClass(status: unknown): string {
 	return typeof status === "string" && Object.hasOwn(TEAM_SETUP_STATUS_CLASSES, status)
 		? TEAM_SETUP_STATUS_CLASSES[status as LegacyTeamSetupStatusV1]
 		: "needs_attention";
+}
+
+interface TeamSetupCandidateGroup {
+	displayName: string;
+	candidates: LegacyTeamSetupCandidateSummaryV1[];
+}
+
+function teamSetupCandidateGroups(
+	candidates: LegacyTeamSetupCandidateSummaryV1[],
+): TeamSetupCandidateGroup[] {
+	const groups = new Map<string, TeamSetupCandidateGroup>();
+	for (const candidate of candidates) {
+		const key = candidate.displayName.trim().toLowerCase();
+		const group = groups.get(key);
+		if (group) groups.set(key, { ...group, candidates: [...group.candidates, candidate] });
+		else groups.set(key, { displayName: candidate.displayName, candidates: [candidate] });
+	}
+	return [...groups.values()].map((group) => ({
+		...group,
+		candidates: [...group.candidates].sort((left, right) =>
+			left.candidateRef < right.candidateRef ? -1 : left.candidateRef > right.candidateRef ? 1 : 0,
+		),
+	}));
 }
 
 function TeamSetupOverview({
@@ -66,38 +101,90 @@ function TeamSetupOverview({
 }) {
 	if (candidates.length === 0) return null;
 	const pending = candidates.filter((candidate) => candidate.status !== "ready");
+	if (pending.length === 0) return null;
+	const groups = teamSetupCandidateGroups(pending);
 	return (
 		<aside
 			aria-labelledby="sharing-team-setup-heading"
 			className="peer-card peer-card--padded recipient-policy-sharing-attention"
 		>
-			<h3 id="sharing-team-setup-heading">
-				{pending.length > 0
-					? `${pending.length} ${pending.length === 1 ? "Team needs" : "Teams need"} setup`
-					: "Team setup"}
-			</h3>
-			{pending.length > 0 ? (
-				<p>Tell Codemem who uses each device before using these Teams for sharing.</p>
-			) : null}
-			<ul className="recipient-policy-sharing-details" aria-label="Team setup status">
-				{candidates.map((candidate) => (
-					<li key={candidate.candidateRef}>
-						<strong>{candidate.displayName}</strong> —{` `}
-						<span
-							className={`project-status-badge ${teamSetupStatusClass(candidate.status)}`.trim()}
-						>
-							{teamSetupStatusLabel(candidate.status)}
-						</span>
-						{candidate.status !== "ready" && onOpenTeamSetup ? (
-							<button
-								aria-label={`Continue setup for ${candidate.displayName}`}
-								className="settings-button recipient-policy-sharing-target-24"
-								onClick={() => onOpenTeamSetup(candidate.candidateRef)}
-								type="button"
-							>
-								Continue setup
-							</button>
+			<h3 id="sharing-team-setup-heading">Legacy groups to migrate</h3>
+			<p>
+				Current devices are proposed for review. No Team membership or Project access changes happen
+				until you finish the migration.
+			</p>
+			<ul
+				{...EXPLICIT_LIST_ROLE}
+				className="recipient-policy-sharing-team-setup-list"
+				aria-label="Team setup status"
+			>
+				{groups.map((group) => (
+					<li
+						{...EXPLICIT_LIST_ITEM_ROLE}
+						className="recipient-policy-sharing-team-setup-group"
+						key={group.displayName}
+					>
+						{group.candidates.length > 1 ? (
+							<div className="recipient-policy-sharing-team-setup-group-title">
+								<strong>{group.displayName}</strong>
+								<span className="small">{group.candidates.length} Teams</span>
+							</div>
 						) : null}
+						<div className="recipient-policy-sharing-team-setup-rows">
+							{group.candidates.map((candidate, index) => {
+								const ordinal = `${index + 1} of ${group.candidates.length}`;
+								const safeSummary = `${countLabel(candidate.deviceCount, "device")}, ${countLabel(candidate.projectCount, "Project")}`;
+								const actionLabel =
+									group.candidates.length > 1
+										? `Review and migrate ${group.displayName} ${ordinal}: ${safeSummary}`
+										: `Review and migrate ${candidate.displayName}: ${safeSummary}`;
+								return (
+									<div
+										className="recipient-policy-sharing-team-setup-row"
+										key={candidate.candidateRef}
+									>
+										<span className="recipient-policy-sharing-team-setup-label">
+											{group.candidates.length > 1 ? (
+												<span className="small">
+													Team {ordinal} · {safeSummary}
+												</span>
+											) : (
+												<>
+													<strong>{candidate.displayName}</strong>
+													<span className="small"> · {safeSummary}</span>
+												</>
+											)}
+											<span
+												aria-hidden="true"
+												className="recipient-policy-sharing-team-setup-separator"
+											>
+												{" "}
+												—{" "}
+											</span>
+										</span>
+										<span className="recipient-policy-sharing-team-setup-status">
+											<span
+												className={`project-status-badge ${teamSetupStatusClass(candidate.status)}`.trim()}
+											>
+												{teamSetupStatusLabel(candidate.status)}
+											</span>
+										</span>
+										<span className="recipient-policy-sharing-team-setup-action">
+											{candidate.status !== "ready" && onOpenTeamSetup ? (
+												<button
+													aria-label={actionLabel}
+													className="settings-button recipient-policy-sharing-target-24"
+													onClick={() => onOpenTeamSetup(candidate.candidateRef)}
+													type="button"
+												>
+													Review and migrate
+												</button>
+											) : null}
+										</span>
+									</div>
+								);
+							})}
+						</div>
 					</li>
 				))}
 			</ul>
@@ -122,14 +209,85 @@ function namesLabel(names: string[], empty: string): string {
 	return names.length ? names.join(", ") : empty;
 }
 
-function activeProjectNames(
+const NAME_PREVIEW_LIMIT = 3;
+
+function BoundedNames({ empty, label, names }: { empty: string; label: string; names: string[] }) {
+	if (names.length === 0) return <>{empty}</>;
+	if (names.length <= NAME_PREVIEW_LIMIT) return <>{namesLabel(names, empty)}</>;
+	return (
+		<>
+			{names.slice(0, NAME_PREVIEW_LIMIT).join(", ")}
+			<span aria-hidden="true">, …</span>
+			<details className="recipient-policy-sharing-name-details">
+				<summary>View all {countLabel(names.length, label)}</summary>
+				<ul {...EXPLICIT_LIST_ROLE} aria-label={`All ${label}s`}>
+					{names.map((name, index) => (
+						<li {...EXPLICIT_LIST_ITEM_ROLE} key={`${index}-${name}`}>
+							{name}
+						</li>
+					))}
+				</ul>
+			</details>
+		</>
+	);
+}
+
+function activeProjectIdentities(
 	projectIds: Iterable<string>,
 	projectsById: Map<string, RecipientPolicyManagementProject>,
-): string[] {
-	return [...new Set(projectIds)].flatMap((projectId) => {
+): ProjectIdentityPresentationItem[] {
+	return [...new Set(projectIds)].map((projectId) => {
 		const project = projectsById.get(projectId);
-		return project ? [project.displayName] : [];
+		return {
+			canonicalId: projectId,
+			displayName: project?.displayName ?? "Unavailable Project",
+		};
 	});
+}
+
+const PROJECT_GROUP_PREVIEW_LIMIT = 3;
+
+function ProjectIdentitySummary({
+	empty,
+	identities,
+	qualifier,
+}: {
+	empty: string;
+	identities: ProjectIdentityPresentationItem[];
+	qualifier: string;
+}) {
+	if (identities.length === 0) return <>{empty}</>;
+	const groups = projectIdentitySummaryGroups(identities);
+	const groupLabel = (group: (typeof groups)[number]) =>
+		group.identityCount > 1
+			? `${group.displayName} (${countLabel(group.identityCount, "identity", "identities")})`
+			: group.displayName;
+	const preview = groups.slice(0, PROJECT_GROUP_PREVIEW_LIMIT);
+	return (
+		<>
+			{countLabel(
+				identities.length,
+				`${qualifier} Project identity`,
+				`${qualifier} Project identities`,
+			)}{" "}
+			— {preview.map(groupLabel).join(", ")}
+			{groups.length > PROJECT_GROUP_PREVIEW_LIMIT ? (
+				<>
+					<span aria-hidden="true">, …</span>
+					<details className="recipient-policy-sharing-project-details">
+						<summary>View all {countLabel(groups.length, "Project name group")}</summary>
+						<ul {...EXPLICIT_LIST_ROLE} aria-label={`All ${qualifier} Project identity groups`}>
+							{groups.map((group) => (
+								<li {...EXPLICIT_LIST_ITEM_ROLE} key={group.displayName}>
+									{groupLabel(group)}
+								</li>
+							))}
+						</ul>
+					</details>
+				</>
+			) : null}
+		</>
+	);
 }
 
 function RecipientActions({
@@ -156,19 +314,24 @@ function RecipientActions({
 			<div className="peer-actions recipient-policy-sharing-actions recipient-policy-sharing-responsive-actions">
 				<button
 					aria-describedby={descriptionId}
-					aria-label={`Add Projects for ${displayName}`}
+					aria-disabled={disabled ? "true" : undefined}
+					aria-label={`Add projects for ${displayName}`}
 					className="settings-button recipient-policy-sharing-target recipient-policy-sharing-target-24"
-					disabled={disabled}
-					onClick={openAdd}
+					onClick={() => {
+						if (!disabled) openAdd();
+					}}
 					type="button"
 				>
 					Add projects
 				</button>
 				<button
-					aria-label={`Manage Projects for ${displayName}`}
+					aria-describedby={descriptionId}
+					aria-disabled={disabled ? "true" : undefined}
+					aria-label={`Manage projects for ${displayName}`}
 					className="settings-button recipient-policy-sharing-target recipient-policy-sharing-target-24"
-					disabled={disabled}
-					onClick={openManagement}
+					onClick={() => {
+						if (!disabled) openManagement();
+					}}
 					type="button"
 				>
 					Manage projects
@@ -186,11 +349,15 @@ function RecipientActions({
 function TeamsView({
 	disableMutations,
 	intent,
+	onTeamRenamed,
 	projects,
+	renameTeam,
 }: {
 	disableMutations: boolean;
 	intent: RecipientPolicyIntentGraphV1;
+	onTeamRenamed?: () => Promise<unknown> | unknown;
 	projects: RecipientPolicyManagementProject[];
+	renameTeam?: typeof import("../lib/api/sync").renameRecipientPolicyTeam;
 }) {
 	const activeTeams = intent.teams.filter((team) => team.status === "active");
 	const activeIdentitiesById = new Map(
@@ -233,7 +400,7 @@ function TeamsView({
 						.filter((device) => device.status === "active" && memberIds.includes(device.identityId))
 						.map((device) => device.deviceId),
 				).size;
-				const projectNames = activeProjectNames(
+				const projectIdentities = activeProjectIdentities(
 					intent.projectRecipients
 						.filter(
 							(edge) =>
@@ -258,10 +425,10 @@ function TeamsView({
 						</div>
 						<dl className="recipient-policy-sharing-details">
 							<div>
-								<dt>Current member Identities</dt>
+								<dt>Current members</dt>
 								<dd>
 									{countLabel(memberNames.length, "active member")} —{` `}
-									{namesLabel(memberNames, "No active members")}
+									<BoundedNames empty="No active members" label="member" names={memberNames} />
 								</dd>
 							</div>
 							<div>
@@ -269,10 +436,13 @@ function TeamsView({
 								<dd>{countLabel(activeDeviceCount, "active registered device")}</dd>
 							</div>
 							<div>
-								<dt>Shared Projects</dt>
+								<dt>Shared projects</dt>
 								<dd>
-									{countLabel(projectNames.length, "active shared Project")} —{` `}
-									{namesLabel(projectNames, "No Projects shared")}
+									<ProjectIdentitySummary
+										empty="No Projects shared"
+										identities={projectIdentities}
+										qualifier="active shared"
+									/>
 								</dd>
 							</div>
 							<div>
@@ -286,6 +456,16 @@ function TeamsView({
 							displayName={team.displayName}
 							recipient={{ recipientKind: "team", teamId: team.teamId }}
 						/>
+						<div className="peer-actions recipient-policy-sharing-actions recipient-policy-sharing-responsive-actions">
+							<RecipientPolicyTeamSettings
+								descriptionId={addDescriptionId}
+								disabled={disableMutations}
+								displayName={team.displayName}
+								onRenamed={onTeamRenamed}
+								renameTeam={renameTeam}
+								teamId={team.teamId}
+							/>
+						</div>
 					</article>
 				);
 			})}
@@ -337,7 +517,7 @@ function IdentitiesView({
 					),
 				];
 				const teamNames = teamIds.map((teamId) => activeTeamsById.get(teamId)?.displayName ?? "");
-				const directProjectNames = activeProjectNames(
+				const directProjectIdentities = activeProjectIdentities(
 					intent.projectRecipients
 						.filter(
 							(edge) =>
@@ -369,24 +549,32 @@ function IdentitiesView({
 								<dt>Registered devices</dt>
 								<dd>
 									{countLabel(activeDevices.length, "active registered device")} —{` `}
-									{namesLabel(
-										activeDevices.map((device) => device.displayName),
-										"No active devices",
-									)}
+									<BoundedNames
+										empty="No active devices"
+										label="device"
+										names={activeDevices.map((device) => device.displayName)}
+									/>
 								</dd>
 							</div>
 							<div>
 								<dt>Team memberships</dt>
 								<dd>
 									{countLabel(teamNames.length, "active Team membership")} —{` `}
-									{namesLabel(teamNames, "No active Team memberships")}
+									<BoundedNames
+										empty="No active Team memberships"
+										label="Team membership"
+										names={teamNames}
+									/>
 								</dd>
 							</div>
 							<div>
-								<dt>Directly shared Projects</dt>
+								<dt>Directly shared projects</dt>
 								<dd>
-									{countLabel(directProjectNames.length, "directly shared active Project")} —{` `}
-									{namesLabel(directProjectNames, "No Projects shared directly")}
+									<ProjectIdentitySummary
+										empty="No Projects shared directly"
+										identities={directProjectIdentities}
+										qualifier="directly shared active"
+									/>
 								</dd>
 							</div>
 						</dl>
@@ -554,7 +742,7 @@ function RecipientPolicySharing({
 							onClick={() => options.onReviewDevices?.(setupAttentionItems[0]?.deviceId)}
 							type="button"
 						>
-							Review Devices
+							Review devices
 						</button>
 					) : null}
 				</aside>
@@ -582,13 +770,17 @@ function RecipientPolicySharing({
 							onClick={() => options.onReviewDevices?.()}
 							type="button"
 						>
-							Review Devices
+							Review devices
 						</button>
 					) : null}
 				</aside>
 			) : null}
 			{options.refreshError ? (
-				<p aria-live="assertive" role="alert">
+				<p
+					aria-live="assertive"
+					className="recipient-policy-sharing-state recipient-policy-sharing-error"
+					role="alert"
+				>
 					Refresh failed; showing previous Sharing details. Team and Identity Project changes are
 					disabled until a refresh succeeds.
 				</p>
@@ -619,42 +811,50 @@ function RecipientPolicySharing({
 				))}
 			</div>
 			{SHARING_TABS.map((tab) => (
-				<div
-					aria-labelledby={`recipient-policy-sharing-tab-${tab.id}`}
-					className="recipient-policy-sharing-panel"
-					hidden={activeTab !== tab.id}
-					id={`recipient-policy-sharing-panel-${tab.id}`}
-					key={tab.id}
-					role="tabpanel"
-				>
-					{options.loading ? (
-						activeTab === tab.id ? (
-							<LoadingCardList detailRowCount={4} label="Loading Sharing details" />
-						) : null
-					) : options.loadError ? (
-						activeTab === tab.id ? (
-							<p aria-live="assertive" role="alert">
-								Sharing details are unavailable. Refresh and try again.
-							</p>
-						) : null
-					) : tab.id === "teams" ? (
-						<TeamsView
-							disableMutations={options.refreshError === true}
-							intent={intent}
-							projects={projects}
-						/>
-					) : tab.id === "identities" ? (
-						<IdentitiesView
-							disableMutations={options.refreshError === true}
-							intent={intent}
-							projects={projects}
-						/>
-					) : tab.id === "received" ? (
-						<ReceivedView received={options.received ?? []} />
-					) : (
-						<RecipientPolicyInvitations intent={intent} />
-					)}
-				</div>
+				<Fragment key={tab.id}>
+					<div
+						aria-labelledby={`recipient-policy-sharing-tab-${tab.id}`}
+						className="recipient-policy-sharing-panel"
+						hidden={activeTab !== tab.id}
+						id={`recipient-policy-sharing-panel-${tab.id}`}
+						role="tabpanel"
+						tabIndex={0}
+					>
+						{options.loading ? (
+							activeTab === tab.id ? (
+								<LoadingCardList detailRowCount={4} label="Loading Sharing details" />
+							) : null
+						) : options.loadError ? (
+							activeTab === tab.id ? (
+								<p
+									aria-live="assertive"
+									className="recipient-policy-sharing-state recipient-policy-sharing-error"
+									role="alert"
+								>
+									Sharing details are unavailable. Refresh and try again.
+								</p>
+							) : null
+						) : tab.id === "teams" ? (
+							<TeamsView
+								disableMutations={options.refreshError === true}
+								intent={intent}
+								onTeamRenamed={options.onTeamRenamed}
+								projects={projects}
+								renameTeam={options.renameTeam}
+							/>
+						) : tab.id === "identities" ? (
+							<IdentitiesView
+								disableMutations={options.refreshError === true}
+								intent={intent}
+								projects={projects}
+							/>
+						) : tab.id === "received" ? (
+							<ReceivedView received={options.received ?? []} />
+						) : (
+							<RecipientPolicyInvitations intent={intent} />
+						)}
+					</div>
+				</Fragment>
 			))}
 		</section>
 	);

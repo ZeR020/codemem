@@ -17,12 +17,13 @@ import { currentAdminTargetGroup } from "../data/target-group";
 
 export interface InvitesPanelDeps {
 	summary: CoordinatorAdminSummary;
+	fresh: boolean;
 	createInvite: () => void;
 	renderShell: () => void;
 }
 
 export function renderInvitesPanel(deps: InvitesPanelDeps) {
-	const { summary, createInvite, renderShell } = deps;
+	const { summary, fresh, createInvite, renderShell } = deps;
 	const status = state.lastCoordinatorAdminStatus;
 	const activeGroup = currentAdminTargetGroup() || String(status?.active_group || "").trim();
 	const effectiveGroup = coordinatorAdminState.inviteGroup.trim() || activeGroup;
@@ -30,17 +31,19 @@ export function renderInvitesPanel(deps: InvitesPanelDeps) {
 	const warnings = Array.isArray(state.lastTeamInvite?.warnings)
 		? state.lastTeamInvite?.warnings
 		: [];
-	const inviteDisabled = summary.readiness !== "ready" || coordinatorAdminState.invitePending;
+	const inviteDisabled = !fresh || coordinatorAdminState.invitePending;
 	return h(
 		RadixTabsContent,
 		{ className: "coordinator-admin-panel", value: "invites" },
-		h("h3", null, "Legacy Team invites"),
+		h("h3", null, "Legacy coordinator invites"),
 		h(
 			"p",
 			{ class: "peer-submeta" },
-			summary.readiness === "ready"
-				? "Legacy Team invites enroll a device in the selected Team. They do not grant project access; share projects from Projects instead."
-				: "Finish setup first. Invite creation stays disabled until the local Teams configuration is ready.",
+			fresh
+				? "Legacy coordinator invites enroll a device in the selected group for discovery. They do not add policy Team membership or grant Project access; use Sharing for both."
+				: summary.readiness === "ready"
+					? "Legacy invite creation is disabled until current coordinator status and group data are available. Previously generated invites remain available to copy."
+					: "Finish coordinator setup first. Legacy invite creation stays disabled until the local configuration is ready.",
 		),
 		h(
 			"form",
@@ -58,17 +61,17 @@ export function renderInvitesPanel(deps: InvitesPanelDeps) {
 				h(
 					"label",
 					{ class: "coordinator-admin-field" },
-					h("span", null, "Team"),
+					h("span", null, "Coordinator group"),
 					h(TextInput, {
 						class: "peer-scope-input",
-						disabled: summary.readiness !== "ready",
+						disabled: !fresh,
 						onInput: (event) => {
 							coordinatorAdminState.inviteGroup = String(
 								(event.currentTarget as HTMLInputElement).value || "",
 							);
 							renderShell();
 						},
-						placeholder: activeGroup || "team-alpha",
+						placeholder: activeGroup || "group-alpha",
 						type: "text",
 						value: coordinatorAdminState.inviteGroup,
 					}),
@@ -80,7 +83,7 @@ export function renderInvitesPanel(deps: InvitesPanelDeps) {
 					h(RadixSelect, {
 						ariaLabel: "Invite join policy",
 						contentClassName: "sync-radix-select-content sync-actor-select-content",
-						disabled: summary.readiness !== "ready",
+						disabled: !fresh,
 						id: "coordinatorAdminInvitePolicy",
 						itemClassName: "sync-radix-select-item",
 						onValueChange: (value) => {
@@ -89,8 +92,8 @@ export function renderInvitesPanel(deps: InvitesPanelDeps) {
 							renderShell();
 						},
 						options: [
-							{ value: "auto_admit", label: "Auto-admit to Team" },
-							{ value: "approval_required", label: "Require approval to join Team" },
+							{ value: "auto_admit", label: "Auto-admit to coordinator group" },
+							{ value: "approval_required", label: "Require approval to join group" },
 						],
 						triggerClassName: "sync-radix-select-trigger sync-actor-select",
 						value: coordinatorAdminState.invitePolicy,
@@ -103,7 +106,7 @@ export function renderInvitesPanel(deps: InvitesPanelDeps) {
 					h("span", null, "Expires in (hours)"),
 					h(TextInput, {
 						class: "peer-scope-input",
-						disabled: summary.readiness !== "ready",
+						disabled: !fresh,
 						min: "1",
 						onInput: (event) => {
 							coordinatorAdminState.inviteTtlHours = String(
@@ -125,10 +128,10 @@ export function renderInvitesPanel(deps: InvitesPanelDeps) {
 						disabled: inviteDisabled,
 						type: "submit",
 					},
-					coordinatorAdminState.invitePending ? "Creating…" : "Create legacy Team invite",
+					coordinatorAdminState.invitePending ? "Creating…" : "Create legacy coordinator invite",
 				),
 				effectiveGroup
-					? h("span", { class: "peer-submeta" }, `Using Team ${effectiveGroup}`)
+					? h("span", { class: "peer-submeta" }, "Using the selected coordinator group")
 					: null,
 			),
 		),

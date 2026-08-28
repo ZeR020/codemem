@@ -14,10 +14,12 @@ import { TextInput } from "../../../components/primitives/text-input";
 import * as api from "../../../lib/api";
 import { showGlobalNotice } from "../../../lib/notice";
 import { state } from "../../../lib/state";
+import { surfaceHasSnapshot, surfaceIsNotApplicable, surfacesAreFresh } from "../data/recovery";
 import { coordinatorAdminState, type GroupPreferencesDraft } from "../data/state";
 import type { CoordinatorAdminSummary } from "../data/summary";
 import {
 	availableCoordinatorGroups,
+	coordinatorGroupPresentationName,
 	currentAdminTargetGroup,
 	setAdminTargetGroup,
 } from "../data/target-group";
@@ -58,47 +60,118 @@ function emptyDraft(): GroupPreferencesDraft {
 		default_space_scope_id: "",
 		auto_grant_default_space_on_join: false,
 		loaded: false,
+		loading: false,
+		availability: "unknown",
+		loadGeneration: 0,
+		recoveryAnnouncement: "",
+		recoveryFocusPending: false,
+		recoveryRetryRequested: false,
 		saving: false,
 		error: "",
 	};
 }
 
-async function openGroupPreferences(groupId: string, renderShell: () => void): Promise<void> {
-	const draft = emptyDraft();
-	coordinatorAdminState.groupPreferencesDrafts.set(groupId, draft);
-	coordinatorAdminState.groupPreferencesOpen.add(groupId);
+export async function loadGroupPreferences(
+	groupId: string,
+	renderShell: () => void,
+): Promise<void> {
+	const current = coordinatorAdminState.groupPreferencesDrafts.get(groupId) ?? emptyDraft();
+	const generation = current.loadGeneration + 1;
+	coordinatorAdminState.groupPreferencesDrafts.set(groupId, {
+		...current,
+		loading: true,
+		error: "",
+		loadGeneration: generation,
+		recoveryAnnouncement: current.recoveryRetryRequested ? current.recoveryAnnouncement : "",
+	});
+	const isCurrent = () =>
+		coordinatorAdminState.groupPreferencesDrafts.get(groupId)?.loadGeneration === generation;
 	renderShell();
 	try {
 		const prefs = await api.loadCoordinatorGroupPreferences(groupId);
+		if (!isCurrent()) return;
+		const latest = coordinatorAdminState.groupPreferencesDrafts.get(groupId) ?? current;
 		coordinatorAdminState.groupPreferencesDrafts.set(groupId, {
+			...latest,
 			projects_include: Array.isArray(prefs.projects_include) ? [...prefs.projects_include] : [],
 			projects_exclude: Array.isArray(prefs.projects_exclude) ? [...prefs.projects_exclude] : [],
 			auto_seed_scope: prefs.auto_seed_scope,
 			default_space_scope_id: prefs.default_space_scope_id || "",
 			auto_grant_default_space_on_join: prefs.auto_grant_default_space_on_join === true,
 			loaded: true,
+			loading: false,
+			availability: "fresh",
 			saving: false,
 			error: "",
+			recoveryAnnouncement: latest.recoveryRetryRequested
+				? "Group defaults refreshed. Current values are available."
+				: latest.recoveryAnnouncement,
+			recoveryFocusPending: latest.recoveryRetryRequested,
+			recoveryRetryRequested: false,
 		});
-	} catch (error) {
+	} catch {
+		if (!isCurrent()) return;
+		const latest = coordinatorAdminState.groupPreferencesDrafts.get(groupId) ?? current;
+		const hasSnapshot = latest.availability === "fresh" || latest.availability === "stale";
+		const retryFailed = latest.recoveryRetryRequested;
 		coordinatorAdminState.groupPreferencesDrafts.set(groupId, {
-			...draft,
-			loaded: true,
-			error: error instanceof Error ? error.message : "Failed to load preferences.",
+			...latest,
+			loading: false,
+			availability: hasSnapshot ? "stale" : "unavailable",
+			recoveryAnnouncement: retryFailed
+				? "Retry finished, but group defaults are still unavailable. Retained values remain unchanged."
+				: "",
+			recoveryFocusPending: retryFailed,
+			recoveryRetryRequested: false,
+			error: hasSnapshot
+				? "Legacy group defaults could not be refreshed. Previously loaded values are still shown."
+				: "Legacy group defaults are unavailable. No default values are being assumed.",
 		});
 	}
 	renderShell();
+	const rendered = coordinatorAdminState.groupPreferencesDrafts.get(groupId);
+	if (rendered?.recoveryFocusPending) {
+		coordinatorAdminState.groupPreferencesDrafts.set(groupId, {
+			...rendered,
+			recoveryFocusPending: false,
+		});
+		queueMicrotask(() =>
+			document.getElementById(`coord-admin-group-defaults-recovery-${groupId}`)?.focus(),
+		);
+	}
+}
+
+async function openGroupPreferences(groupId: string, renderShell: () => void): Promise<void> {
+	coordinatorAdminState.groupPreferencesOpen.add(groupId);
+	renderShell();
+	await loadGroupPreferences(groupId, renderShell);
 }
 
 function closeGroupPreferences(groupId: string, renderShell: () => void): void {
 	coordinatorAdminState.groupPreferencesOpen.delete(groupId);
-	coordinatorAdminState.groupPreferencesDrafts.delete(groupId);
 	renderShell();
+}
+
+function retryGroupPreferences(groupId: string, renderShell: () => void): void {
+	const current = coordinatorAdminState.groupPreferencesDrafts.get(groupId);
+	if (!current) return;
+	coordinatorAdminState.groupPreferencesDrafts.set(groupId, {
+		...current,
+		recoveryAnnouncement: "Retrying group defaults…",
+		recoveryRetryRequested: true,
+	});
+	void loadGroupPreferences(groupId, renderShell);
 }
 
 async function saveGroupPreferences(groupId: string, renderShell: () => void): Promise<void> {
 	const initial = coordinatorAdminState.groupPreferencesDrafts.get(groupId);
 	if (!initial) return;
+	if (
+		initial.availability !== "fresh" ||
+		initial.loading ||
+		!surfacesAreFresh(coordinatorAdminState.recovery, "status", "groups")
+	)
+		return;
 	// Re-entrancy guard: a second click before the first save resolves must not
 	// kick off a parallel save. The Save button is disabled on `draft.saving`,
 	// but a pre-render double-click can otherwise slip through.
@@ -121,9 +194,11 @@ async function saveGroupPreferences(groupId: string, renderShell: () => void): P
 	renderShell();
 	try {
 		await api.saveCoordinatorGroupPreferences(groupId, payload);
-		showGlobalNotice("Team defaults saved. New devices use these filters and Space settings.");
+		showGlobalNotice(
+			"Legacy coordinator group defaults saved. Sharing policy and Project access are unchanged.",
+		);
 		closeGroupPreferences(groupId, renderShell);
-	} catch (error) {
+	} catch {
 		// Re-read the latest draft so any keystrokes landed during the save are
 		// preserved; only clobber saving + error fields.
 		const latest = coordinatorAdminState.groupPreferencesDrafts.get(groupId);
@@ -131,7 +206,8 @@ async function saveGroupPreferences(groupId: string, renderShell: () => void): P
 		coordinatorAdminState.groupPreferencesDrafts.set(groupId, {
 			...latest,
 			saving: false,
-			error: error instanceof Error ? error.message : "Failed to save preferences.",
+			error:
+				"Could not save legacy group defaults. Sharing policy is unchanged; retry after coordinator recovery.",
 		});
 		renderShell();
 	}
@@ -144,18 +220,114 @@ function renderGroupPreferencesEditor(
 ): ReturnType<typeof h> {
 	const draft = coordinatorAdminState.groupPreferencesDrafts.get(groupId);
 	if (!draft) return null;
-	if (!draft.loaded) {
-		return h("div", { class: "peer-submeta" }, "Loading project defaults…");
+	const recoveryId = `coord-admin-group-defaults-recovery-${groupId}`;
+	if (!draft.loaded && draft.availability !== "unavailable") {
+		return h(
+			Fragment,
+			null,
+			h("h4", { class: "coordinator-admin-drawer-title" }, "Legacy group defaults"),
+			h(
+				"div",
+				{
+					"aria-atomic": "true",
+					"aria-live": "polite",
+					id: recoveryId,
+					role: "status",
+					tabIndex: -1,
+				},
+				"Loading project defaults…",
+			),
+		);
+	}
+	if (draft.availability === "unavailable") {
+		return h(
+			Fragment,
+			null,
+			h("h4", { class: "coordinator-admin-drawer-title" }, "Legacy group defaults"),
+			h(
+				"div",
+				{
+					"aria-atomic": "true",
+					"aria-live": "polite",
+					class: "coordinator-admin-inline-warning coordinator-admin-recovery-notice",
+					id: recoveryId,
+					role: "status",
+					tabIndex: -1,
+				},
+				h(
+					"div",
+					{ class: "coordinator-admin-legacy-notice-copy" },
+					h("strong", null, "Group defaults are unavailable"),
+					draft.recoveryAnnouncement
+						? h("span", { class: "peer-submeta" }, draft.recoveryAnnouncement)
+						: null,
+					h(
+						"span",
+						{ class: "peer-submeta" },
+						"Current values could not be loaded. No defaults are being assumed or changed.",
+					),
+				),
+				h(
+					"button",
+					{
+						class: "settings-button",
+						disabled: draft.loading,
+						onClick: () => retryGroupPreferences(groupId, renderShell),
+						type: "button",
+					},
+					draft.loading ? "Retrying…" : "Retry",
+				),
+			),
+		);
 	}
 	const autoSeedLabelId = `coord-admin-scope-autoseed-${groupId}`;
 	const autoGrantLabelId = `coord-admin-default-space-autogrant-${groupId}`;
 	const includeLabelId = `coord-admin-scope-include-${groupId}`;
 	const excludeLabelId = `coord-admin-scope-exclude-${groupId}`;
-	const fieldsDisabled = !ready || draft.saving || !draft.auto_seed_scope;
+	const mutationsFresh = ready && draft.availability === "fresh" && !draft.loading;
+	const fieldsDisabled = !mutationsFresh || draft.saving || !draft.auto_seed_scope;
 	return h(
 		Fragment,
 		null,
-		h("h4", { class: "coordinator-admin-drawer-title" }, "Team defaults"),
+		h("h4", { class: "coordinator-admin-drawer-title" }, "Legacy group defaults"),
+		h(
+			"div",
+			{
+				"aria-atomic": "true",
+				"aria-live": "polite",
+				class:
+					draft.availability === "stale"
+						? "coordinator-admin-inline-warning coordinator-admin-recovery-notice"
+						: "coordinator-admin-recovery-status",
+				id: recoveryId,
+				role: "status",
+				tabIndex: -1,
+			},
+			draft.availability === "stale"
+				? h(
+						Fragment,
+						null,
+						h(
+							"span",
+							{ class: "peer-submeta" },
+							"Previously loaded group defaults are shown. Saving is disabled until refresh succeeds.",
+						),
+						draft.recoveryAnnouncement
+							? h("span", { class: "peer-submeta" }, draft.recoveryAnnouncement)
+							: null,
+						h(
+							"button",
+							{
+								class: "settings-button",
+								disabled: draft.loading,
+								onClick: () => retryGroupPreferences(groupId, renderShell),
+								type: "button",
+							},
+							draft.loading ? "Retrying…" : "Retry",
+						),
+					)
+				: draft.recoveryAnnouncement,
+		),
 		h(
 			"div",
 			{ class: "peer-submeta" },
@@ -176,7 +348,7 @@ function renderGroupPreferencesEditor(
 				"aria-labelledby": autoSeedLabelId,
 				checked: draft.auto_seed_scope,
 				className: "coordinator-admin-switch",
-				disabled: !ready || draft.saving,
+				disabled: !mutationsFresh || draft.saving,
 				onCheckedChange: (checked: boolean) => {
 					const current = coordinatorAdminState.groupPreferencesDrafts.get(groupId) ?? draft;
 					coordinatorAdminState.groupPreferencesDrafts.set(groupId, {
@@ -194,13 +366,13 @@ function renderGroupPreferencesEditor(
 			h(
 				"span",
 				{ class: "section-meta", id: autoGrantLabelId },
-				"Auto-grant default Space on join",
+				"Auto-grant default Space on coordinator join",
 			),
 			h(RadixSwitch, {
 				"aria-labelledby": autoGrantLabelId,
 				checked: draft.auto_grant_default_space_on_join,
 				className: "coordinator-admin-switch",
-				disabled: !ready || draft.saving || !draft.default_space_scope_id,
+				disabled: !mutationsFresh || draft.saving || !draft.default_space_scope_id,
 				onCheckedChange: (checked: boolean) => {
 					const current = coordinatorAdminState.groupPreferencesDrafts.get(groupId) ?? draft;
 					coordinatorAdminState.groupPreferencesDrafts.set(groupId, {
@@ -270,7 +442,7 @@ function renderGroupPreferencesEditor(
 				"button",
 				{
 					class: "settings-button",
-					disabled: !ready || draft.saving,
+					disabled: !mutationsFresh || draft.saving,
 					onClick: () => void saveGroupPreferences(groupId, renderShell),
 					type: "button",
 				},
@@ -293,7 +465,7 @@ function renderGroupPreferencesEditor(
 function renderTeamSetupGuide(renderShell: () => void): ReturnType<typeof h> {
 	const guide = coordinatorAdminState.teamSetupGuide;
 	if (!guide) return null;
-	const title = guide.displayName || guide.groupId;
+	const title = coordinatorGroupPresentationName(guide.groupId, guide.displayName);
 	const warningStepById: Record<string, string> = {
 		default_space: "default Space setup",
 		default_space_grant: "default Space access grant",
@@ -302,17 +474,17 @@ function renderTeamSetupGuide(renderShell: () => void): ReturnType<typeof h> {
 	return h(
 		"div",
 		{ class: "peer-meta coordinator-admin-empty-state" },
-		h("h4", { class: "coordinator-admin-drawer-title" }, `Set up ${title}`),
+		h("h4", { class: "coordinator-admin-drawer-title" }, `Set up legacy group ${title}`),
 		h(
 			"div",
 			{ class: "peer-submeta" },
-			"A Team organizes people and devices. The default Space is the memory boundary; Team membership only grants data access when default Space auto-grant is enabled.",
+			"This coordinator group organizes technical discovery and enrollment. It is not a policy Team; use Sharing to manage Team membership and Project access.",
 		),
 		guide.setupWarning
 			? h(
 					"div",
 					{ class: "peer-meta coordinator-admin-inline-warning" },
-					`Team created, but ${warningStep} failed. Automatic repair is not available yet; use Spaces to inspect or create access manually before inviting teammates.`,
+					`Legacy coordinator group created, but ${warningStep} failed. Automatic repair is not available yet; use Spaces to inspect or create transport access manually. Sharing policy is unchanged.`,
 				)
 			: h(
 					"div",
@@ -326,9 +498,9 @@ function renderTeamSetupGuide(renderShell: () => void): ReturnType<typeof h> {
 		h(
 			"ol",
 			{ class: "peer-submeta" },
-			h("li", null, "Review Team defaults and the auto-grant default Space setting."),
-			h("li", null, "Invite teammates or other devices."),
-			h("li", null, "Assign projects to Spaces from the Projects tab."),
+			h("li", null, "Review legacy group defaults and the auto-grant default Space setting."),
+			h("li", null, "Use legacy enrollment only when compatibility or recovery requires it."),
+			h("li", null, "Open Sharing for Team membership and Project access."),
 		),
 		h(
 			"div",
@@ -343,7 +515,7 @@ function renderTeamSetupGuide(renderShell: () => void): ReturnType<typeof h> {
 					},
 					type: "button",
 				},
-				"Review Team defaults",
+				"Review legacy defaults",
 			),
 			h(
 				"button",
@@ -367,7 +539,7 @@ function renderTeamSetupGuide(renderShell: () => void): ReturnType<typeof h> {
 					},
 					type: "button",
 				},
-				"Invite devices",
+				"Create legacy device invite",
 			),
 			h(
 				"button",
@@ -378,7 +550,7 @@ function renderTeamSetupGuide(renderShell: () => void): ReturnType<typeof h> {
 					},
 					type: "button",
 				},
-				"Assign projects",
+				"Open Projects",
 			),
 			h(
 				"button",
@@ -397,12 +569,13 @@ function renderTeamSetupGuide(renderShell: () => void): ReturnType<typeof h> {
 }
 
 function archiveButtonLabel(archived: boolean, pending: boolean): string {
-	if (pending) return archived ? "Restoring…" : "Archiving…";
+	if (pending) return archived ? "Unarchiving…" : "Archiving…";
 	return archived ? "Unarchive" : "Archive";
 }
 
 export interface GroupsPanelDeps {
 	summary: CoordinatorAdminSummary;
+	fresh: boolean;
 	createGroup: () => void;
 	runGroup: (
 		groupId: string,
@@ -414,7 +587,9 @@ export interface GroupsPanelDeps {
 }
 
 export function renderGroupsPanel(deps: GroupsPanelDeps) {
-	const { summary, createGroup, runGroup, renderShell, reloadData } = deps;
+	const { summary, fresh, createGroup, runGroup, renderShell, reloadData } = deps;
+	const groupsKnown = surfaceHasSnapshot(coordinatorAdminState.recovery, "groups");
+	const groupsNotApplicable = surfaceIsNotApplicable(coordinatorAdminState.recovery, "groups");
 	const configuredGroup = String(state.lastCoordinatorAdminStatus?.active_group || "").trim();
 	const selectedGroup = currentAdminTargetGroup();
 	const groups = availableCoordinatorGroups();
@@ -429,28 +604,28 @@ export function renderGroupsPanel(deps: GroupsPanelDeps) {
 	return h(
 		RadixTabsContent,
 		{ className: "coordinator-admin-panel", value: "groups" },
-		h("h3", null, "Teams"),
+		h("h3", null, "Coordinator groups"),
 		h(
 			"p",
 			{ class: "peer-submeta" },
 			selectedGroup
-				? `Managing ${selectedGroup}${configuredGroup && configuredGroup !== selectedGroup ? ` · this node uses ${configuredGroup} for discovery` : ""}`
+				? `Managing the selected coordinator group${configuredGroup && configuredGroup !== selectedGroup ? " · this node uses a different group for discovery" : ""}`
 				: configuredGroup
-					? `This node uses ${configuredGroup} for discovery. Select a Team below to manage it.`
-					: "No Team selected yet. Create one or select an existing Team to manage.",
+					? `This node uses ${configuredGroup} for discovery. Select a coordinator group below to manage it.`
+					: "No coordinator group selected yet. Create one or select an existing group to manage.",
 		),
 		groups.length ? h("p", { class: "peer-submeta" }, countParts.join(" · ")) : null,
 		!targetExists && selectedGroup
 			? h(
 					"div",
 					{ class: "peer-meta coordinator-admin-inline-warning" },
-					`The selected Team (${selectedGroup}) is configured locally but does not exist in the coordinator yet. Create it below or switch to another Team once one exists.`,
+					"The selected legacy group is configured locally but does not exist in the coordinator yet. Create it below or switch to another coordinator group once one exists.",
 				)
 			: null,
 		renderTeamSetupGuide(renderShell),
 		(() => {
 			const createGroupDisabled =
-				summary.readiness !== "ready" || coordinatorAdminState.groupActionPendingKind === "create";
+				!fresh || coordinatorAdminState.groupActionPendingKind === "create";
 			return h(
 				"form",
 				{
@@ -463,11 +638,16 @@ export function renderGroupsPanel(deps: GroupsPanelDeps) {
 				},
 				h(
 					"div",
+					{ class: "peer-meta coordinator-admin-inline-warning", role: "note" },
+					"Creating a coordinator group changes legacy discovery and transport setup only. It does not create a policy Team or grant Project access in Sharing.",
+				),
+				h(
+					"div",
 					{ class: "coordinator-admin-form-grid" },
 					h(
 						"label",
 						{ class: "coordinator-admin-field" },
-						h("span", null, "New Team id"),
+						h("span", null, "New coordinator group ID"),
 						h(TextInput, {
 							class: "peer-scope-input",
 							disabled: createGroupDisabled,
@@ -476,7 +656,7 @@ export function renderGroupsPanel(deps: GroupsPanelDeps) {
 									(event.currentTarget as HTMLInputElement).value || "",
 								);
 							},
-							placeholder: "team-alpha",
+							placeholder: "group-alpha",
 							type: "text",
 							value: coordinatorAdminState.createGroupId,
 						}),
@@ -484,7 +664,7 @@ export function renderGroupsPanel(deps: GroupsPanelDeps) {
 					h(
 						"label",
 						{ class: "coordinator-admin-field" },
-						h("span", null, "Display name"),
+						h("span", null, "Legacy group display name"),
 						h(TextInput, {
 							class: "peer-scope-input",
 							disabled: createGroupDisabled,
@@ -493,7 +673,7 @@ export function renderGroupsPanel(deps: GroupsPanelDeps) {
 									(event.currentTarget as HTMLInputElement).value || "",
 								);
 							},
-							placeholder: "Team Alpha",
+							placeholder: "Legacy group Alpha",
 							type: "text",
 							value: coordinatorAdminState.createGroupDisplayName,
 						}),
@@ -514,7 +694,7 @@ export function renderGroupsPanel(deps: GroupsPanelDeps) {
 							},
 							coordinatorAdminState.groupActionPendingKind === "create"
 								? "Creating…"
-								: "Create Team",
+								: "Create coordinator group",
 						),
 					),
 					h(
@@ -532,7 +712,6 @@ export function renderGroupsPanel(deps: GroupsPanelDeps) {
 								"aria-labelledby": "coordinatorAdminShowArchivedLabel",
 								checked: coordinatorAdminState.showArchivedGroups,
 								className: "coordinator-admin-switch",
-								disabled: summary.readiness !== "ready",
 								onCheckedChange: (checked) => {
 									coordinatorAdminState.showArchivedGroups = checked;
 									renderShell();
@@ -544,237 +723,261 @@ export function renderGroupsPanel(deps: GroupsPanelDeps) {
 				),
 			);
 		})(),
-		!visibleGroups.length
+		groupsNotApplicable
 			? h(
 					"div",
-					{ class: "peer-meta coordinator-admin-empty-state" },
-					summary.readiness === "ready"
-						? coordinatorAdminState.showArchivedGroups
-							? "No Teams are available yet."
-							: "No active Teams yet. Create one to get started."
-						: "Team browsing will appear here once setup is complete.",
+					{ class: "peer-meta" },
+					"Complete legacy coordinator setup before loading coordinator groups. No group list is expected yet.",
 				)
-			: h(
-					"div",
-					{ class: "peer-list" },
-					visibleGroups.map((group) => {
-						const selected = group.group_id === selectedGroup;
-						const pending = coordinatorAdminState.groupActionPendingId === group.group_id;
-						const archived = Boolean(group.archived_at);
-						const draftName =
-							coordinatorAdminState.groupRenameDrafts.get(group.group_id) ??
-							group.display_name ??
-							group.group_id;
-						const scopeOpen = coordinatorAdminState.groupPreferencesOpen.has(group.group_id);
-						const domainsOpen = coordinatorAdminState.groupScopeManagementOpen.has(group.group_id);
-						const archiveActionKind = archived ? "unarchive" : "archive";
-						const archivePending =
-							pending && coordinatorAdminState.groupActionPendingKind === archiveActionKind;
-						const archiveActionLabel = archiveButtonLabel(archived, archivePending);
-						const overview = teamCardOverview({
-							groupId: group.group_id,
-							preferences: coordinatorAdminState.groupPreferencesDrafts.get(group.group_id),
-							scopeManagement: coordinatorAdminState.groupScopeManagementDrafts.get(group.group_id),
-							setupGuide: coordinatorAdminState.teamSetupGuide,
-						});
-						return h(
+			: !groupsKnown
+				? h(
+						"div",
+						{ class: "peer-meta coordinator-admin-empty-state" },
+						"Coordinator groups are unavailable. Retry to load current groups; no empty result is being assumed.",
+					)
+				: !visibleGroups.length
+					? h(
 							"div",
-							{ class: "peer-card peer-card--padded", key: group.group_id },
-							h("div", { class: "peer-title" }, h("strong", null, draftName)),
-							h("div", { class: "peer-submeta" }, archived ? "Archived Team" : "Active Team"),
-							h("div", { class: "peer-meta" }, `Advanced: Team ID ${group.group_id}`),
-							h(
-								"div",
-								{ class: "coordinator-admin-summary-grid" },
-								h(
+							{ class: "peer-meta coordinator-admin-empty-state" },
+							summary.readiness === "ready"
+								? coordinatorAdminState.showArchivedGroups
+									? "No coordinator groups are available yet."
+									: "No active coordinator groups yet. Create one only for legacy discovery or recovery."
+								: "Coordinator group browsing will appear here once setup is complete.",
+						)
+					: h(
+							"div",
+							{ class: "peer-list" },
+							visibleGroups.map((group) => {
+								const selected = group.group_id === selectedGroup;
+								const pending = coordinatorAdminState.groupActionPendingId === group.group_id;
+								const archived = Boolean(group.archived_at);
+								const draftName =
+									coordinatorAdminState.groupRenameDrafts.get(group.group_id) ??
+									group.display_name ??
+									"";
+								const presentationName =
+									draftName.trim() ||
+									coordinatorGroupPresentationName(group.group_id, group.display_name);
+								const scopeOpen = coordinatorAdminState.groupPreferencesOpen.has(group.group_id);
+								const domainsOpen = coordinatorAdminState.groupScopeManagementOpen.has(
+									group.group_id,
+								);
+								const archiveActionKind = archived ? "unarchive" : "archive";
+								const archivePending =
+									pending && coordinatorAdminState.groupActionPendingKind === archiveActionKind;
+								const archiveActionLabel = archiveButtonLabel(archived, archivePending);
+								const overview = teamCardOverview({
+									groupId: group.group_id,
+									preferences: coordinatorAdminState.groupPreferencesDrafts.get(group.group_id),
+									scopeManagement: coordinatorAdminState.groupScopeManagementDrafts.get(
+										group.group_id,
+									),
+									setupGuide: coordinatorAdminState.teamSetupGuide,
+								});
+								return h(
 									"div",
-									{ class: "coordinator-admin-summary-card" },
-									h("span", { class: "section-meta" }, "Default Space"),
-									h("strong", null, overview.defaultSpace),
-								),
-								h(
-									"div",
-									{ class: "coordinator-admin-summary-card" },
-									h("span", { class: "section-meta" }, "Auto-grant"),
-									h("strong", null, overview.autoGrant),
-								),
-								h(
-									"div",
-									{ class: "coordinator-admin-summary-card" },
-									h("span", { class: "section-meta" }, "Spaces"),
-									h("strong", null, overview.spaces),
-								),
-							),
-							configuredGroup === group.group_id
-								? h(
+									{ class: "peer-card peer-card--padded", key: group.group_id },
+									h("div", { class: "peer-title" }, h("strong", null, presentationName)),
+									h(
 										"div",
 										{ class: "peer-submeta" },
-										"This node uses this Team for coordinator-backed discovery.",
-									)
-								: null,
-							h(
-								"label",
-								{ class: "coordinator-admin-field" },
-								h("span", null, "Display name"),
-								h(TextInput, {
-									class: "peer-scope-input",
-									disabled: summary.readiness !== "ready" || pending,
-									onInput: (event) => {
-										coordinatorAdminState.groupRenameDrafts.set(
-											group.group_id,
-											String((event.currentTarget as HTMLInputElement).value || ""),
-										);
-									},
-									type: "text",
-									value: draftName,
-								}),
-							),
-							h(
-								"div",
-								{ class: "peer-actions" },
-								h(
-									"button",
-									{
-										class: "settings-button",
-										disabled: summary.readiness !== "ready" || selected,
-										onClick: () => {
-											setAdminTargetGroup(group.group_id);
-											reloadData();
-										},
-										type: "button",
-									},
-									selected ? "Managing" : "Manage Team",
-								),
-								h(
-									"button",
-									{
-										class: "settings-button",
-										disabled: summary.readiness !== "ready" || pending,
-										onClick: () => runGroup(group.group_id, draftName, "rename"),
-										type: "button",
-									},
-									pending && coordinatorAdminState.groupActionPendingKind === "rename"
-										? "Renaming…"
-										: "Rename",
-								),
-								h(
-									"button",
-									{
-										"aria-expanded": scopeOpen,
-										"aria-controls": `coord-admin-project-defaults-drawer-${group.group_id}`,
-										class: "settings-button coordinator-admin-scope-trigger",
-										"data-state": scopeOpen ? "open" : "closed",
-										disabled: summary.readiness !== "ready" || pending,
-										onClick: () => {
-											if (scopeOpen) {
-												closeGroupPreferences(group.group_id, renderShell);
-											} else {
-												void openGroupPreferences(group.group_id, renderShell);
-											}
-										},
-										type: "button",
-									},
-									h("span", null, "Team defaults"),
-									h(
-										"span",
-										{ "aria-hidden": "true", class: "device-row-chevron" },
-										h(ChevronRightIcon, null),
+										archived ? "Archived coordinator group" : "Active coordinator group",
 									),
-								),
-								h(
-									"button",
-									{
-										"aria-expanded": domainsOpen,
-										"aria-controls": `coord-admin-spaces-drawer-${group.group_id}`,
-										class: "settings-button coordinator-admin-scope-trigger",
-										"data-state": domainsOpen ? "open" : "closed",
-										disabled: summary.readiness !== "ready" || pending,
-										onClick: () => {
-											if (domainsOpen) {
-												closeGroupScopeManagement(group.group_id, renderShell);
-											} else {
-												openGroupScopeManagement(group.group_id, renderShell);
-											}
-										},
-										type: "button",
-									},
-									h("span", null, "Spaces & access"),
 									h(
-										"span",
-										{ "aria-hidden": "true", class: "device-row-chevron" },
-										h(ChevronRightIcon, null),
+										"details",
+										{ class: "coordinator-admin-diagnostics" },
+										h("summary", null, "Diagnostics"),
+										h("div", { class: "peer-meta" }, `Group ID ${group.group_id}`),
 									),
-								),
-								h(
-									"button",
-									{
-										class: archived ? "settings-button" : "settings-button danger",
-										disabled: summary.readiness !== "ready" || pending,
-										onClick: () =>
-											runGroup(
-												group.group_id,
-												group.display_name || group.group_id,
-												archiveActionKind,
-											),
-										type: "button",
-									},
-									archiveActionLabel,
-								),
-							),
-							h(
-								Collapsible.Root,
-								{
-									open: scopeOpen,
-									onOpenChange: (open: boolean) => {
-										if (open) void openGroupPreferences(group.group_id, renderShell);
-										else closeGroupPreferences(group.group_id, renderShell);
-									},
-								},
-								h(
-									Collapsible.Content,
-									{
-										"aria-label": `Project defaults for ${draftName}`,
-										class: "coordinator-admin-group-preferences",
-										id: `coord-admin-project-defaults-drawer-${group.group_id}`,
-									},
-									scopeOpen
-										? renderGroupPreferencesEditor(
-												group.group_id,
-												renderShell,
-												summary.readiness === "ready",
+									h(
+										"div",
+										{ class: "coordinator-admin-summary-grid" },
+										h(
+											"div",
+											{ class: "coordinator-admin-summary-card" },
+											h("span", { class: "section-meta" }, "Default Space"),
+											h("strong", null, overview.defaultSpace),
+										),
+										h(
+											"div",
+											{ class: "coordinator-admin-summary-card" },
+											h("span", { class: "section-meta" }, "Auto-grant"),
+											h("strong", null, overview.autoGrant),
+										),
+										h(
+											"div",
+											{ class: "coordinator-admin-summary-card" },
+											h("span", { class: "section-meta" }, "Spaces"),
+											h("strong", null, overview.spaces),
+										),
+									),
+									configuredGroup === group.group_id
+										? h(
+												"div",
+												{ class: "peer-submeta" },
+												"This node uses this coordinator group for discovery.",
 											)
 										: null,
-								),
-							),
-							h(
-								Collapsible.Root,
-								{
-									open: domainsOpen,
-									onOpenChange: (open: boolean) => {
-										if (open) openGroupScopeManagement(group.group_id, renderShell);
-										else closeGroupScopeManagement(group.group_id, renderShell);
-									},
-								},
-								h(
-									Collapsible.Content,
-									{
-										"aria-label": `Spaces for ${draftName}`,
-										class:
-											"coordinator-admin-group-preferences coordinator-admin-domain-management",
-										id: `coord-admin-spaces-drawer-${group.group_id}`,
-									},
-									domainsOpen
-										? renderGroupScopeManagementPanel({
-												groupId: group.group_id,
-												ready: summary.readiness === "ready",
-												renderShell,
-												summary,
-											})
-										: null,
-								),
-							),
-						);
-					}),
-				),
+									h(
+										"label",
+										{ class: "coordinator-admin-field" },
+										h("span", null, "Legacy group display name"),
+										h(TextInput, {
+											class: "peer-scope-input",
+											disabled: !fresh || pending,
+											onInput: (event) => {
+												coordinatorAdminState.groupRenameDrafts.set(
+													group.group_id,
+													String((event.currentTarget as HTMLInputElement).value || ""),
+												);
+											},
+											type: "text",
+											value: draftName,
+										}),
+									),
+									h(
+										"div",
+										{ class: "peer-actions" },
+										h(
+											"button",
+											{
+												class: "settings-button",
+												disabled: !fresh || selected,
+												onClick: () => {
+													setAdminTargetGroup(group.group_id);
+													reloadData();
+												},
+												type: "button",
+											},
+											selected ? "Managing" : "Manage group",
+										),
+										h(
+											"button",
+											{
+												class: "settings-button",
+												disabled: !fresh || pending,
+												onClick: () => runGroup(group.group_id, draftName, "rename"),
+												type: "button",
+											},
+											pending && coordinatorAdminState.groupActionPendingKind === "rename"
+												? "Renaming…"
+												: "Rename group",
+										),
+										h(
+											"button",
+											{
+												"aria-expanded": scopeOpen,
+												"aria-controls": `coord-admin-project-defaults-drawer-${group.group_id}`,
+												class: "settings-button coordinator-admin-scope-trigger",
+												"data-state": scopeOpen ? "open" : "closed",
+												disabled: pending,
+												onClick: () => {
+													if (scopeOpen) {
+														closeGroupPreferences(group.group_id, renderShell);
+													} else {
+														void openGroupPreferences(group.group_id, renderShell);
+													}
+												},
+												type: "button",
+											},
+											h("span", null, "Legacy group defaults"),
+											h(
+												"span",
+												{ "aria-hidden": "true", class: "device-row-chevron" },
+												h(ChevronRightIcon, null),
+											),
+										),
+										h(
+											"button",
+											{
+												"aria-expanded": domainsOpen,
+												"aria-controls": `coord-admin-spaces-drawer-${group.group_id}`,
+												class: "settings-button coordinator-admin-scope-trigger",
+												"data-state": domainsOpen ? "open" : "closed",
+												disabled: pending,
+												onClick: () => {
+													if (domainsOpen) {
+														closeGroupScopeManagement(group.group_id, renderShell);
+													} else {
+														openGroupScopeManagement(group.group_id, renderShell);
+													}
+												},
+												type: "button",
+											},
+											h("span", null, "Spaces & access"),
+											h(
+												"span",
+												{ "aria-hidden": "true", class: "device-row-chevron" },
+												h(ChevronRightIcon, null),
+											),
+										),
+										h(
+											"button",
+											{
+												class: archived ? "settings-button" : "settings-button danger",
+												disabled: !fresh || pending,
+												onClick: () =>
+													runGroup(
+														group.group_id,
+														group.display_name || group.group_id,
+														archiveActionKind,
+													),
+												type: "button",
+											},
+											archiveActionLabel,
+										),
+									),
+									h(
+										Collapsible.Root,
+										{
+											open: scopeOpen,
+											onOpenChange: (open: boolean) => {
+												if (open) void openGroupPreferences(group.group_id, renderShell);
+												else closeGroupPreferences(group.group_id, renderShell);
+											},
+										},
+										h(
+											Collapsible.Content,
+											{
+												"aria-label": `Project defaults for ${presentationName}`,
+												class: "coordinator-admin-group-preferences",
+												id: `coord-admin-project-defaults-drawer-${group.group_id}`,
+											},
+											scopeOpen
+												? renderGroupPreferencesEditor(group.group_id, renderShell, fresh)
+												: null,
+										),
+									),
+									h(
+										Collapsible.Root,
+										{
+											open: domainsOpen,
+											onOpenChange: (open: boolean) => {
+												if (open) openGroupScopeManagement(group.group_id, renderShell);
+												else closeGroupScopeManagement(group.group_id, renderShell);
+											},
+										},
+										h(
+											Collapsible.Content,
+											{
+												"aria-label": `Spaces for ${presentationName}`,
+												class:
+													"coordinator-admin-group-preferences coordinator-admin-domain-management",
+												id: `coord-admin-spaces-drawer-${group.group_id}`,
+											},
+											domainsOpen
+												? renderGroupScopeManagementPanel({
+														groupId: group.group_id,
+														ready: fresh,
+														renderShell,
+														summary,
+													})
+												: null,
+										),
+									),
+								);
+							}),
+						),
 	);
 }

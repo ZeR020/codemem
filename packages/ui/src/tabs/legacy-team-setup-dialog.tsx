@@ -8,6 +8,10 @@ import { LegacyTeamSetupProjects } from "./legacy-team-setup-projects";
 import { LegacyTeamSetupReview } from "./legacy-team-setup-review";
 
 type TeamSetupStep = "devices" | "projects" | "review" | "completed";
+
+// Safari/VoiceOver can drop list semantics when CSS removes native markers.
+const EXPLICIT_LIST_ROLE = { role: "list" } as const;
+const EXPLICIT_LIST_ITEM_ROLE = { role: "listitem" } as const;
 const CHANGED_STATE_ERROR =
 	"Team setup changed since it was last reviewed. Reload the latest details to continue.";
 const SAVED_RELOAD_ERROR =
@@ -75,9 +79,13 @@ function canRestoreFocus(element: HTMLElement | null): element is HTMLElement {
 	return true;
 }
 
-function initialStep(detail: api.LegacyTeamSetupDetailResponseV1): TeamSetupStep {
+function initialStep(
+	detail: api.LegacyTeamSetupDetailResponseV1,
+	projectsVisited = false,
+): TeamSetupStep {
 	if (detail.draftState === "completed") return "completed";
 	if (detail.unresolvedDeviceCount > 0) return "devices";
+	if (!projectsVisited && detail.projects.length > 0) return "projects";
 	if (detail.unresolvedProjectCount > 0) return "projects";
 	return "review";
 }
@@ -92,10 +100,21 @@ function detailNeedsRecovery(detail: api.LegacyTeamSetupDetailResponseV1): boole
 	);
 }
 
+const ROSTER_UNAVAILABLE_ERROR =
+	"Team device details are temporarily unavailable. Check the coordinator connection and settings, then retry.";
+
+function isRosterUnavailableError(cause: unknown): boolean {
+	return (
+		cause instanceof api.LegacyTeamSetupApiError &&
+		cause.errorCode === "team_setup_roster_unavailable"
+	);
+}
+
 function safeLoadError(cause: unknown): string {
 	if (isChangedStateError(cause)) {
 		return CHANGED_STATE_ERROR;
 	}
+	if (isRosterUnavailableError(cause)) return ROSTER_UNAVAILABLE_ERROR;
 	return "Team setup details are temporarily unavailable. Retry to load the latest details.";
 }
 
@@ -107,12 +126,7 @@ function safeMutationError(cause: unknown): string {
 	if (isChangedStateError(cause)) {
 		return CHANGED_STATE_ERROR;
 	}
-	if (
-		cause instanceof api.LegacyTeamSetupApiError &&
-		cause.errorCode === "team_setup_roster_unavailable"
-	) {
-		return "Team device details are temporarily unavailable. Reload the latest details before trying again.";
-	}
+	if (isRosterUnavailableError(cause)) return ROSTER_UNAVAILABLE_ERROR;
 	return "This device change could not be saved. Reload the latest details before trying again.";
 }
 
@@ -120,6 +134,7 @@ function safeProjectMutationError(cause: unknown): string {
 	if (cause instanceof api.LegacyTeamSetupApiError && RELOAD_ERROR_CODES.has(cause.errorCode)) {
 		return CHANGED_STATE_ERROR;
 	}
+	if (isRosterUnavailableError(cause)) return ROSTER_UNAVAILABLE_ERROR;
 	return "This Project mapping could not be saved. Reload the latest details before trying again.";
 }
 
@@ -127,6 +142,7 @@ function safeRefreshError(cause: unknown): string {
 	if (cause instanceof api.LegacyTeamSetupApiError && RELOAD_ERROR_CODES.has(cause.errorCode)) {
 		return CHANGED_STATE_ERROR;
 	}
+	if (isRosterUnavailableError(cause)) return ROSTER_UNAVAILABLE_ERROR;
 	return "Team setup could not be refreshed. Retry to load the latest server details.";
 }
 
@@ -134,6 +150,7 @@ function safeFinishError(cause: unknown): string {
 	if (cause instanceof api.LegacyTeamSetupApiError && RELOAD_ERROR_CODES.has(cause.errorCode)) {
 		return CHANGED_STATE_ERROR;
 	}
+	if (isRosterUnavailableError(cause)) return ROSTER_UNAVAILABLE_ERROR;
 	return "Team setup could not be finished. Reload the latest details before trying again.";
 }
 
@@ -164,11 +181,9 @@ function StepContent({
 			<p>
 				{detail.canFinish
 					? "The server has confirmed that this Team is ready for final review."
-					: "Final review is waiting for current server confirmation evidence."}
+					: "Final review is waiting for the latest setup details."}
 			</p>
-			<p className="small">
-				Next setup action: confirm the server-provided access review before finishing.
-			</p>
+			<p className="small">Next setup action: review the access summary before finishing.</p>
 		</section>
 	);
 }
@@ -193,6 +208,7 @@ function LegacyTeamSetupDialogHost({
 	const focusStepAfterRender = useRef(false);
 	const refreshBeforeLoad = useRef(false);
 	const retryNeedsRefresh = useRef(false);
+	const projectsVisitedAttemptId = useRef<string | null>(null);
 	const submitting = useRef(false);
 	const dialogGeneration = useRef(0);
 	const completedSurfaceRefresh = useRef<{
@@ -245,6 +261,7 @@ function LegacyTeamSetupDialogHost({
 			dialogGeneration.current += 1;
 			refreshBeforeLoad.current = false;
 			retryNeedsRefresh.current = false;
+			projectsVisitedAttemptId.current = null;
 			setCandidateRef(nextCandidateRef);
 			setDetail(null);
 			setError(null);
@@ -277,7 +294,12 @@ function LegacyTeamSetupDialogHost({
 				if (!current) return;
 				retryNeedsRefresh.current = detailNeedsRecovery(nextDetail);
 				setDetail(nextDetail);
-				setStep(initialStep(nextDetail));
+				const nextStep = initialStep(
+					nextDetail,
+					projectsVisitedAttemptId.current === nextDetail.attemptId,
+				);
+				if (nextStep === "projects") projectsVisitedAttemptId.current = nextDetail.attemptId;
+				setStep(nextStep);
 				setError(detailNeedsRecovery(nextDetail) ? CHANGED_STATE_ERROR : null);
 				setLoading(false);
 				if (nextDetail.draftState === "completed") {
@@ -336,6 +358,7 @@ function LegacyTeamSetupDialogHost({
 		focusStepAfterRender.current = false;
 		refreshBeforeLoad.current = false;
 		retryNeedsRefresh.current = false;
+		projectsVisitedAttemptId.current = null;
 		dialogGeneration.current += 1;
 		setCandidateRef(null);
 		setDetail(null);
@@ -347,6 +370,7 @@ function LegacyTeamSetupDialogHost({
 		setStep("devices");
 	};
 	const navigate = (nextStep: TeamSetupStep) => {
+		if (nextStep === "projects" && detail) projectsVisitedAttemptId.current = detail.attemptId;
 		if (nextStep === step) {
 			document.getElementById(`legacy-team-setup-step-${nextStep}`)?.focus();
 			return;
@@ -397,7 +421,8 @@ function LegacyTeamSetupDialogHost({
 				nextDetail.draftState !== "completed" &&
 				nextDetail.unresolvedDeviceCount > 0
 					? "devices"
-					: initialStep(nextDetail);
+					: initialStep(nextDetail, projectsVisitedAttemptId.current === nextDetail.attemptId);
+			if (nextStep === "projects") projectsVisitedAttemptId.current = nextDetail.attemptId;
 			if (nextStep !== current) focusStepAfterRender.current = true;
 			return nextStep;
 		});
@@ -641,8 +666,7 @@ function LegacyTeamSetupDialogHost({
 				</div>
 				<div className="modal-body legacy-team-setup-body">
 					<p className="small" id="legacy-team-setup-description">
-						Review the server-provided device and Project work before this Team can be used for
-						sharing.
+						Review device ownership and Project access before this Team can be used for sharing.
 					</p>
 					{loading && !detail ? <p role="status">Loading the latest Team setup details…</p> : null}
 					{error ? (
@@ -672,9 +696,17 @@ function LegacyTeamSetupDialogHost({
 						<>
 							{step !== "completed" ? (
 								<>
-									<ol aria-label="Team setup steps" className="legacy-team-setup-steps">
-										<li>
+									<ol
+										{...EXPLICIT_LIST_ROLE}
+										aria-label="Team setup steps"
+										className="legacy-team-setup-steps"
+									>
+										<li {...EXPLICIT_LIST_ITEM_ROLE} className="legacy-team-setup-step">
+											<span aria-hidden="true" className="legacy-team-setup-step-number">
+												1
+											</span>
 											<button
+												aria-label="Step 1: Devices"
 												aria-current={step === "devices" ? "step" : undefined}
 												className="settings-button legacy-team-setup-target"
 												onClick={() => navigate("devices")}
@@ -683,8 +715,12 @@ function LegacyTeamSetupDialogHost({
 												Devices
 											</button>
 										</li>
-										<li>
+										<li {...EXPLICIT_LIST_ITEM_ROLE} className="legacy-team-setup-step">
+											<span aria-hidden="true" className="legacy-team-setup-step-number">
+												2
+											</span>
 											<button
+												aria-label="Step 2: Projects"
 												aria-current={step === "projects" ? "step" : undefined}
 												aria-describedby={
 													devicesBlockProgress ? "legacy-team-setup-block-devices" : undefined
@@ -704,8 +740,12 @@ function LegacyTeamSetupDialogHost({
 												Projects
 											</button>
 										</li>
-										<li>
+										<li {...EXPLICIT_LIST_ITEM_ROLE} className="legacy-team-setup-step">
+											<span aria-hidden="true" className="legacy-team-setup-step-number">
+												3
+											</span>
 											<button
+												aria-label="Step 3: Review"
 												aria-current={step === "review" ? "step" : undefined}
 												aria-describedby={
 													devicesBlockProgress
@@ -794,6 +834,7 @@ function LegacyTeamSetupDialogHost({
 									blockedDescriptionId={mutationBlockDescriptionId}
 									busyProjectRef={busyProjectRef}
 									detail={detail}
+									onContinue={() => navigate("review")}
 									onMap={mapProject}
 								/>
 							) : step === "review" && detail.canFinish ? (

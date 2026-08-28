@@ -5,7 +5,7 @@
  * and type definitions shared across the codemem TS backend.
  */
 
-export const VERSION = "0.43.0";
+export const VERSION = "0.43.1";
 
 export * as Api from "./api-types.js";
 export { extractApplyPatchPaths, MUTATING_TOOL_NAMES } from "./apply-patch.js";
@@ -862,6 +862,15 @@ export {
 	resolveRecipientPolicyReview,
 	resolveRecipientPolicyReviewBulk,
 } from "./recipient-policy-review.js";
+export type {
+	ConfiguredCoordinatorGroupV1,
+	RecipientPolicyTeamRenameErrorCode,
+	RecipientPolicyTeamRenameResultV1,
+} from "./recipient-policy-team-metadata.js";
+export {
+	RecipientPolicyTeamRenameError,
+	renameRecipientPolicyTeam,
+} from "./recipient-policy-team-metadata.js";
 export type {
 	RecipientReviewedIntentExcludedProjectV1,
 	RecipientReviewedIntentProjectSourceV1,

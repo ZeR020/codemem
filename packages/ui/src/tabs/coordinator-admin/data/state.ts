@@ -4,6 +4,8 @@
  * and write it without hitting ES-module `export let` limitations. */
 
 import type { CachedCoordinatorAdminDevice } from "../../../lib/state";
+import { createUnnamedDeviceAliasRegistry, type UnnamedDeviceAliasRegistry } from "./device-card";
+import { type CoordinatorAdminRecoveryState, initialCoordinatorAdminRecovery } from "./recovery";
 import type {
 	CoordinatorAdminScopeMemberView,
 	CoordinatorAdminScopeView,
@@ -24,6 +26,12 @@ export interface GroupPreferencesDraft {
 	default_space_scope_id: string;
 	auto_grant_default_space_on_join: boolean;
 	loaded: boolean;
+	loading: boolean;
+	availability: "unknown" | "fresh" | "stale" | "unavailable";
+	loadGeneration: number;
+	recoveryAnnouncement: string;
+	recoveryFocusPending: boolean;
+	recoveryRetryRequested: boolean;
 	saving: boolean;
 	error: string;
 }
@@ -31,17 +39,24 @@ export interface GroupPreferencesDraft {
 export interface GroupScopeManagementDraft {
 	loaded: boolean;
 	loading: boolean;
+	availability: "unknown" | "fresh" | "stale" | "unavailable";
 	error: string;
 	includeInactive: boolean;
 	devicesLoaded: boolean;
 	scopes: CoordinatorAdminScopeView[];
 	membersByScope: Map<string, CoordinatorAdminScopeMemberView[]>;
+	memberAvailabilityByScope: Map<string, "fresh" | "stale" | "unavailable" | "deferred">;
 	devices: CachedCoordinatorAdminDevice[];
 	createScopeId: string;
 	createLabel: string;
 	createKind: string;
+	createPanelOpen: boolean;
 	actionPendingKey: string;
 	actionPendingKind: ScopeManagementActionKind;
+	loadGeneration: number;
+	recoveryAnnouncement: string;
+	recoveryFocusPending: boolean;
+	recoveryRetryRequested: boolean;
 }
 
 export interface TeamSetupGuideState {
@@ -53,7 +68,17 @@ export interface TeamSetupGuideState {
 	setupWarning: { step?: string; error?: string } | null;
 }
 
+export interface CoordinatorAdminSnapshotTarget {
+	coordinatorUrl: string;
+	groupId: string;
+}
+
 export interface CoordinatorAdminState {
+	recovery: CoordinatorAdminRecoveryState;
+	loadGeneration: number;
+	recoveryAnnouncement: string;
+	recoveryFocusPending: boolean;
+	recoveryRetryRequested: boolean;
 	activeSection: AdminSection;
 	inviteGroup: string;
 	inviteTtlHours: string;
@@ -68,9 +93,13 @@ export interface CoordinatorAdminState {
 	joinReviewPendingAction: JoinReviewAction;
 	deviceActionPendingId: string;
 	deviceActionPendingKind: DeviceActionKind;
+	joinRequestsSnapshotTarget: CoordinatorAdminSnapshotTarget | null;
+	devicesSnapshotTarget: CoordinatorAdminSnapshotTarget | null;
 	groupRenameDrafts: Map<string, string>;
+	groupPresentationAliases: Map<string, string>;
 	deviceRenameDrafts: Map<string, string>;
 	deviceRenameServerNames: Map<string, string>;
+	unnamedDeviceAliases: UnnamedDeviceAliasRegistry;
 	groupPreferencesOpen: Set<string>;
 	groupPreferencesDrafts: Map<string, GroupPreferencesDraft>;
 	groupScopeManagementOpen: Set<string>;
@@ -87,6 +116,11 @@ export interface CoordinatorAdminState {
 export const ADMIN_TARGET_GROUP_KEY = "codemem-coordinator-admin-target-group";
 
 export const coordinatorAdminState: CoordinatorAdminState = {
+	recovery: initialCoordinatorAdminRecovery(),
+	loadGeneration: 0,
+	recoveryAnnouncement: "",
+	recoveryFocusPending: false,
+	recoveryRetryRequested: false,
 	activeSection: "groups",
 	inviteGroup: "",
 	inviteTtlHours: "24",
@@ -101,9 +135,13 @@ export const coordinatorAdminState: CoordinatorAdminState = {
 	joinReviewPendingAction: "",
 	deviceActionPendingId: "",
 	deviceActionPendingKind: "",
+	joinRequestsSnapshotTarget: null,
+	devicesSnapshotTarget: null,
 	groupRenameDrafts: new Map<string, string>(),
+	groupPresentationAliases: new Map<string, string>(),
 	deviceRenameDrafts: new Map<string, string>(),
 	deviceRenameServerNames: new Map<string, string>(),
+	unnamedDeviceAliases: createUnnamedDeviceAliasRegistry(),
 	groupPreferencesOpen: new Set<string>(),
 	groupPreferencesDrafts: new Map<string, GroupPreferencesDraft>(),
 	groupScopeManagementOpen: new Set<string>(),
@@ -111,3 +149,12 @@ export const coordinatorAdminState: CoordinatorAdminState = {
 	teamSetupGuide: null,
 	availableProjects: [],
 };
+
+export function beginCoordinatorAdminLoadGeneration(): number {
+	coordinatorAdminState.loadGeneration += 1;
+	return coordinatorAdminState.loadGeneration;
+}
+
+export function isCurrentCoordinatorAdminLoadGeneration(generation: number): boolean {
+	return coordinatorAdminState.loadGeneration === generation;
+}

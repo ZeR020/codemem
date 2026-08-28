@@ -18,6 +18,7 @@ import {
 	loadRecipientPolicyReview,
 	loadShareOperation,
 	loadShareOperations,
+	ProjectInviteAcceptanceError,
 	previewDeviceIdentityBindings,
 	previewRecipientInvite,
 	previewRecipientPolicyEdges,
@@ -25,6 +26,7 @@ import {
 	type RecipientPolicyReviewListV1,
 	RecipientPolicyReviewStaleError,
 	refreshLegacyTeamSetupCandidate,
+	renameRecipientPolicyTeam,
 	resolveRecipientPolicyReview,
 	resolveRecipientPolicyReviewBulk,
 	saveLegacyTeamSetupAssignment,
@@ -96,7 +98,113 @@ afterEach(() => {
 	vi.restoreAllMocks();
 });
 
+describe("recipient policy Team metadata API", () => {
+	it("sends the bounded rename contract and validates the response", async () => {
+		const result = {
+			version: 1 as const,
+			teamId: "team-one",
+			displayName: "New Team",
+			revision: "revision-two",
+			linkedCoordinatorGroupRenamed: true,
+		};
+		const fetchMock = vi
+			.fn()
+			.mockResolvedValue(new Response(JSON.stringify(result), { status: 200 }));
+		globalThis.fetch = fetchMock as typeof fetch;
+
+		await expect(
+			renameRecipientPolicyTeam({
+				teamId: "team/one",
+				displayName: "New Team",
+				expectedDisplayName: "Old Team",
+			}),
+		).resolves.toEqual(result);
+		expect(fetchMock).toHaveBeenCalledWith("/api/sync/recipient-policy/v1/teams/team%2Fone", {
+			method: "PATCH",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ displayName: "New Team", expectedDisplayName: "Old Team" }),
+		});
+	});
+
+	it("maps unknown server failures to a safe typed error", async () => {
+		globalThis.fetch = vi
+			.fn()
+			.mockResolvedValue(
+				new Response(JSON.stringify({ error: "private_remote_detail" }), { status: 503 }),
+			) as typeof fetch;
+
+		await expect(
+			renameRecipientPolicyTeam({
+				teamId: "team-one",
+				displayName: "New Team",
+				expectedDisplayName: "Old Team",
+			}),
+		).rejects.toMatchObject({ statusCode: 503, errorCode: "team_rename_failed" });
+	});
+});
+
 describe("recipient invitation API", () => {
+	it("preserves allowlisted Project invitation error codes without changing safe detail", async () => {
+		globalThis.fetch = vi.fn(
+			async () =>
+				new Response(
+					JSON.stringify({
+						detail: "This invitation expired. Ask the owner to create a new invitation.",
+						error: "invite_expired",
+					}),
+					{ status: 400 },
+				),
+		) as typeof fetch;
+
+		const failure = await importCoordinatorInvite(
+			"expired-project-invite",
+			undefined,
+			"project_share_invite",
+		).catch((cause: unknown) => cause);
+
+		expect(failure).toBeInstanceOf(ProjectInviteAcceptanceError);
+		expect(failure).toMatchObject({
+			errorCode: "invite_expired",
+			message: "This invitation expired. Ask the owner to create a new invitation.",
+		});
+	});
+
+	it.each([
+		"team_member",
+		"add_device",
+	] as const)("does not classify %s failures as Project invitation failures", async (inviteKind) => {
+		globalThis.fetch = vi.fn(
+			async () =>
+				new Response(JSON.stringify({ error: "invite_identity_conflict" }), {
+					status: 409,
+				}),
+		) as typeof fetch;
+
+		const failure = await importCoordinatorInvite("recipient-invite", undefined, inviteKind).catch(
+			(cause: unknown) => cause,
+		);
+
+		expect(failure).toBeInstanceOf(Error);
+		expect(failure).not.toBeInstanceOf(ProjectInviteAcceptanceError);
+		expect(failure).toMatchObject({ message: "invite_identity_conflict" });
+	});
+
+	it("keeps unknown Project invitation errors untyped", async () => {
+		globalThis.fetch = vi.fn(
+			async () =>
+				new Response(JSON.stringify({ detail: "private backend detail", error: "private_code" }), {
+					status: 400,
+				}),
+		) as typeof fetch;
+
+		const failure = await importCoordinatorInvite("unknown-project-invite").catch(
+			(cause: unknown) => cause,
+		);
+
+		expect(failure).toBeInstanceOf(Error);
+		expect(failure).not.toBeInstanceOf(ProjectInviteAcceptanceError);
+	});
+
 	it("prefers actionable invite-import detail over an opaque error code", async () => {
 		globalThis.fetch = vi.fn(
 			async () =>

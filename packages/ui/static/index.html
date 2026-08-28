@@ -336,6 +336,61 @@
         padding: var(--sp-3);
       }
 
+      .coordinator-admin-legacy-notice {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: var(--sp-4);
+        margin-bottom: var(--sp-4);
+      }
+
+      .coordinator-admin-recovery-notice {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: var(--sp-4);
+        border-width: 2px;
+      }
+
+      .coordinator-admin-legacy-notice-copy {
+        display: grid;
+        gap: var(--sp-2);
+        min-width: 0;
+      }
+
+      .coordinator-admin-legacy-notice-copy h3 {
+        margin: 0;
+      }
+
+      @media (max-width: 720px) {
+        .advanced-legacy-header {
+          align-items: stretch;
+          flex-direction: column;
+        }
+
+        .advanced-legacy-header .section-actions {
+          flex-wrap: wrap;
+        }
+
+        .coordinator-admin-legacy-notice {
+          align-items: stretch;
+          flex-direction: column;
+        }
+
+        .coordinator-admin-legacy-notice .settings-button {
+          width: 100%;
+        }
+
+        .coordinator-admin-recovery-notice {
+          align-items: stretch;
+          flex-direction: column;
+        }
+
+        .coordinator-admin-recovery-notice .settings-button {
+          width: 100%;
+        }
+      }
+
       .coordinator-admin-inline-meta {
         margin-top: -4px;
       }
@@ -591,6 +646,37 @@
       .coordinator-admin-domain-management {
         gap: var(--sp-4);
       }
+
+      .coordinator-admin-space-toolbar {
+        align-items: center;
+        justify-content: space-between;
+        flex-wrap: wrap;
+      }
+
+      .coordinator-admin-create-space-panel {
+        border: 1px solid var(--border);
+        border-radius: var(--radius-md);
+        background: var(--surface-1);
+        padding: var(--sp-3);
+      }
+
+      .coordinator-admin-create-space-panel[data-state="closed"] { display: none; }
+
+      .coordinator-admin-diagnostics {
+        color: var(--text-tertiary);
+        font-size: var(--font-size-sm);
+        min-width: 0;
+      }
+
+      .coordinator-admin-diagnostics summary {
+        cursor: pointer;
+        font-weight: var(--font-weight-semibold);
+        width: fit-content;
+      }
+
+      .coordinator-admin-diagnostics[open] > :not(summary) { margin-top: var(--sp-1); }
+
+      .coordinator-admin-card-title { margin: 0; overflow-wrap: anywhere; }
 
       .coordinator-admin-scope-card-list {
         display: grid;
@@ -1203,15 +1289,33 @@
         font-weight: var(--font-weight-semibold);
       }
       .recipient-policy-management-dialog .modal-card { width: min(720px, calc(100vw - 32px)); }
+      .recipient-policy-team-settings-dialog .modal-card { width: min(440px, calc(100vw - 32px)); }
+      .recipient-policy-team-settings-dialog .form-field { display: grid; gap: var(--sp-2); margin-top: var(--sp-4); }
+      .recipient-policy-team-settings-dialog .form-field span { font-weight: var(--font-weight-semibold); }
+      .recipient-policy-team-settings-dialog input { width: 100%; }
+      .recipient-policy-team-settings-actions { justify-content: flex-end; flex-wrap: wrap; }
       .legacy-team-setup-dialog .modal-card { width: min(680px, calc(100vw - 32px)); }
       .legacy-team-setup-steps {
         display: grid;
         grid-template-columns: repeat(3, minmax(0, 1fr));
         gap: var(--sp-2);
         margin: var(--sp-2) 0;
-        padding-left: var(--sp-5);
+        padding: 0;
+        list-style: none;
       }
-      .legacy-team-setup-steps button { width: 100%; }
+      .legacy-team-setup-step {
+        display: grid;
+        grid-template-columns: auto minmax(0, 1fr);
+        align-items: center;
+        gap: var(--sp-2);
+        min-width: 0;
+      }
+      .legacy-team-setup-step-number {
+        color: var(--text-secondary);
+        font-weight: var(--font-weight-semibold);
+        font-variant-numeric: tabular-nums;
+      }
+      .legacy-team-setup-steps button { width: 100%; min-width: 0; }
       .legacy-team-setup-steps button[aria-current="step"] {
         border-color: var(--accent);
         background: var(--accent-subtle);
@@ -1268,9 +1372,28 @@
       .legacy-team-project-select { width: 100%; margin: 0; }
       .legacy-team-project-select:disabled { opacity: 0.55; cursor: not-allowed; }
       .legacy-team-setup-delta { display: grid; gap: var(--sp-3); }
+      .legacy-team-setup-review-summary {
+        display: grid;
+        gap: var(--sp-2);
+        margin-block: var(--sp-3);
+        padding: var(--sp-3);
+        border: 1px solid var(--border);
+        border-radius: var(--radius-sm);
+        background: var(--surface-2);
+      }
+      .legacy-team-setup-review-summary p,
+      .legacy-team-setup-review-summary ul { margin: 0; }
       .legacy-team-setup-delta section { padding-block: var(--sp-2); border-bottom: 1px solid var(--border); }
       .legacy-team-setup-delta h4 { margin: 0 0 var(--sp-2); }
       .legacy-team-setup-delta ul { display: grid; gap: var(--sp-1); margin: 0; padding-inline-start: var(--sp-5); }
+      .legacy-team-setup-delta-summary { font-weight: var(--font-weight-semibold); }
+      .legacy-team-setup-delta details { margin-top: var(--sp-2); }
+      .legacy-team-setup-delta summary { cursor: pointer; font-weight: var(--font-weight-semibold); }
+      .legacy-team-setup-delta .legacy-team-setup-exact-list {
+        margin-top: var(--sp-2);
+        padding-block: var(--sp-2);
+        border-top: 1px solid var(--border);
+      }
       .legacy-team-setup-confirmation { display: flex; gap: var(--sp-2); align-items: flex-start; margin-block: var(--sp-4); }
       .legacy-team-setup-confirmation input { flex: 0 0 auto; margin-top: 0.2em; min-width: 24px; min-height: 24px; }
       .recipient-policy-management-selection fieldset { border: 0; padding: 0; margin: var(--sp-4) 0 0; }
@@ -1307,6 +1430,7 @@
       .recipient-policy-sharing-tabs {
         position: static;
         display: flex;
+		flex-wrap: wrap;
         gap: var(--sp-1);
         margin-bottom: var(--sp-4);
         padding: 0;
@@ -1317,6 +1441,11 @@
       .recipient-policy-sharing-tabs .tab-btn { color: var(--text-secondary); }
       .recipient-policy-sharing-tabs .tab-btn.active { color: var(--text-primary); }
       .recipient-policy-sharing-grid { display: grid; gap: var(--sp-3); }
+      .recipient-policy-sharing-responsive-grid {
+        grid-template-columns: repeat(auto-fit, minmax(min(100%, 20rem), 1fr));
+      }
+      .recipient-policy-sharing-responsive-surface { min-width: 0; }
+      .recipient-policy-sharing-target { max-width: 100%; }
       .recipient-policy-sharing-card { border: 1px solid var(--border); border-radius: var(--radius-md); }
       .recipient-policy-sharing-card-title {
         display: flex;
@@ -1325,6 +1454,31 @@
         gap: var(--sp-3);
       }
       .recipient-policy-sharing-card-title h3 { margin: 0; }
+      .recipient-policy-sharing-card,
+      .recipient-policy-sharing-card-title,
+      .recipient-policy-sharing-details dd { min-width: 0; overflow-wrap: anywhere; }
+      .recipient-policy-sharing-state,
+      .recipient-policy-sharing-empty {
+        border: 1px solid var(--border);
+        border-radius: var(--radius-md);
+        background: var(--surface-1);
+        color: var(--text-secondary);
+        padding: var(--sp-3);
+      }
+      .recipient-policy-sharing-error {
+        border-color: color-mix(in srgb, var(--status-attention) 45%, var(--border));
+        color: var(--text-primary);
+      }
+      .recipient-policy-sharing-name-details,
+      .recipient-policy-sharing-project-details { margin-top: var(--sp-2); }
+      .recipient-policy-sharing-name-details summary,
+      .recipient-policy-sharing-project-details summary {
+        color: var(--text-secondary);
+        cursor: pointer;
+        font-weight: var(--font-weight-semibold);
+      }
+      .recipient-policy-sharing-name-details ul,
+      .recipient-policy-sharing-project-details ul { margin: var(--sp-2) 0 0; padding-left: var(--sp-5); }
       .recipient-policy-sharing-details { display: grid; gap: var(--sp-3); margin: var(--sp-4) 0; }
       .recipient-policy-sharing-details div {
         display: grid;
@@ -1333,6 +1487,9 @@
       }
       .recipient-policy-sharing-details dt { color: var(--text-secondary); }
       .recipient-policy-sharing-details dd { margin: 0; color: var(--text-primary); }
+      .recipient-policy-sharing-team-card > .recipient-policy-sharing-actions + .recipient-policy-sharing-actions {
+        margin-top: var(--sp-2);
+      }
 
       .loading-card-list { display: grid; gap: var(--sp-3); }
       .loading-card {
@@ -1436,6 +1593,32 @@
       }
       .recipient-policy-sharing-attention p { margin-top: var(--sp-2); }
       .recipient-policy-sharing-attention .settings-button { margin-top: var(--sp-3); }
+      .recipient-policy-sharing-team-setup-list {
+        display: grid;
+        gap: var(--sp-3);
+        margin: var(--sp-3) 0 0;
+        padding: 0;
+        list-style: none;
+      }
+      .recipient-policy-sharing-team-setup-group,
+      .recipient-policy-sharing-team-setup-rows { display: grid; gap: var(--sp-2); }
+      .recipient-policy-sharing-team-setup-group-title {
+        display: flex;
+        align-items: baseline;
+        gap: var(--sp-2);
+        min-width: 0;
+        overflow-wrap: anywhere;
+        flex-wrap: wrap;
+      }
+      .recipient-policy-sharing-team-setup-row {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) auto auto;
+        align-items: center;
+        gap: var(--sp-2);
+        min-width: 0;
+      }
+      .recipient-policy-sharing-team-setup-label { min-width: 0; overflow-wrap: anywhere; }
+      .recipient-policy-sharing-team-setup-action .settings-button { margin-top: 0; }
       .device-identity-setup-card fieldset,
       .device-identity-rebind fieldset {
         display: grid;
@@ -1466,7 +1649,12 @@
         .recipient-policy-sharing-responsive-actions { display: grid; grid-template-columns: 1fr; }
         .recipient-policy-management-actions button,
         .recipient-policy-sharing-responsive-actions button { min-height: 44px; width: 100%; }
-        .recipient-policy-sharing-responsive-tabs { overflow-x: auto; }
+        .recipient-policy-sharing-responsive-tabs { flex-wrap: wrap; min-width: 0; overflow-x: visible; }
+        .recipient-policy-sharing-responsive-tabs .tab-btn { flex: 1 1 auto; min-width: 0; }
+        .coordinator-admin-space-toolbar,
+        .coordinator-admin-space-toolbar > .peer-actions { align-items: stretch; width: 100%; }
+        .coordinator-admin-space-toolbar > .peer-actions { display: grid; grid-template-columns: 1fr; }
+        .coordinator-admin-space-toolbar .settings-button { width: 100%; }
         .recipient-policy-sharing-details div { grid-template-columns: 1fr; gap: var(--sp-1); }
         .recipient-policy-invitation-result { padding: var(--sp-3); }
         #devicesMount .recipient-policy-sharing-card > .settings-button,
@@ -2739,7 +2927,8 @@
       .sync-attention-target {
         animation: sync-attention-target var(--duration-attention) var(--ease-out);
       }
-      .settings-button:disabled {
+      .settings-button:disabled,
+      .settings-button[aria-disabled="true"] {
         opacity: 0.55;
         cursor: not-allowed;
       }
@@ -3716,6 +3905,9 @@
         .modal-card { padding: var(--sp-4); border-radius: var(--radius-lg); }
         .legacy-team-setup-dialog .modal-card { width: calc(100vw - 16px); }
         .legacy-team-setup-steps { grid-template-columns: 1fr; }
+        .recipient-policy-sharing-team-setup-row { grid-template-columns: 1fr auto; }
+        .recipient-policy-sharing-team-setup-label { grid-column: 1 / -1; }
+        .recipient-policy-sharing-team-setup-separator { display: none; }
       }
 
       /* ──────────────────────────────────────────────────────────────────
@@ -3799,7 +3991,7 @@
       <button class="tab-btn" id="tabBtn-sharing">Sharing</button>
       <button class="tab-btn" id="tabBtn-devices">Devices</button>
       <button class="tab-btn" id="tabBtn-health">Health</button>
-      <button class="tab-btn" id="tabBtn-advanced">Advanced</button>
+      <button class="tab-btn" id="tabBtn-advanced">Advanced (legacy)</button>
     </nav>
     <div id="toastRoot"></div>
     <div id="recipientPolicyManagementMount"></div>
@@ -4153,14 +4345,14 @@
     <!-- ── Tab: Advanced ───────────────────────────────────── -->
     <div class="tab-panel" id="tab-advanced" hidden>
       <div class="card">
-        <div class="section-header">
+        <div class="section-header advanced-legacy-header">
           <div>
-            <h2>Advanced</h2>
-            <div class="section-meta">Compatibility tools for device sync and Team administration.</div>
+            <h2>Advanced (legacy)</h2>
+            <div class="section-meta">Compatibility and recovery tools for device sync and coordinator administration.</div>
           </div>
-          <div class="section-actions" aria-label="Advanced sections">
+          <div class="section-actions" aria-label="Advanced sections" role="group">
             <button class="settings-button" id="advancedSyncButton" type="button" aria-pressed="true">Sync</button>
-            <button class="settings-button" id="advancedTeamsButton" type="button" aria-pressed="false">Teams</button>
+            <button class="settings-button" id="advancedTeamsButton" type="button" aria-pressed="false">Coordinator administration (legacy)</button>
           </div>
         </div>
       </div>
@@ -4315,9 +4507,25 @@
 
       <div id="advancedTeamsContent" hidden>
         <div class="card">
+          <aside
+            aria-labelledby="coordinatorAdminLegacyNoticeTitle"
+            class="coordinator-admin-inline-warning coordinator-admin-legacy-notice"
+            role="note"
+          >
+            <div class="coordinator-admin-legacy-notice-copy">
+              <h3 id="coordinatorAdminLegacyNoticeTitle" tabindex="-1">Sharing is the supported Team experience</h3>
+              <div class="peer-submeta">
+                Coordinator groups and Spaces here are legacy technical discovery and transport boundaries, not policy Teams. Changes here do not safely manage Team membership, Project access, Identity, or Team names in Sharing.
+              </div>
+              <div class="peer-submeta">
+                Keep using these controls for compatibility and recovery. Use Sharing for ordinary Team and access administration.
+              </div>
+            </div>
+            <button class="settings-button" id="coordinatorAdminOpenSharing" type="button">Open Sharing</button>
+          </aside>
           <details class="advanced-administration-disclosure" open>
-            <summary>Advanced Team administration</summary>
-            <div class="section-meta">Manage legacy enrollment, Spaces, device administration, and coordinator settings.</div>
+            <summary>Advanced coordinator administration (legacy)</summary>
+            <div class="section-meta">Technical coordinator groups, Spaces, enrollment, and recovery controls.</div>
             <div id="coordinatorAdminMount"></div>
           </details>
         </div>

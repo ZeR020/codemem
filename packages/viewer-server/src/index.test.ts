@@ -28,7 +28,7 @@ import {
 import { serve } from "@hono/node-server";
 import Database from "better-sqlite3";
 import { describe, expect, it, vi } from "vitest";
-import { createApp, createSyncApp } from "./index.js";
+import { type AppOptions, createApp, createSyncApp } from "./index.js";
 import { __usageCacheTestHooks } from "./routes/stats.js";
 import { reconcileConfiguredCoordinatorEnrollment } from "./routes/sync.js";
 import {
@@ -186,6 +186,8 @@ function createTestApp(opts?: {
 	sweeper?: unknown;
 	getUpdateStatus?: (options: core.GetUpdateStatusOptions) => Promise<core.UpdateStatus>;
 	loadLegacyTeamConfiguredGroupSnapshots?: LegacyTeamConfiguredGroupSnapshotLoader;
+	readCoordinatorConfig?: AppOptions["readCoordinatorConfig"];
+	renameCoordinatorGroup?: AppOptions["renameCoordinatorGroup"];
 	syncRequestRateLimit?: {
 		readLimit?: number;
 		mutationLimit?: number;
@@ -215,6 +217,8 @@ function createTestApp(opts?: {
 		getUpdateStatus: opts?.getUpdateStatus,
 		getSyncRuntimeStatus: opts?.getSyncRuntimeStatus,
 		loadLegacyTeamConfiguredGroupSnapshots: opts?.loadLegacyTeamConfiguredGroupSnapshots,
+		readCoordinatorConfig: opts?.readCoordinatorConfig,
+		renameCoordinatorGroup: opts?.renameCoordinatorGroup,
 	};
 	const app = createApp(appOptions);
 
@@ -449,15 +453,21 @@ describe("viewer-server", () => {
 	it("sync UI api routes all exist in the viewer sync router", () => {
 		const root = join(import.meta.dirname, "../../..");
 		const apiSource = readFileSync(join(root, "packages/ui/src/lib/api.ts"), "utf8");
-		const routeSource = ["sync.ts", "team-setup.ts"]
-			.map((file) => readFileSync(join(root, "packages/viewer-server/src/routes", file), "utf8"))
-			.join("\n");
+		const syncRouteSource = readFileSync(
+			join(root, "packages/viewer-server/src/routes/sync.ts"),
+			"utf8",
+		);
+		const teamSetupRouteSource = readFileSync(
+			join(root, "packages/viewer-server/src/routes/team-setup.ts"),
+			"utf8",
+		);
+		const routeSource = `${syncRouteSource}\n${teamSetupRouteSource}`;
 		const uiRoutes = [
 			...apiSource.matchAll(/fetch\('(\/api\/sync\/[^']+)'/g),
 			...apiSource.matchAll(/fetchJson\('(\/api\/sync\/[^']+)'/g),
 		].map((match) => match[1]);
 		const concreteServerRoutes = [
-			...routeSource.matchAll(/app\.(?:get|post|put|delete)\("(\/api\/sync\/[^"]+)"/g),
+			...routeSource.matchAll(/app\.(?:get|post|put|patch|delete)\("(\/api\/sync\/[^"]+)"/g),
 		].map((match) => match[1]);
 		const normalizedServerRoutes = new Set(
 			concreteServerRoutes.map((route) => route.replace(/:\w+/g, "__param__")),
@@ -470,6 +480,8 @@ describe("viewer-server", () => {
 		).toBe(true);
 		expect(concreteServerRoutes).toContain("/api/sync/team-setup/v1");
 		expect(concreteServerRoutes).toContain("/api/sync/team-setup/v1/:candidateRef");
+		expect(syncRouteSource).toContain('app.patch("/api/sync/recipient-policy/v1/teams/:teamId"');
+		expect(teamSetupRouteSource).not.toContain("/api/sync/recipient-policy/");
 		expect(concreteServerRoutes).toEqual(
 			expect.arrayContaining([
 				"/api/sync/team-setup/v1/:candidateRef/devices/:deviceRef/assignment",
@@ -508,6 +520,49 @@ describe("viewer-server", () => {
 				],
 			},
 		];
+
+		it("invalidates the cached Team setup summary after a recipient-policy rename", async () => {
+			const loadSnapshots = vi.fn(async () => []);
+			const { app, ensureStore, cleanup } = createTestApp({
+				loadLegacyTeamConfiguredGroupSnapshots: loadSnapshots,
+				readCoordinatorConfig: () => core.readCoordinatorSyncConfig({}),
+			});
+			try {
+				const store = ensureStore();
+				store.db
+					.prepare(
+						`INSERT INTO policy_teams(
+					 team_id, display_name, status, provenance, revision, migration_state,
+					 idempotency_key, created_at, updated_at
+					 ) VALUES ('team-local', 'Old Team', 'active', 'user', 'revision-1',
+					 'user_managed', 'team-key', '2026-08-26T00:00:00.000Z',
+					 '2026-08-26T00:00:00.000Z')`,
+					)
+					.run();
+
+				await app.request("/api/sync/team-setup/v1");
+				await app.request("/api/sync/team-setup/v1");
+				expect(loadSnapshots).toHaveBeenCalledTimes(1);
+
+				const renamed = await app.request("/api/sync/recipient-policy/v1/teams/team-local", {
+					method: "PATCH",
+					headers: {
+						"Content-Type": "application/json",
+						Origin: "http://127.0.0.1:38888",
+					},
+					body: JSON.stringify({
+						displayName: "New Team",
+						expectedDisplayName: "Old Team",
+					}),
+				});
+				expect(renamed.status).toBe(200);
+
+				await app.request("/api/sync/team-setup/v1");
+				expect(loadSnapshots).toHaveBeenCalledTimes(2);
+			} finally {
+				cleanup();
+			}
+		});
 
 		it("returns versioned summaries and a redacted detail with preview only when finishable", async () => {
 			const loadSnapshots = vi.fn(async () => snapshots);
@@ -1515,7 +1570,7 @@ describe("viewer-server", () => {
 			]);
 		});
 
-		it("fails closed for non-size coordinator roster errors", async () => {
+		it("fails closed when the only summary roster is unavailable", async () => {
 			const config = {
 				...core.readCoordinatorSyncConfig({}),
 				syncCoordinatorUrl: "http://localhost:8787",
@@ -1540,7 +1595,7 @@ describe("viewer-server", () => {
 			).rejects.toThrow("team_setup_roster_unavailable");
 		});
 
-		it("rejects coordinator roster fingerprints that do not match their public keys", async () => {
+		it("fails closed when the only summary roster has a mismatched fingerprint", async () => {
 			const config = {
 				...core.readCoordinatorSyncConfig({}),
 				syncCoordinatorUrl: "http://localhost:8787",
@@ -1574,7 +1629,9 @@ describe("viewer-server", () => {
 			).rejects.toThrow("team_setup_roster_unavailable");
 		});
 
-		it.each([2, -1])("rejects invalid coordinator enabled value %i", async (enabled) => {
+		it.each([
+			2, -1,
+		])("fails closed on sole invalid coordinator enabled value %i", async (enabled) => {
 			const publicKey = "public-key-a";
 			const config = {
 				...core.readCoordinatorSyncConfig({}),
