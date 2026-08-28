@@ -31,6 +31,7 @@ import {
 } from "./db.js";
 import { buildFilterClausesWithContext, type OwnershipFilterContext } from "./filters.js";
 import { buildMemoryDedupKey, normalizeMemoryDedupTitle } from "./memory-dedup.js";
+import { validateMemoryKind } from "./memory-kinds.js";
 import { readCodememConfigFile } from "./observer-config.js";
 import type { PackArtifacts } from "./pack.js";
 import {
@@ -75,19 +76,6 @@ import type {
 } from "./types.js";
 import { storeVectors } from "./vectors.js";
 
-// Memory kind validation (mirrors codemem/memory_kinds.py)
-
-const ALLOWED_MEMORY_KINDS = new Set([
-	"discovery",
-	"change",
-	"feature",
-	"bugfix",
-	"refactor",
-	"decision",
-	"exploration",
-	"session_summary",
-]);
-
 // Locally reviewed flows that can establish same-person ownership. Coordinator
 // enrollment remains discovery evidence and must never grant write authority.
 const SAME_PERSON_BINDING_PROVENANCE = new Set([
@@ -96,17 +84,6 @@ const SAME_PERSON_BINDING_PROVENANCE = new Set([
 	"exact_project_invite",
 	"review_resolution",
 ]);
-
-/** Normalize and validate a memory kind. Throws on invalid kinds. */
-function validateMemoryKind(kind: string): string {
-	const normalized = kind.trim().toLowerCase();
-	if (!ALLOWED_MEMORY_KINDS.has(normalized)) {
-		throw new Error(
-			`Invalid memory kind "${kind}". Allowed: ${[...ALLOWED_MEMORY_KINDS].join(", ")}`,
-		);
-	}
-	return normalized;
-}
 
 // Helpers
 

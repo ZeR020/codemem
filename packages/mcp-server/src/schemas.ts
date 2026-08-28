@@ -1,3 +1,4 @@
+import { REMEMBER_MEMORY_KINDS } from "@codemem/core";
 import { z } from "zod";
 
 const scopeFilterSchema = {
@@ -29,14 +30,6 @@ export const filterSchema = {
 	widen_shared_min_personal_score: z.number().optional(),
 };
 
-export const memoryKindSchema = z.enum([
-	"discovery",
-	"change",
-	"feature",
-	"bugfix",
-	"refactor",
-	"decision",
-	"exploration",
-]);
+export const memoryKindSchema = z.enum(REMEMBER_MEMORY_KINDS);
 
 export const filterNames = Object.keys(filterSchema).toSorted();

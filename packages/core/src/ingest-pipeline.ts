@@ -65,6 +65,7 @@ import {
 	shouldPreferRepairedObserverResponse,
 	shouldRepairObserverResponse,
 } from "./ingest-xml-parser.js";
+import { REMEMBER_MEMORY_KINDS } from "./memory-kinds.js";
 import { type ObserverClient, ObserverClient as ObserverClientImpl } from "./observer-client.js";
 import { resolveProject } from "./project.js";
 import * as schema from "./schema.js";
@@ -78,15 +79,7 @@ import { storeVectors } from "./vectors.js";
 // Allowed memory kinds (matches Python)
 // ---------------------------------------------------------------------------
 
-const ALLOWED_KINDS = new Set([
-	"bugfix",
-	"feature",
-	"refactor",
-	"change",
-	"discovery",
-	"decision",
-	"exploration",
-]);
+const ALLOWED_KINDS = new Set<string>(REMEMBER_MEMORY_KINDS);
 
 // ---------------------------------------------------------------------------
 // Path normalization

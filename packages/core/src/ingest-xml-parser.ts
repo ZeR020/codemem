@@ -10,6 +10,7 @@
 
 import { isLowSignalObservation } from "./ingest-filters.js";
 import type { ParsedObservation, ParsedOutput, ParsedSummary } from "./ingest-types.js";
+import { REMEMBER_MEMORY_KINDS } from "./memory-kinds.js";
 
 // ---------------------------------------------------------------------------
 // Regex patterns
@@ -43,15 +44,7 @@ const OBSERVATION_CONCEPTS = new Set([
 	"trade-off",
 ]);
 
-export const SUPPORTED_OBSERVATION_KINDS = new Set([
-	"bugfix",
-	"feature",
-	"refactor",
-	"change",
-	"discovery",
-	"decision",
-	"exploration",
-]);
+export const SUPPORTED_OBSERVATION_KINDS = new Set<string>(REMEMBER_MEMORY_KINDS);
 
 export interface ObserverResponseStructuralDiagnostics {
 	recognizedOutput: boolean;
