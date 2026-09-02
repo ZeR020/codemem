@@ -715,6 +715,11 @@ export interface RecipientPolicyBlockedItemV1 {
 	reason: string;
 	ownerLabel: string;
 	repairAction: string;
+	repair: {
+		kind: "reassign_project" | "open_project_administration";
+		projectIdentity: string;
+		label: string;
+	};
 }
 
 export interface RecipientPolicyReviewListV1 {
@@ -914,14 +919,38 @@ export interface LegacyTeamSetupCandidateSummaryV1 {
 	unresolvedProjectCount: number;
 }
 
+export type LegacyTeamSetupPendingCandidateSummaryV1 = Omit<
+	LegacyTeamSetupCandidateSummaryV1,
+	"status"
+> & {
+	status: Exclude<LegacyTeamSetupStatusV1, "ready">;
+};
+
 export interface LegacyTeamSetupSummaryResponseV1 {
 	version: 1;
-	candidates: LegacyTeamSetupCandidateSummaryV1[];
+	candidates: LegacyTeamSetupPendingCandidateSummaryV1[];
 }
 
 export type LegacyTeamSetupAssignmentExpectationV1 =
 	| { kind: "absent" }
 	| { kind: "existing"; assignmentVersion: number; identityRef: string };
+
+export type LegacyTeamSetupActionBlockedReasonV1 =
+	| "setup_incomplete"
+	| "setup_unavailable"
+	| "setup_completed"
+	| "device_inactive"
+	| "device_active"
+	| "assignment_evidence_inactive"
+	| "assignment_required"
+	| "assignment_unavailable"
+	| "decision_unresolved"
+	| "mapping_unavailable"
+	| "automatic_mapping";
+
+export type LegacyTeamSetupActionGateV1 =
+	| { enabled: true; blockedReason: null }
+	| { enabled: false; blockedReason: LegacyTeamSetupActionBlockedReasonV1 };
 
 export interface LegacyTeamSetupDeviceV1 {
 	deviceRef: string;
@@ -933,6 +962,13 @@ export interface LegacyTeamSetupDeviceV1 {
 	decision: "unresolved" | "included" | "excluded" | "removed";
 	targetIdentityRef: string | null;
 	expectation: LegacyTeamSetupAssignmentExpectationV1;
+	actions: {
+		assignIdentity: LegacyTeamSetupActionGateV1;
+		include: LegacyTeamSetupActionGateV1;
+		exclude: LegacyTeamSetupActionGateV1;
+		remove: LegacyTeamSetupActionGateV1;
+		clearDecision: LegacyTeamSetupActionGateV1;
+	};
 }
 
 export interface LegacyTeamSetupProjectV1 {
@@ -942,6 +978,7 @@ export interface LegacyTeamSetupProjectV1 {
 	canonicalProjectRef: string | null;
 	resolvedProjectRef: string | null;
 	mappingChoices: Array<{ resolvedProjectRef: string; displayName: string }>;
+	actions: { map: LegacyTeamSetupActionGateV1 };
 }
 
 export interface LegacyTeamSetupIdentityChoiceV1 {
@@ -967,8 +1004,10 @@ export interface LegacyTeamSetupAccessDeltaV1 {
 	projectChanges: Array<{
 		projectRef: string;
 		projectDisplayName: string;
+		fromCanonicalProjectRef: string | null;
 		fromResolvedProjectRef: string | null;
 		fromResolvedProjectDisplayName: string | null;
+		toCanonicalProjectRef: string | null;
 		toResolvedProjectRef: string | null;
 		toResolvedProjectDisplayName: string | null;
 		change: "add" | "update" | "remove";
@@ -976,6 +1015,7 @@ export interface LegacyTeamSetupAccessDeltaV1 {
 	recipientChanges: Array<{
 		canonicalProjectRef: string;
 		canonicalProjectDisplayName: string;
+		canonicalProjectKind: "project" | "legacy_default_sharing";
 		recipientKind: "team";
 		recipientRef: string;
 		recipientDisplayName: string;
@@ -984,17 +1024,17 @@ export interface LegacyTeamSetupAccessDeltaV1 {
 	deviceAccessChanges: Array<{
 		canonicalProjectRef: string;
 		canonicalProjectDisplayName: string;
+		canonicalProjectKind: "project" | "legacy_default_sharing";
 		deviceRef: string;
 		deviceDisplayName: string;
 		change: "add" | "remove";
 	}>;
 }
 
-interface LegacyTeamSetupDetailBaseV1 {
+interface LegacyTeamSetupViewBaseV1 {
 	version: 1;
 	candidate: LegacyTeamSetupCandidateSummaryV1;
 	attemptId: string;
-	draftState: "needs_setup" | "in_progress" | "stale" | "completed";
 	unresolvedDeviceCount: number;
 	unresolvedProjectCount: number;
 	devices: LegacyTeamSetupDeviceV1[];
@@ -1002,31 +1042,43 @@ interface LegacyTeamSetupDetailBaseV1 {
 	identityChoices: LegacyTeamSetupIdentityChoiceV1[];
 }
 
-export type LegacyTeamSetupDetailResponseV1 = LegacyTeamSetupDetailBaseV1 &
-	(
-		| {
-				canFinish: true;
-				conflictState: null;
-				finishDigest: string;
-				accessDeltaDigest: string;
-				viewerAccessDeltaDigest: string;
-				accessDelta: LegacyTeamSetupAccessDeltaV1;
-		  }
-		| {
-				canFinish: false;
-				conflictState: LegacyTeamSetupErrorCode | null;
-		  }
-	);
+export type LegacyTeamSetupViewV1 =
+	| (LegacyTeamSetupViewBaseV1 & {
+			state: "reviewing";
+			actions: {
+				refresh: { enabled: true; blockedReason: null };
+				finish: { enabled: false; blockedReason: "setup_incomplete" };
+			};
+	  })
+	| (LegacyTeamSetupViewBaseV1 & {
+			state: "ready_to_finish";
+			actions: {
+				refresh: { enabled: true; blockedReason: null };
+				finish: { enabled: true; blockedReason: null };
+			};
+			finishDigest: string;
+			accessDeltaDigest: string;
+			viewerAccessDeltaDigest: string;
+			accessDelta: LegacyTeamSetupAccessDeltaV1;
+	  })
+	| (LegacyTeamSetupViewBaseV1 & {
+			state: "unavailable";
+			unavailableReason: LegacyTeamSetupErrorCode;
+			actions: {
+				refresh: { enabled: true; blockedReason: null };
+				finish: { enabled: false; blockedReason: "setup_unavailable" };
+			};
+	  })
+	| (LegacyTeamSetupViewBaseV1 & {
+			state: "completed";
+			actions: {
+				refresh: { enabled: false; blockedReason: "setup_completed" };
+				finish: { enabled: false; blockedReason: "setup_completed" };
+			};
+	  });
 
-export interface LegacyTeamSetupMutationResponseV1 {
-	version: 1;
-	candidateRef: string;
-	attemptId: string;
-	draftState: "needs_setup" | "in_progress" | "stale" | "completed";
-	canFinish: boolean;
-	unresolvedDeviceCount: number;
-	unresolvedProjectCount: number;
-}
+export type LegacyTeamSetupDetailResponseV1 = LegacyTeamSetupViewV1;
+export type LegacyTeamSetupMutationResponseV1 = LegacyTeamSetupViewV1;
 
 export interface LegacyTeamSetupFinishResponseV1 {
 	version: 1;
@@ -1062,17 +1114,36 @@ const LEGACY_TEAM_SETUP_STATUSES = new Set<LegacyTeamSetupStatusV1>([
 	"stale",
 	"ready",
 ]);
-const LEGACY_TEAM_SETUP_DRAFT_STATES = new Set([
-	"needs_setup",
-	"in_progress",
-	"stale",
+const LEGACY_TEAM_SETUP_VIEW_STATES = new Set([
+	"reviewing",
+	"ready_to_finish",
+	"unavailable",
 	"completed",
+]);
+const LEGACY_TEAM_SETUP_ACTION_BLOCKED_REASONS = new Set<LegacyTeamSetupActionBlockedReasonV1>([
+	"setup_incomplete",
+	"setup_unavailable",
+	"setup_completed",
+	"device_inactive",
+	"device_active",
+	"assignment_evidence_inactive",
+	"assignment_required",
+	"assignment_unavailable",
+	"decision_unresolved",
+	"mapping_unavailable",
+	"automatic_mapping",
 ]);
 
 type JsonRecord = Record<string, unknown>;
 
 function isJsonRecord(value: unknown): value is JsonRecord {
 	return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function hasExactJsonKeys(value: JsonRecord, keys: readonly string[]): boolean {
+	const actual = Object.keys(value).sort();
+	const expected = [...keys].sort();
+	return actual.length === expected.length && actual.every((key, index) => key === expected[index]);
 }
 
 function isStringOrNull(value: unknown): value is string | null {
@@ -1107,7 +1178,11 @@ function isLegacyTeamSetupSummary(value: unknown): value is LegacyTeamSetupSumma
 	return (
 		isJsonRecord(value) &&
 		value.version === LEGACY_TEAM_SETUP_VERSION &&
-		isArrayOf(value.candidates, isLegacyTeamSetupCandidateSummary)
+		isArrayOf(
+			value.candidates,
+			(candidate): candidate is LegacyTeamSetupPendingCandidateSummaryV1 =>
+				isLegacyTeamSetupCandidateSummary(candidate) && candidate.status !== "ready",
+		)
 	);
 }
 
@@ -1123,6 +1198,36 @@ function isLegacyTeamSetupExpectation(
 	);
 }
 
+function isLegacyTeamSetupActionGate(value: unknown): value is LegacyTeamSetupActionGateV1 {
+	if (!isJsonRecord(value) || !hasExactJsonKeys(value, ["blockedReason", "enabled"])) return false;
+	if (value.enabled === true) return value.blockedReason === null;
+	return (
+		value.enabled === false &&
+		typeof value.blockedReason === "string" &&
+		LEGACY_TEAM_SETUP_ACTION_BLOCKED_REASONS.has(
+			value.blockedReason as LegacyTeamSetupActionBlockedReasonV1,
+		)
+	);
+}
+
+function isLegacyTeamSetupDeviceActions(
+	value: unknown,
+): value is LegacyTeamSetupDeviceV1["actions"] {
+	if (
+		!isJsonRecord(value) ||
+		!hasExactJsonKeys(value, ["assignIdentity", "clearDecision", "exclude", "include", "remove"])
+	) {
+		return false;
+	}
+	return (
+		isLegacyTeamSetupActionGate(value.assignIdentity) &&
+		isLegacyTeamSetupActionGate(value.include) &&
+		isLegacyTeamSetupActionGate(value.exclude) &&
+		isLegacyTeamSetupActionGate(value.remove) &&
+		isLegacyTeamSetupActionGate(value.clearDecision)
+	);
+}
+
 function isLegacyTeamSetupDevice(value: unknown): value is LegacyTeamSetupDeviceV1 {
 	if (!isJsonRecord(value)) return false;
 	return (
@@ -1135,7 +1240,8 @@ function isLegacyTeamSetupDevice(value: unknown): value is LegacyTeamSetupDevice
 		typeof value.decision === "string" &&
 		["unresolved", "included", "excluded", "removed"].includes(value.decision) &&
 		isStringOrNull(value.targetIdentityRef) &&
-		isLegacyTeamSetupExpectation(value.expectation)
+		isLegacyTeamSetupExpectation(value.expectation) &&
+		isLegacyTeamSetupDeviceActions(value.actions)
 	);
 }
 
@@ -1154,7 +1260,10 @@ function isLegacyTeamSetupProject(value: unknown): value is LegacyTeamSetupProje
 				isJsonRecord(item) &&
 				typeof item.resolvedProjectRef === "string" &&
 				typeof item.displayName === "string",
-		)
+		) &&
+		isJsonRecord(value.actions) &&
+		hasExactJsonKeys(value.actions, ["map"]) &&
+		isLegacyTeamSetupActionGate(value.actions.map)
 	);
 }
 
@@ -1191,8 +1300,10 @@ function isLegacyTeamSetupAccessDelta(value: unknown): value is LegacyTeamSetupA
 				isJsonRecord(item) &&
 				typeof item.projectRef === "string" &&
 				typeof item.projectDisplayName === "string" &&
+				isStringOrNull(item.fromCanonicalProjectRef) &&
 				isStringOrNull(item.fromResolvedProjectRef) &&
 				isStringOrNull(item.fromResolvedProjectDisplayName) &&
+				isStringOrNull(item.toCanonicalProjectRef) &&
 				isStringOrNull(item.toResolvedProjectRef) &&
 				isStringOrNull(item.toResolvedProjectDisplayName) &&
 				validChange(item.change),
@@ -1203,6 +1314,8 @@ function isLegacyTeamSetupAccessDelta(value: unknown): value is LegacyTeamSetupA
 				isJsonRecord(item) &&
 				typeof item.canonicalProjectRef === "string" &&
 				typeof item.canonicalProjectDisplayName === "string" &&
+				(item.canonicalProjectKind === "project" ||
+					item.canonicalProjectKind === "legacy_default_sharing") &&
 				item.recipientKind === "team" &&
 				typeof item.recipientRef === "string" &&
 				typeof item.recipientDisplayName === "string" &&
@@ -1214,6 +1327,8 @@ function isLegacyTeamSetupAccessDelta(value: unknown): value is LegacyTeamSetupA
 				isJsonRecord(item) &&
 				typeof item.canonicalProjectRef === "string" &&
 				typeof item.canonicalProjectDisplayName === "string" &&
+				(item.canonicalProjectKind === "project" ||
+					item.canonicalProjectKind === "legacy_default_sharing") &&
 				typeof item.deviceRef === "string" &&
 				typeof item.deviceDisplayName === "string" &&
 				typeof item.change === "string" &&
@@ -1222,18 +1337,43 @@ function isLegacyTeamSetupAccessDelta(value: unknown): value is LegacyTeamSetupA
 	);
 }
 
-function isLegacyTeamSetupDetail(value: unknown): value is LegacyTeamSetupDetailResponseV1 {
+function isLegacyTeamSetupViewActions(value: unknown): value is LegacyTeamSetupViewV1["actions"] {
+	return (
+		isJsonRecord(value) &&
+		hasExactJsonKeys(value, ["finish", "refresh"]) &&
+		isLegacyTeamSetupActionGate(value.refresh) &&
+		isLegacyTeamSetupActionGate(value.finish)
+	);
+}
+
+function hasDisabledItemActions(
+	devices: LegacyTeamSetupDeviceV1[],
+	projects: LegacyTeamSetupProjectV1[],
+	reason: "setup_unavailable" | "setup_completed",
+): boolean {
+	return (
+		devices.every((device) =>
+			Object.values(device.actions).every((gate) => !gate.enabled && gate.blockedReason === reason),
+		) &&
+		projects.every(
+			(project) => !project.actions.map.enabled && project.actions.map.blockedReason === reason,
+		)
+	);
+}
+
+export function isLegacyTeamSetupView(value: unknown): value is LegacyTeamSetupDetailResponseV1 {
 	if (!isJsonRecord(value)) return false;
 	const validBase =
 		value.version === LEGACY_TEAM_SETUP_VERSION &&
 		isLegacyTeamSetupCandidateSummary(value.candidate) &&
 		typeof value.attemptId === "string" &&
-		typeof value.draftState === "string" &&
-		LEGACY_TEAM_SETUP_DRAFT_STATES.has(value.draftState) &&
+		typeof value.state === "string" &&
+		LEGACY_TEAM_SETUP_VIEW_STATES.has(value.state) &&
 		isNonNegativeInteger(value.unresolvedDeviceCount) &&
 		isNonNegativeInteger(value.unresolvedProjectCount) &&
 		isArrayOf(value.devices, isLegacyTeamSetupDevice) &&
 		isArrayOf(value.projects, isLegacyTeamSetupProject) &&
+		isLegacyTeamSetupViewActions(value.actions) &&
 		isArrayOf(
 			value.identityChoices,
 			(item): item is LegacyTeamSetupIdentityChoiceV1 =>
@@ -1242,34 +1382,65 @@ function isLegacyTeamSetupDetail(value: unknown): value is LegacyTeamSetupDetail
 				typeof item.displayName === "string",
 		);
 	if (!validBase) return false;
-	if (value.canFinish === true) {
+	const actions = value.actions as LegacyTeamSetupViewV1["actions"];
+	const devices = value.devices as LegacyTeamSetupDeviceV1[];
+	const projects = value.projects as LegacyTeamSetupProjectV1[];
+	const baseKeys = [
+		"actions",
+		"attemptId",
+		"candidate",
+		"devices",
+		"identityChoices",
+		"projects",
+		"state",
+		"unresolvedDeviceCount",
+		"unresolvedProjectCount",
+		"version",
+	] as const;
+	if (value.state === "ready_to_finish") {
 		return (
-			value.conflictState === null &&
+			hasExactJsonKeys(value, [
+				...baseKeys,
+				"accessDelta",
+				"accessDeltaDigest",
+				"finishDigest",
+				"viewerAccessDeltaDigest",
+			]) &&
+			actions.refresh.enabled === true &&
+			actions.finish.enabled === true &&
 			typeof value.finishDigest === "string" &&
 			typeof value.accessDeltaDigest === "string" &&
 			typeof value.viewerAccessDeltaDigest === "string" &&
 			isLegacyTeamSetupAccessDelta(value.accessDelta)
 		);
 	}
+	if (value.state === "unavailable") {
+		return (
+			hasExactJsonKeys(value, [...baseKeys, "unavailableReason"]) &&
+			typeof value.unavailableReason === "string" &&
+			LEGACY_TEAM_SETUP_ERROR_CODES.has(value.unavailableReason as LegacyTeamSetupErrorCode) &&
+			actions.refresh.enabled === true &&
+			actions.finish.enabled === false &&
+			actions.finish.blockedReason === "setup_unavailable" &&
+			hasDisabledItemActions(devices, projects, "setup_unavailable")
+		);
+	}
+	if (value.state === "completed") {
+		return (
+			hasExactJsonKeys(value, baseKeys) &&
+			actions.refresh.enabled === false &&
+			actions.refresh.blockedReason === "setup_completed" &&
+			actions.finish.enabled === false &&
+			actions.finish.blockedReason === "setup_completed" &&
+			hasDisabledItemActions(devices, projects, "setup_completed")
+		);
+	}
 	return (
-		value.canFinish === false &&
-		(value.conflictState === null ||
-			(typeof value.conflictState === "string" &&
-				LEGACY_TEAM_SETUP_ERROR_CODES.has(value.conflictState as LegacyTeamSetupErrorCode)))
-	);
-}
-
-function isLegacyTeamSetupMutation(value: unknown): value is LegacyTeamSetupMutationResponseV1 {
-	return (
-		isJsonRecord(value) &&
-		value.version === LEGACY_TEAM_SETUP_VERSION &&
-		typeof value.candidateRef === "string" &&
-		typeof value.attemptId === "string" &&
-		typeof value.draftState === "string" &&
-		LEGACY_TEAM_SETUP_DRAFT_STATES.has(value.draftState) &&
-		typeof value.canFinish === "boolean" &&
-		isNonNegativeInteger(value.unresolvedDeviceCount) &&
-		isNonNegativeInteger(value.unresolvedProjectCount)
+		hasExactJsonKeys(value, baseKeys) &&
+		value.state === "reviewing" &&
+		actions.refresh.enabled === true &&
+		actions.finish.enabled === false &&
+		actions.finish.blockedReason === "setup_incomplete"
 	);
 }
 
@@ -1354,7 +1525,7 @@ export function loadLegacyTeamSetupSummary(): Promise<LegacyTeamSetupSummaryResp
 export function loadLegacyTeamSetupDetail(
 	candidateRef: string,
 ): Promise<LegacyTeamSetupDetailResponseV1> {
-	return legacyTeamSetupRequest(legacyTeamSetupPath(candidateRef), isLegacyTeamSetupDetail);
+	return legacyTeamSetupRequest(legacyTeamSetupPath(candidateRef), isLegacyTeamSetupView);
 }
 
 export function saveLegacyTeamSetupAssignment(
@@ -1368,7 +1539,7 @@ export function saveLegacyTeamSetupAssignment(
 ): Promise<LegacyTeamSetupMutationResponseV1> {
 	return legacyTeamSetupRequest(
 		`${legacyTeamSetupPath(candidateRef)}/devices/${encodeURIComponent(deviceRef)}/assignment`,
-		isLegacyTeamSetupMutation,
+		isLegacyTeamSetupView,
 		legacyTeamSetupJson("PUT", input),
 	);
 }
@@ -1382,7 +1553,7 @@ export function saveLegacyTeamSetupDecision(
 ): Promise<LegacyTeamSetupMutationResponseV1> {
 	return legacyTeamSetupRequest(
 		`${legacyTeamSetupPath(candidateRef)}/devices/${encodeURIComponent(deviceRef)}/decision`,
-		isLegacyTeamSetupMutation,
+		isLegacyTeamSetupView,
 		legacyTeamSetupJson("PUT", input),
 	);
 }
@@ -1394,7 +1565,7 @@ export function clearLegacyTeamSetupDecision(
 ): Promise<LegacyTeamSetupMutationResponseV1> {
 	return legacyTeamSetupRequest(
 		`${legacyTeamSetupPath(candidateRef)}/devices/${encodeURIComponent(deviceRef)}/decision`,
-		isLegacyTeamSetupMutation,
+		isLegacyTeamSetupView,
 		legacyTeamSetupJson("DELETE", input),
 	);
 }
@@ -1406,7 +1577,7 @@ export function saveLegacyTeamSetupProjectMapping(
 ): Promise<LegacyTeamSetupMutationResponseV1> {
 	return legacyTeamSetupRequest(
 		`${legacyTeamSetupPath(candidateRef)}/projects/${encodeURIComponent(projectRef)}/mapping`,
-		isLegacyTeamSetupMutation,
+		isLegacyTeamSetupView,
 		legacyTeamSetupJson("PUT", input),
 	);
 }
@@ -1416,7 +1587,7 @@ export function refreshLegacyTeamSetupCandidate(
 ): Promise<LegacyTeamSetupMutationResponseV1> {
 	return legacyTeamSetupRequest(
 		`${legacyTeamSetupPath(candidateRef)}/refresh`,
-		isLegacyTeamSetupMutation,
+		isLegacyTeamSetupView,
 		legacyTeamSetupJson("POST", {}),
 	);
 }

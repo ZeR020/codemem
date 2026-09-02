@@ -11,6 +11,35 @@ import {
 	legacyTeamCandidateProjectInventory,
 	refreshLegacyTeamCandidate,
 } from "./legacy-team-candidate.js";
+import { isFilesystemRootProjectIdentity } from "./legacy-team-project-policy.js";
+
+describe("filesystem-root Project identities", () => {
+	it.each([
+		"/",
+		"C:\\",
+		"D:/",
+		"//server/share",
+		"file:///",
+		"file:///C:/",
+		"file://server/share",
+		"file://server/share/",
+		"file:////server/share",
+	])("rejects %s", (identity) => {
+		expect(isFilesystemRootProjectIdentity(identity)).toBe(true);
+	});
+
+	it.each([
+		"/workspace/repo",
+		"C:\\workspace\\repo",
+		"//server/share/repo",
+		"file://server/share/repo",
+		"file:///C:/workspace/repo",
+		"codemem",
+	])("keeps %s", (identity) => {
+		expect(isFilesystemRootProjectIdentity(identity)).toBe(false);
+	});
+});
+
 import { latestLegacyTeamSetupAttempt } from "./legacy-team-setup-attempt.js";
 import { getLegacyTeamSetupDraft } from "./legacy-team-setup-draft.js";
 import {
@@ -115,6 +144,36 @@ describe("legacy Team candidate discovery", () => {
 		expect(db.prepare("SELECT COUNT(*) FROM legacy_team_setup_draft_projects").pluck().get()).toBe(
 			1,
 		);
+	});
+
+	it("keeps the synthetic shared fallback outside Team setup inventory", () => {
+		const sessionId = Number(
+			db
+				.prepare(
+					`INSERT INTO sessions(started_at, project, git_remote, git_branch)
+					 VALUES (?, 'legacy shared', NULL, NULL)`,
+				)
+				.run(NOW).lastInsertRowid,
+		);
+		db.prepare(
+			`INSERT INTO memory_items(
+				session_id, kind, title, body_text, active, created_at, updated_at,
+				visibility, workspace_id, project, scope_id
+			 ) VALUES (?, 'discovery', 'legacy shared', 'body', 1, ?, ?,
+				'shared', 'shared:default', 'legacy shared', 'scope-api')`,
+		).run(sessionId, NOW, NOW);
+
+		const [candidate] = discoverLegacyTeamCandidates(db, options());
+
+		expect(candidate?.projectCount).toBe(1);
+		expect(
+			db
+				.prepare(
+					"SELECT COUNT(*) FROM legacy_team_setup_draft_projects WHERE source_project_identity = 'shared:default'",
+				)
+				.pluck()
+				.get(),
+		).toBe(0);
 	});
 
 	it("rejects malformed discovery identities without hiding independent valid groups", () => {
@@ -440,19 +499,17 @@ describe("legacy Team candidate discovery", () => {
 		);
 	});
 
-	it("marks changed roster evidence stale until explicit refresh", () => {
+	it("replaces changed roster evidence during discovery", () => {
 		const [first] = discoverLegacyTeamCandidates(db, options());
 		const firstAttempt = latestLegacyTeamSetupAttempt(db, first?.candidateRef as string);
 		expect(firstAttempt).not.toBeNull();
 		if (!firstAttempt) throw new Error("initial refresh attempt missing");
-		const [stale] = discoverLegacyTeamCandidates(db, options("key-b"));
+		const [refreshedCandidate] = discoverLegacyTeamCandidates(db, options("key-b"));
 
-		expect(stale?.status).toBe("stale");
-		const refreshed = refreshLegacyTeamCandidate(
-			db,
-			options("key-b"),
-			first?.candidateRef as string,
-		);
+		expect(refreshedCandidate?.status).toBe("needs_setup");
+		const refreshed = getLegacyTeamSetupDraft(db, first?.candidateRef as string);
+		expect(refreshed).not.toBeNull();
+		if (!refreshed) throw new Error("replacement attempt missing");
 		expect(refreshed.state).toBe("needs_setup");
 		expect(latestLegacyTeamSetupAttempt(db, first?.candidateRef as string)?.attemptId).toBe(
 			refreshed.attemptId,
@@ -466,10 +523,29 @@ describe("legacy Team candidate discovery", () => {
 		).toBe(firstAttempt.attemptId);
 	});
 
+	it("replaces an activation-staled attempt during discovery", () => {
+		const [candidate] = discoverLegacyTeamCandidates(db, options());
+		const firstAttempt = latestLegacyTeamSetupAttempt(db, candidate?.candidateRef as string);
+		if (!firstAttempt) throw new Error("initial attempt missing");
+		db.prepare("UPDATE legacy_team_setup_drafts SET state = 'stale' WHERE attempt_id = ?").run(
+			firstAttempt.attemptId,
+		);
+
+		const [rediscovered] = discoverLegacyTeamCandidates(db, options());
+		const replacement = latestLegacyTeamSetupAttempt(db, candidate?.candidateRef as string);
+		const historical = db
+			.prepare("SELECT state, superseded_at FROM legacy_team_setup_drafts WHERE attempt_id = ?")
+			.get(firstAttempt.attemptId);
+
+		expect(rediscovered?.status).toBe("needs_setup");
+		expect(replacement?.attemptId).not.toBe(firstAttempt.attemptId);
+		expect(historical).toEqual({ state: "stale", superseded_at: NOW });
+	});
+
 	it.each([
-		["newly stale", false],
-		["already stale", true],
-	] as const)("re-sanitizes persisted labels for a %s attempt", (_label, staleFirst) => {
+		["first replacement", false],
+		["subsequent replacement", true],
+	] as const)("sanitizes labels for a %s", (_label, replaceFirst) => {
 		const initialOptions = options("key-a", "api");
 		const initialGroup = initialOptions.groups[0];
 		if (!initialGroup) throw new Error("invalid test fixture");
@@ -483,15 +559,15 @@ describe("legacy Team candidate discovery", () => {
 			projects: [{ displayName: "api" }],
 		});
 
-		if (staleFirst) {
-			const staleOptions = options("key-b", "api");
-			const staleGroup = staleOptions.groups[0];
-			if (!staleGroup) throw new Error("invalid test fixture");
-			staleGroup.displayName = "api";
-			expect(discoverLegacyTeamCandidates(db, staleOptions)[0]?.status).toBe("stale");
+		if (replaceFirst) {
+			const replacementOptions = options("key-b", "api");
+			const replacementGroup = replacementOptions.groups[0];
+			if (!replacementGroup) throw new Error("invalid test fixture");
+			replacementGroup.displayName = "api";
+			expect(discoverLegacyTeamCandidates(db, replacementOptions)[0]?.status).toBe("needs_setup");
 		}
 
-		const changedOptions = options(staleFirst ? "key-b" : "key-a", "api");
+		const changedOptions = options(replaceFirst ? "key-b" : "key-a", "api");
 		const changedGroup = changedOptions.groups[0];
 		if (!changedGroup) throw new Error("invalid test fixture");
 		changedGroup.displayName = "api";
@@ -502,38 +578,39 @@ describe("legacy Team candidate discovery", () => {
 		db.prepare("DELETE FROM sessions").run();
 		db.prepare("DELETE FROM project_scope_mappings").run();
 
-		const [stale] = discoverLegacyTeamCandidates(db, changedOptions);
-		const staleDraft = getLegacyTeamSetupDraft(db, initial?.candidateRef as string);
+		const [replacement] = discoverLegacyTeamCandidates(db, changedOptions);
+		const replacementDraft = getLegacyTeamSetupDraft(db, initial?.candidateRef as string);
 
-		expect(stale).toMatchObject({ displayName: "Legacy Team", status: "stale" });
-		expect(staleDraft).toMatchObject({
-			attemptId,
-			state: "stale",
+		expect(replacement).toMatchObject({ displayName: "Legacy Team", status: "needs_setup" });
+		expect(replacementDraft).toMatchObject({
+			state: "needs_setup",
 			displayName: "Legacy Team",
-			devices: [{ displayName: "Device" }],
-			projects: [{ displayName: "Project" }],
+			projects: [],
 		});
-		expect(latestLegacyTeamSetupAttempt(db, stale?.candidateRef as string)?.attemptId).toBe(
-			attemptId,
-		);
+		expect(replacementDraft?.devices.map((device) => device.displayName)).toEqual([
+			"New Device",
+			"Removed device",
+		]);
+		expect(replacementDraft?.attemptId).not.toBe(attemptId);
 	});
 
-	it("keeps a stale attempt blocked if roster evidence reverts", () => {
+	it("creates a fresh attempt if roster evidence reverts", () => {
 		const [first] = discoverLegacyTeamCandidates(db, options());
 		const firstAttempt = latestLegacyTeamSetupAttempt(db, first?.candidateRef as string);
 		expect(firstAttempt).not.toBeNull();
 		if (!firstAttempt) throw new Error("initial stale-reversion attempt missing");
 		discoverLegacyTeamCandidates(db, options("key-b"));
+		const changedAttempt = latestLegacyTeamSetupAttempt(db, first?.candidateRef as string);
 
 		const [reverted] = discoverLegacyTeamCandidates(db, options("key-a"));
 
-		expect(reverted?.status).toBe("stale");
-		expect(latestLegacyTeamSetupAttempt(db, reverted?.candidateRef as string)?.attemptId).toBe(
-			firstAttempt.attemptId,
-		);
+		expect(reverted?.status).toBe("needs_setup");
+		const revertedAttempt = latestLegacyTeamSetupAttempt(db, reverted?.candidateRef as string);
+		expect(revertedAttempt?.attemptId).not.toBe(firstAttempt.attemptId);
+		expect(revertedAttempt?.attemptId).not.toBe(changedAttempt?.attemptId);
 	});
 
-	it("derives ready only from a current completed draft and compatible canonical Team", () => {
+	it("reconciles a missing setup-owned Project edge for a compatible completion", () => {
 		const [initial] = discoverLegacyTeamCandidates(db, options());
 		const draft = db
 			.prepare(
@@ -545,13 +622,14 @@ describe("legacy Team candidate discovery", () => {
 			candidate_id: string;
 			roster_fingerprint: string;
 		};
+		const completedTeamId = deterministicPolicyTeamId(draft.candidate_id);
 		db.prepare(
 			`INSERT INTO policy_teams(
 				team_id, display_name, status, device_eligibility_mode, provenance,
 				revision, migration_state, source_fingerprint, idempotency_key, created_at, updated_at
 			 ) VALUES (?, 'Engineering', 'active', 'reviewed_allowlist', 'reviewed_team_candidate',
 				'revision-1', 'completed', ?, 'team-setup-test', ?, ?)`,
-		).run(deterministicPolicyTeamId(draft.candidate_id), draft.roster_fingerprint, NOW, NOW);
+		).run(completedTeamId, draft.roster_fingerprint, NOW, NOW);
 
 		expect(discoverLegacyTeamCandidates(db, options())[0]?.status).toBe("needs_setup");
 
@@ -561,19 +639,111 @@ describe("legacy Team candidate discovery", () => {
 				policy_revision, migration_state, idempotency_key, created_at, updated_at
 			 ) VALUES (?, 'team', ?, 'active', 'reviewed_team_setup', 'revision-1', 'completed',
 				'ready-edge', ?, ?)`,
-		).run(PROJECT_ID, deterministicPolicyTeamId(draft.candidate_id), NOW, NOW);
+		).run(PROJECT_ID, completedTeamId, NOW, NOW);
 		db.prepare(
 			`UPDATE legacy_team_setup_drafts
 			 SET state = 'completed', completed_team_id = ?, completed_at = ?, updated_at = ?
 			 WHERE attempt_id = ?`,
-		).run(deterministicPolicyTeamId(draft.candidate_id), NOW, NOW, draft.attempt_id);
+		).run(completedTeamId, NOW, NOW, draft.attempt_id);
 
 		expect(discoverLegacyTeamCandidates(db, options())[0]?.status).toBe("ready");
+		db.prepare(
+			`INSERT INTO policy_teams(
+			 team_id, display_name, status, device_eligibility_mode, provenance,
+			 revision, migration_state, idempotency_key, created_at, updated_at
+			 ) VALUES ('team-independent', 'Independent', 'active', 'reviewed_allowlist', 'user',
+			 'independent-r1', 'user_managed', 'independent-team', ?, ?)`,
+		).run(NOW, NOW);
+		db.prepare(
+			`INSERT INTO project_recipients(
+			 canonical_project_identity, recipient_kind, recipient_id, status, provenance,
+			 policy_revision, migration_state, idempotency_key, created_at, updated_at
+			 ) VALUES (?, 'team', 'team-independent', 'active', 'review_resolution',
+			 'independent-r1', 'user_managed', 'independent-edge', ?, ?)`,
+		).run(PROJECT_ID, NOW, NOW);
+		const independentEdge = db
+			.prepare("SELECT * FROM project_recipients WHERE recipient_id = 'team-independent'")
+			.get();
 
-		// Removing a completion-bound canonical row must drop Ready even though
-		// the Team header and legacy inventory are unchanged.
-		db.prepare("UPDATE project_recipients SET status = 'revoked'").run();
-		expect(discoverLegacyTeamCandidates(db, options())[0]?.status).toBe("needs_setup");
+		// Older completions may predate Project edge materialization. A setup-owned
+		// missing edge is restored once, without reopening an otherwise compatible Team.
+		db.prepare("DELETE FROM project_recipients WHERE recipient_id = ?").run(completedTeamId);
+		const supersedingAttemptId = "legacy-team-attempt:00000000-0000-4000-8000-000000000099";
+		db.prepare(
+			`INSERT INTO legacy_team_setup_drafts(
+			 attempt_id, candidate_id, coordinator_id, group_id, state, display_name,
+			 roster_fingerprint, projection_fingerprint, created_at, updated_at
+			 ) SELECT ?, candidate_id, coordinator_id, group_id, 'needs_setup', display_name,
+			 'superseding-roster', 'superseding-projection', ?, ?
+			 FROM legacy_team_setup_drafts WHERE attempt_id = ?`,
+		).run(supersedingAttemptId, NOW, NOW, draft.attempt_id);
+		const firstReconciliation = options();
+		firstReconciliation.now = "2026-08-21T12:01:00.000Z";
+		expect(discoverLegacyTeamCandidates(db, firstReconciliation)[0]?.status).toBe("ready");
+		expect(
+			db
+				.prepare("SELECT COUNT(*) FROM legacy_team_setup_drafts WHERE candidate_id = ?")
+				.pluck()
+				.get(draft.candidate_id),
+		).toBe(2);
+		expect(
+			db
+				.prepare(
+					"SELECT state, completed_team_id FROM legacy_team_setup_drafts WHERE attempt_id = ?",
+				)
+				.get(supersedingAttemptId),
+		).toEqual({ state: "needs_setup", completed_team_id: null });
+		expect(
+			db
+				.prepare(
+					`SELECT status, provenance, updated_at FROM project_recipients
+					 WHERE canonical_project_identity = ? AND recipient_kind = 'team' AND recipient_id = ?`,
+				)
+				.get(PROJECT_ID, completedTeamId),
+		).toEqual({
+			status: "active",
+			provenance: "reviewed_team_setup",
+			updated_at: firstReconciliation.now,
+		});
+		expect(
+			db.prepare("SELECT * FROM project_recipients WHERE recipient_id = 'team-independent'").get(),
+		).toEqual(independentEdge);
+
+		const replay = options();
+		replay.now = "2026-08-21T12:02:00.000Z";
+		expect(discoverLegacyTeamCandidates(db, replay)[0]?.status).toBe("ready");
+		expect(
+			db
+				.prepare(
+					`SELECT updated_at FROM project_recipients
+					 WHERE canonical_project_identity = ? AND recipient_id = ?`,
+				)
+				.pluck()
+				.get(PROJECT_ID, completedTeamId),
+		).toBe(firstReconciliation.now);
+
+		db.prepare(
+			`UPDATE project_recipients
+			 SET status = 'revoked', provenance = 'review_resolution', policy_revision = 'user-r1',
+			     migration_state = 'user_managed', source_fingerprint = 'user-source',
+			     idempotency_key = 'user-edge', updated_at = '2026-08-21T12:03:00.000Z'
+			 WHERE canonical_project_identity = ? AND recipient_id = ?`,
+		).run(PROJECT_ID, completedTeamId);
+		const userOwnedEdge = db
+			.prepare(
+				"SELECT * FROM project_recipients WHERE canonical_project_identity = ? AND recipient_id = ?",
+			)
+			.get(PROJECT_ID, completedTeamId);
+		const unsafeReconciliation = options();
+		unsafeReconciliation.now = "2026-08-21T12:04:00.000Z";
+		expect(discoverLegacyTeamCandidates(db, unsafeReconciliation)[0]?.status).toBe("needs_setup");
+		expect(
+			db
+				.prepare(
+					"SELECT * FROM project_recipients WHERE canonical_project_identity = ? AND recipient_id = ?",
+				)
+				.get(PROJECT_ID, completedTeamId),
+		).toEqual(userOwnedEdge);
 	});
 
 	it("stays Ready after an explicit Project resolution is materialized", () => {
@@ -649,7 +819,8 @@ describe("legacy Team candidate discovery", () => {
 		});
 		expect(latestLegacyTeamSetupAttempt(db, draft.candidate_id)?.attemptId).toBe(draft.attempt_id);
 
-		// A genuinely new Project still reopens setup for review.
+		// A genuinely new Project drops the legacy Ready diagnostic without
+		// superseding the terminal completion.
 		const newSession = Number(
 			db.prepare(`INSERT INTO sessions(started_at, project) VALUES (?, 'brand-new')`).run(NOW)
 				.lastInsertRowid,
@@ -712,6 +883,34 @@ describe("legacy Team candidate discovery", () => {
 		expect(discoverLegacyTeamCandidates(db, options())[0]?.status).toBe("needs_setup");
 	});
 
+	it("drops Ready when the selected mapping moves to another active scope in the group", () => {
+		completeCandidate();
+		expect(discoverLegacyTeamCandidates(db, options())[0]?.status).toBe("ready");
+		db.prepare(
+			`INSERT INTO replication_scopes(
+				scope_id, label, kind, authority_type, coordinator_id, group_id,
+				membership_epoch, status, created_at, updated_at
+			 ) VALUES ('scope-api-second', 'Engineering Second', 'managed_project', 'coordinator',
+			 'coordinator-private', 'group-private', 1, 'active', ?, ?)`,
+		).run(NOW, NOW);
+
+		// Group membership alone is insufficient: completion reviewed scope-api.
+		db.prepare("UPDATE project_scope_mappings SET scope_id = 'scope-api-second'").run();
+
+		expect(discoverLegacyTeamCandidates(db, options())[0]?.status).toBe("needs_setup");
+	});
+
+	it("keeps Ready for a higher-priority exact mapping to the reviewed scope", () => {
+		completeCandidate();
+		db.prepare(
+			`INSERT INTO project_scope_mappings(
+				workspace_identity, project_pattern, scope_id, priority, source, created_at, updated_at
+			 ) VALUES (?, 'older-exact-pattern', 'scope-api', 9000, 'test', ?, ?)`,
+		).run(PROJECT_ID, NOW, NOW);
+
+		expect(discoverLegacyTeamCandidates(db, options())[0]?.status).toBe("ready");
+	});
+
 	it("drops Ready for malformed inactive membership identities", () => {
 		const { teamId } = completeCandidate();
 		expect(discoverLegacyTeamCandidates(db, options())[0]?.status).toBe("ready");
@@ -756,44 +955,77 @@ describe("legacy Team candidate discovery", () => {
 		expect(discoverLegacyTeamCandidates(db, options())[0]?.status).toBe("needs_setup");
 	});
 
-	it("keeps Ready when merged resolutions share one selected mapping", () => {
-		const { attemptId, candidateId } = completeCandidate();
+	it("keeps a completed Team selectable when merged resolutions share one mapping", () => {
+		const { teamId, attemptId, candidateId } = completeCandidate();
 		expect(discoverLegacyTeamCandidates(db, options())[0]?.status).toBe("ready");
+		// Exercise the full compatibility path used by completions created before
+		// terminal migration provenance was introduced.
+		db.prepare(
+			"UPDATE policy_teams SET provenance = 'legacy_team_candidate' WHERE team_id = ?",
+		).run(teamId);
+		db.prepare(
+			`INSERT INTO replication_scopes(
+				scope_id, label, kind, authority_type, coordinator_id, group_id,
+				membership_epoch, status, created_at, updated_at
+			 ) VALUES ('scope-api-second', 'Engineering Second', 'managed_project', 'coordinator',
+			 'coordinator-private', 'group-private', 1, 'active', ?, ?)`,
+		).run(NOW, NOW);
 
 		// A second confirmed source resolved to the same canonical identity:
 		// selection can pick only one mapping, so Ready must accept the
-		// authoritative pattern matching ANY confirmed source.
+		// authoritative pattern with that source's own confirmed target scope.
 		db.prepare(
 			`INSERT INTO legacy_team_setup_draft_projects(
 				attempt_id, project_ref, source_project_identity, display_name,
-				source_fingerprint, resolution_kind, resolved_project_identity, updated_at
+				source_fingerprint, resolution_kind, resolved_project_identity, target_scope_id, updated_at
 			 ) VALUES (?, 'project-ref-mirror', 'unmapped:mirror', 'Mirror', 'source-mirror',
-				'explicit', ?, ?)`,
+			 'explicit', ?, 'scope-api', ?)`,
 		).run(attemptId, PROJECT_ID, NOW);
 		db.prepare(
 			`INSERT INTO project_scope_mappings(
 				workspace_identity, project_pattern, scope_id, priority, source, created_at, updated_at
 			 ) VALUES (?, 'unmapped:mirror', 'scope-api', 1000, 'reviewed_team_setup', ?, ?)`,
 		).run(PROJECT_ID, NOW, NOW);
-		const prepareSpy = vi.spyOn(db, "prepare");
-		try {
-			expect(isLegacyTeamCandidateSelectable(db, candidateId)).toBe(true);
-			expect(
-				prepareSpy.mock.calls.filter(([sql]) => /FROM actors ORDER BY actor_id/.test(String(sql))),
-			).toHaveLength(1);
-			expect(
-				prepareSpy.mock.calls.filter(([sql]) =>
-					/SELECT 1 FROM project_recipients\s+WHERE canonical_project_identity/u.test(String(sql)),
-				),
-			).toHaveLength(1);
-			expect(
-				prepareSpy.mock.calls.filter(([sql]) =>
-					/FROM project_scope_mappings\s+ORDER BY priority DESC/u.test(String(sql)),
-				),
-			).toHaveLength(1);
-		} finally {
-			prepareSpy.mockRestore();
-		}
+		expect(isLegacyTeamCandidateSelectable(db, candidateId)).toBe(true);
+
+		// The other merged source targets scope-api-second, but that cannot
+		// authorize moving the selected primary source away from scope-api.
+		db.prepare("UPDATE project_scope_mappings SET scope_id = 'scope-api-second'").run();
+		expect(isLegacyTeamCandidateSelectable(db, candidateId)).toBe(false);
+	});
+
+	it("rejects a legacy null-scope completion redirected to local authority", () => {
+		const { teamId, attemptId, candidateId } = completeCandidate();
+		// Exercise the compatibility gate for completions created before terminal
+		// provenance markers, rather than the canonical completion fast path.
+		db.prepare(
+			"UPDATE policy_teams SET provenance = 'legacy_team_candidate' WHERE team_id = ?",
+		).run(teamId);
+		db.prepare(
+			"UPDATE legacy_team_setup_draft_projects SET target_scope_id = NULL WHERE attempt_id = ?",
+		).run(attemptId);
+		db.prepare(
+			`INSERT INTO replication_scopes(
+				scope_id, label, kind, authority_type, coordinator_id, group_id,
+				membership_epoch, status, created_at, updated_at
+			 ) VALUES ('scope-local-rogue', 'Local Rogue', 'team', 'local',
+			 'coordinator-private', 'group-private', 1, 'active', ?, ?)`,
+		).run(NOW, NOW);
+		db.prepare("UPDATE project_scope_mappings SET scope_id = 'scope-local-rogue'").run();
+
+		expect(isLegacyTeamCandidateSelectable(db, candidateId)).toBe(false);
+	});
+
+	it("recovers a legacy null-scope completion from its reviewed coordinator mapping", () => {
+		const { teamId, attemptId, candidateId } = completeCandidate();
+		db.prepare(
+			"UPDATE policy_teams SET provenance = 'legacy_team_candidate' WHERE team_id = ?",
+		).run(teamId);
+		db.prepare(
+			"UPDATE legacy_team_setup_draft_projects SET target_scope_id = NULL WHERE attempt_id = ?",
+		).run(attemptId);
+
+		expect(isLegacyTeamCandidateSelectable(db, candidateId)).toBe(true);
 	});
 
 	it("loads the current selectable draft in one authoritative query", () => {
@@ -808,14 +1040,16 @@ describe("legacy Team candidate discovery", () => {
 						sql.includes("FROM legacy_team_setup_drafts") && sql.includes("completed_team_id"),
 				);
 			expect(authorityReads).toHaveLength(1);
-			expect(authorityReads[0]).toMatch(/WHERE candidate_id = \?\s+ORDER BY rowid DESC LIMIT 1/u);
+			expect(authorityReads[0]).toMatch(
+				/WHERE draft\.candidate_id = \?.*ORDER BY draft\.rowid DESC LIMIT 1/su,
+			);
 			expect(authorityReads[0]).not.toMatch(/WHERE attempt_id = \?/u);
 		} finally {
 			prepare.mockRestore();
 		}
 	});
 
-	it("bounds active assignment statement preparation across completion-bound devices", () => {
+	it("does not revalidate completion-bound devices after migration", () => {
 		const { teamId, attemptId, candidateId } = completeCandidate();
 		const insertActor = db.prepare(
 			`INSERT INTO actors(actor_id, display_name, is_local, status, created_at, updated_at)
@@ -878,7 +1112,7 @@ describe("legacy Team candidate discovery", () => {
 						String(sql),
 					),
 				),
-			).toHaveLength(1);
+			).toHaveLength(0);
 		} finally {
 			prepare.mockRestore();
 		}
@@ -1027,8 +1261,8 @@ describe("legacy Team candidate discovery", () => {
 		expect(discoverLegacyTeamCandidates(db, options())[0]?.projectCount).toBe(3);
 	});
 
-	it("blocks selection when current evidence drifted from the completion", () => {
-		completeCandidate();
+	it("keeps a completed Team selectable when current evidence drifts", () => {
+		const completion = completeCandidate();
 		const [candidate] = discoverLegacyTeamCandidates(db, options());
 		expect(candidate?.status).toBe("ready");
 		const candidateId = candidate?.candidateRef as string;
@@ -1040,18 +1274,149 @@ describe("legacy Team candidate discovery", () => {
 			true,
 		);
 
-		// Roster drift the next discovery would reopen setup for must also
-		// block selection when the caller holds a current snapshot.
+		// Roster and Project drift belong to normal Team management after the
+		// one-time migration completes; they must not revoke that completion.
 		expect(
 			isLegacyTeamCandidateSelectable(db, candidateId, {
 				rosterFingerprint: "drifted-roster",
 				projects: liveInventory,
 			}),
-		).toBe(false);
+		).toBe(true);
 
-		// Inventory drift — a reviewed Project vanished or a new one appeared —
-		// blocks selection the same way.
-		expect(isLegacyTeamCandidateSelectable(db, candidateId, { projects: [] })).toBe(false);
+		expect(isLegacyTeamCandidateSelectable(db, candidateId, { projects: [] })).toBe(true);
+
+		const driftedRoster = options("key-b");
+		expect(discoverLegacyTeamCandidates(db, driftedRoster)[0]?.status).toBe("needs_setup");
+		expect(latestLegacyTeamSetupAttempt(db, candidateId)?.attemptId).toBe(completion.attemptId);
+		expect(getLegacyTeamSetupDraft(db, candidateId)?.state).toBe("completed");
+		expect(isLegacyTeamCandidateSelectable(db, candidateId)).toBe(true);
+	});
+
+	it("validates normalized current Project evidence for pre-marker completions", () => {
+		const completion = completeCandidate();
+		db.prepare(
+			"UPDATE policy_teams SET provenance = 'legacy_team_candidate' WHERE team_id = ?",
+		).run(completion.teamId);
+		const liveInventory = legacyTeamCandidateProjectInventory(
+			db,
+			options().projection,
+			completion.candidateId,
+		);
+		db.prepare("UPDATE project_scope_mappings SET workspace_identity = ?").run(`${PROJECT_ID}/`);
+
+		expect(
+			isLegacyTeamCandidateSelectable(db, completion.candidateId, {
+				projects: liveInventory.map((project) => ({
+					...project,
+					sourceProjectIdentity: `${project.sourceProjectIdentity}/`,
+				})),
+			}),
+		).toBe(true);
+		expect(isLegacyTeamCandidateSelectable(db, completion.candidateId, { projects: [] })).toBe(
+			false,
+		);
+	});
+
+	it("keeps pre-marker completions selectable after root Projects are retired", () => {
+		const completion = completeCandidate();
+		db.prepare(
+			"UPDATE policy_teams SET provenance = 'legacy_team_candidate' WHERE team_id = ?",
+		).run(completion.teamId);
+		db.prepare(
+			`UPDATE legacy_team_setup_draft_projects
+			 SET source_project_identity = '/', resolved_project_identity = '/'
+			 WHERE attempt_id = ?`,
+		).run(completion.attemptId);
+		db.prepare("DELETE FROM memory_items").run();
+		db.prepare("DELETE FROM sessions").run();
+		db.prepare("DELETE FROM project_scope_mappings").run();
+
+		expect(isLegacyTeamCandidateSelectable(db, completion.candidateId, { projects: [] })).toBe(
+			true,
+		);
+	});
+
+	it.each([
+		"/",
+		null,
+	])("reconciles non-root edges without restoring a retired root resolved as %s", (rootResolution) => {
+		const completion = completeCandidate();
+		db.prepare(
+			"UPDATE policy_teams SET provenance = 'legacy_team_candidate' WHERE team_id = ?",
+		).run(completion.teamId);
+		db.prepare(
+			`INSERT INTO legacy_team_setup_draft_projects(
+				 attempt_id, project_ref, source_project_identity, display_name,
+				 source_fingerprint, resolution_kind, resolved_project_identity,
+				 target_scope_id, updated_at
+				 ) VALUES (?, '000-root', '/', 'Filesystem root', 'root-source',
+				 'explicit', ?, 'scope-api', ?)`,
+		).run(completion.attemptId, rootResolution, NOW);
+		db.prepare(
+			"DELETE FROM project_recipients WHERE canonical_project_identity = ? AND recipient_id = ?",
+		).run(PROJECT_ID, completion.teamId);
+
+		expect(discoverLegacyTeamCandidates(db, options())[0]?.status).toBe("ready");
+		expect(
+			db
+				.prepare(
+					`SELECT COUNT(*) FROM project_recipients
+						 WHERE canonical_project_identity = ? AND recipient_id = ? AND status = 'active'`,
+				)
+				.pluck()
+				.get(PROJECT_ID, completion.teamId),
+		).toBe(1);
+		expect(
+			db
+				.prepare(
+					`SELECT COUNT(*) FROM project_recipients
+						 WHERE canonical_project_identity = '/' AND recipient_id = ?`,
+				)
+				.pluck()
+				.get(completion.teamId),
+		).toBe(0);
+	});
+
+	it("keeps validating a retired root source resolved to a non-root Project", () => {
+		const completion = completeCandidate();
+		db.prepare(
+			"UPDATE policy_teams SET provenance = 'legacy_team_candidate' WHERE team_id = ?",
+		).run(completion.teamId);
+		db.prepare(
+			`UPDATE legacy_team_setup_draft_projects
+			 SET source_project_identity = '/'
+			 WHERE attempt_id = ?`,
+		).run(completion.attemptId);
+		db.prepare(
+			"DELETE FROM project_recipients WHERE canonical_project_identity = ? AND recipient_id = ?",
+		).run(PROJECT_ID, completion.teamId);
+
+		expect(discoverLegacyTeamCandidates(db, options())[0]?.status).toBe("ready");
+		expect(
+			db
+				.prepare(
+					`SELECT COUNT(*) FROM project_recipients
+					 WHERE canonical_project_identity = ? AND recipient_id = ? AND status = 'active'`,
+				)
+				.pluck()
+				.get(PROJECT_ID, completion.teamId),
+		).toBe(1);
+	});
+
+	it("reopens an incompatible completion that predates terminal migration markers", () => {
+		const completion = completeCandidate();
+		db.prepare(
+			`UPDATE policy_teams
+			 SET provenance = 'legacy_team_candidate', source_fingerprint = 'drifted-roster'
+			 WHERE team_id = ?`,
+		).run(completion.teamId);
+
+		expect(isLegacyTeamCandidateSelectable(db, completion.candidateId)).toBe(false);
+		expect(discoverLegacyTeamCandidates(db, options())[0]?.status).toBe("needs_setup");
+		expect(latestLegacyTeamSetupAttempt(db, completion.candidateId)?.attemptId).not.toBe(
+			completion.attemptId,
+		);
+		expect(getLegacyTeamSetupDraft(db, completion.candidateId)?.state).toBe("needs_setup");
 	});
 
 	it("rejects rosters with conflicting duplicate device rows", () => {
@@ -1236,39 +1601,44 @@ describe("legacy Team candidate discovery", () => {
 				existing_memory_count, ordinal
 			 ) VALUES ('op-invite', ?, 'Invite Only', 'git_remote', 1, 0)`,
 		).run(inviteProject);
-
-		const [candidate] = discoverLegacyTeamCandidates(db, options());
-
-		// The invite-only Project has no relevant replication scope, but its
-		// group resolves to the configured coordinator, so it belongs to the
-		// candidate's inventory instead of being dropped by a fallback ID.
-		expect(candidate?.projectCount).toBe(2);
-		expect(
-			db
-				.prepare(
-					`SELECT COUNT(*) FROM legacy_team_setup_draft_projects
-					 WHERE source_project_identity = ?`,
-				)
-				.pluck()
-				.get(inviteProject),
-		).toBe(1);
-
-		// A local-authority scope that carries the group ID and a bogus
-		// coordinator is not coordinator evidence: it must neither hijack the
-		// association nor suppress the legitimate global coordinator match.
+		// A local-authority scope carrying the same coordinator and group IDs is
+		// not coordinator evidence: it must neither hijack the association nor
+		// suppress the legitimate coordinator fallback.
 		db.prepare(
 			`INSERT INTO replication_scopes(
 				scope_id, label, kind, authority_type, coordinator_id, group_id,
 				membership_epoch, status, created_at, updated_at
 			 ) VALUES ('scope-local-rogue', 'Local Rogue', 'team', 'local',
-				'coordinator-rogue', 'group-private', 1, 'active', ?, ?)`,
+			 'coordinator-private', 'group-private', 1, 'active', ?, ?)`,
 		).run(NOW, NOW);
+		const [candidate] = discoverLegacyTeamCandidates(db, options());
+
+		// The invite-only Project has no relevant replication scope, but its
+		// group resolves to the configured coordinator, so it belongs to the
+		// candidate's inventory and inherits the sole active group scope.
+		expect(candidate).toMatchObject({ projectCount: 2, unresolvedProjectCount: 0 });
+		expect(
+			db
+				.prepare(
+					`SELECT resolution_kind, resolved_project_identity, target_scope_id
+					 FROM legacy_team_setup_draft_projects
+					 WHERE source_project_identity = ?`,
+				)
+				.get(inviteProject),
+		).toEqual({
+			resolution_kind: "deterministic",
+			resolved_project_identity: inviteProject,
+			target_scope_id: "scope-api",
+		});
+		expect(discoverLegacyTeamCandidates(db, options())[0]).toMatchObject({
+			status: "needs_setup",
+			projectCount: 2,
+			unresolvedProjectCount: 0,
+		});
 		db.prepare(
-			`INSERT INTO project_scope_mappings(
-				workspace_identity, project_pattern, scope_id, priority, source, created_at, updated_at
-			 ) VALUES (?, ?, 'scope-local-rogue', 500, 'test', ?, ?)`,
-		).run(inviteProject, inviteProject, NOW, NOW);
-		expect(discoverLegacyTeamCandidates(db, options())[0]?.projectCount).toBe(2);
+			"UPDATE legacy_team_setup_draft_devices SET decision = 'excluded' WHERE attempt_id = ?",
+		).run(latestLegacyTeamSetupAttempt(db, candidate?.candidateRef as string)?.attemptId);
+		expect(getLegacyTeamSetupDraft(db, candidate?.candidateRef as string)?.canFinish).toBe(true);
 
 		// A second coordinator sharing the group ID makes the association
 		// ambiguous, so the invite-only Project must drop out again.
@@ -1378,7 +1748,7 @@ describe("legacy Team candidate discovery", () => {
 		expect(discoverLegacyTeamCandidates(db, options())[0]?.status).toBe("ready");
 	});
 
-	it("keeps the active Team name when stale coordinator evidence creates a replacement draft", () => {
+	it("keeps the active Team name and completion when coordinator evidence changes", () => {
 		const [initial] = discoverLegacyTeamCandidates(db, options());
 		const draft = db
 			.prepare(
@@ -1406,8 +1776,29 @@ describe("legacy Team candidate discovery", () => {
 
 		const refreshed = refreshLegacyTeamCandidate(db, options("changed-key"), draft.candidate_id);
 
-		expect(refreshed.attemptId).not.toBe(draft.attempt_id);
+		expect(refreshed.attemptId).toBe(draft.attempt_id);
+		expect(refreshed.state).toBe("completed");
 		expect(refreshed.displayName).toBe("Renamed Engineering");
+	});
+
+	it("keeps the last reviewed Team name when coordinator labels temporarily fall back", () => {
+		const namedOptions = options();
+		const namedGroup = namedOptions.groups[0];
+		if (!namedGroup) throw new Error("group fixture missing");
+		namedGroup.displayName = "Nerdworld";
+		const [initial] = discoverLegacyTeamCandidates(db, namedOptions);
+		expect(initial?.displayName).toBe("Nerdworld");
+
+		const fallbackOptions = options("changed-key");
+		const fallbackGroup = fallbackOptions.groups[0];
+		if (!fallbackGroup) throw new Error("group fixture missing");
+		fallbackGroup.displayName = "Legacy Team";
+		const [refreshed] = discoverLegacyTeamCandidates(db, fallbackOptions);
+
+		expect(refreshed?.displayName).toBe("Nerdworld");
+		expect(getLegacyTeamSetupDraft(db, refreshed?.candidateRef as string)?.displayName).toBe(
+			"Nerdworld",
+		);
 	});
 
 	it("serializes a competing refresh before reading candidate authority", () => {
@@ -1476,7 +1867,7 @@ describe("legacy Team candidate discovery", () => {
 		}
 	});
 
-	it("keeps Ready when a group exposes multiple scopes and mappings use their own", () => {
+	it("requires setup when Project evidence spans multiple group scopes", () => {
 		db.prepare(
 			`INSERT INTO replication_scopes(
 				scope_id, label, kind, authority_type, coordinator_id, group_id,
@@ -1486,7 +1877,7 @@ describe("legacy Team candidate discovery", () => {
 		).run(NOW, NOW);
 		// The confirmed mapping targets the second scope of the same group.
 		db.prepare("UPDATE project_scope_mappings SET scope_id = 'scope-api-second'").run();
-		runExcludedCompletionScenario(() => undefined, "ready");
+		expect(discoverLegacyTeamCandidates(db, options())[0]?.status).toBe("needs_setup");
 	});
 
 	it("keeps Ready when an invite-owned decision is preserved outside the draft", () => {
@@ -1545,7 +1936,7 @@ describe("legacy Team candidate discovery", () => {
 
 	function runExcludedCompletionScenario(
 		mutate: (db2: InstanceType<typeof Database>, teamId: string) => unknown,
-		expectedStatus: "ready" | "needs_setup",
+		expectedStatus: "ready" | "needs_setup" | "missing",
 	) {
 		db.prepare(
 			`INSERT INTO actors(actor_id, display_name, is_local, status, created_at, updated_at)
@@ -1595,8 +1986,108 @@ describe("legacy Team candidate discovery", () => {
 		expect(discoverLegacyTeamCandidates(db, options())[0]?.status).toBe("ready");
 
 		mutate(db, teamId);
-		expect(discoverLegacyTeamCandidates(db, options())[0]?.status).toBe(expectedStatus);
+		const discovered = discoverLegacyTeamCandidates(db, options());
+		if (expectedStatus === "missing") expect(discovered).toEqual([]);
+		else expect(discovered[0]?.status).toBe(expectedStatus);
 	}
+
+	it("does not restore a Project edge when another recipient blocks canonical derivation", () => {
+		let completedTeamId = "";
+		runExcludedCompletionScenario((db2, teamId) => {
+			completedTeamId = teamId;
+			db2
+				.prepare(
+					`DELETE FROM project_recipients
+					 WHERE canonical_project_identity = ? AND recipient_kind = 'team' AND recipient_id = ?`,
+				)
+				.run(PROJECT_ID, teamId);
+			db2
+				.prepare(
+					`INSERT INTO project_recipients(
+					 canonical_project_identity, recipient_kind, recipient_id, status, provenance,
+					 policy_revision, migration_state, idempotency_key, created_at, updated_at
+					 ) VALUES (?, 'team', 'missing-team', 'active', 'test', 'r1', 'completed',
+					 'blocking-recipient', ?, ?)`,
+				)
+				.run(PROJECT_ID, NOW, NOW);
+		}, "needs_setup");
+
+		expect(
+			db
+				.prepare(
+					`SELECT COUNT(*) FROM project_recipients
+					 WHERE canonical_project_identity = ? AND recipient_kind = 'team' AND recipient_id = ?`,
+				)
+				.pluck()
+				.get(PROJECT_ID, completedTeamId),
+		).toBe(0);
+	});
+
+	it("rolls back reconciliation if the strict post-write invariant changes", () => {
+		let completedTeamId = "";
+		runExcludedCompletionScenario((db2, teamId) => {
+			completedTeamId = teamId;
+			db2
+				.prepare(
+					`DELETE FROM project_recipients
+					 WHERE canonical_project_identity = ? AND recipient_kind = 'team' AND recipient_id = ?`,
+				)
+				.run(PROJECT_ID, teamId);
+			db2.exec(
+				`CREATE TRIGGER block_reconciled_team_edge
+				 AFTER INSERT ON project_recipients
+				 WHEN NEW.provenance = 'reviewed_team_setup'
+				 BEGIN
+				   INSERT INTO project_recipients(
+				     canonical_project_identity, recipient_kind, recipient_id, status, provenance,
+				     policy_revision, migration_state, idempotency_key, created_at, updated_at
+				   ) VALUES (NEW.canonical_project_identity, 'team', 'missing-after-write', 'active',
+				     'test', 'r1', 'completed', 'post-write-blocker', NEW.created_at, NEW.updated_at);
+				 END`,
+			);
+		}, "missing");
+
+		expect(
+			db
+				.prepare(
+					`SELECT COUNT(*) FROM project_recipients
+					 WHERE canonical_project_identity = ? AND recipient_kind = 'team'
+					   AND recipient_id IN (?, 'missing-after-write')`,
+				)
+				.pluck()
+				.get(PROJECT_ID, completedTeamId),
+		).toBe(0);
+		expect(db.prepare("SELECT state FROM legacy_team_setup_drafts").pluck().get()).toBe(
+			"completed",
+		);
+	});
+
+	it("reactivates a revoked setup-owned Project edge", () => {
+		let completedTeamId = "";
+		runExcludedCompletionScenario((db2, teamId) => {
+			completedTeamId = teamId;
+			db2
+				.prepare(
+					`UPDATE project_recipients SET status = 'revoked', policy_revision = 'old-r1',
+					 source_fingerprint = 'old-source'
+					 WHERE canonical_project_identity = ? AND recipient_kind = 'team' AND recipient_id = ?`,
+				)
+				.run(PROJECT_ID, teamId);
+		}, "ready");
+
+		expect(
+			db
+				.prepare(
+					`SELECT status, provenance, policy_revision FROM project_recipients
+					 WHERE canonical_project_identity = ? AND recipient_kind = 'team' AND recipient_id = ?`,
+				)
+				.get(PROJECT_ID, completedTeamId),
+		).toEqual({
+			status: "active",
+			provenance: "reviewed_team_setup",
+			policy_revision: "revision-1",
+		});
+	});
 
 	it.each([
 		[
@@ -1686,7 +2177,7 @@ describe("legacy Team candidate discovery", () => {
 					.run(teamId, NOW, NOW);
 			},
 		],
-	] as const)("drops Ready for an included-device completion when %s", (_label, mutate) => {
+	] as const)("preserves terminal completion when %s", (_label, mutate) => {
 		db.prepare(
 			`INSERT INTO actors(actor_id, display_name, is_local, status, created_at, updated_at)
 			 VALUES ('identity-a', 'Person A', 0, 'active', ?, ?)`,
@@ -1752,9 +2243,12 @@ describe("legacy Team candidate discovery", () => {
 
 		mutate(db, teamId);
 		expect(discoverLegacyTeamCandidates(db, options())[0]?.status).toBe("needs_setup");
+		expect(latestLegacyTeamSetupAttempt(db, draft.candidate_id)?.attemptId).toBe(draft.attempt_id);
+		expect(getLegacyTeamSetupDraft(db, draft.candidate_id)?.state).toBe("completed");
+		expect(isLegacyTeamCandidateSelectable(db, draft.candidate_id)).toBe(true);
 	});
 
-	it("reopens a completed candidate when its Project inventory fingerprint is stale", () => {
+	it("replaces a malformed completion without a terminal Team", () => {
 		const [initial] = discoverLegacyTeamCandidates(db, options());
 		if (!initial) throw new Error("initial candidate missing");
 		const initialAttempt = latestLegacyTeamSetupAttempt(db, initial.candidateRef);
@@ -1765,18 +2259,16 @@ describe("legacy Team candidate discovery", () => {
 			 WHERE candidate_id = ?`,
 		).run(NOW, initial.candidateRef);
 
-		const [reopened] = discoverLegacyTeamCandidates(db, options());
-		if (!reopened) throw new Error("reopened candidate missing");
-		const reopenedAttempt = latestLegacyTeamSetupAttempt(db, reopened.candidateRef);
+		const [rediscovered] = discoverLegacyTeamCandidates(db, options());
+		if (!rediscovered) throw new Error("rediscovered candidate missing");
+		const rediscoveredAttempt = latestLegacyTeamSetupAttempt(db, rediscovered.candidateRef);
 
-		expect(reopened.status).toBe("needs_setup");
-		expect(reopenedAttempt).toMatchObject({ candidateId: initial.candidateRef, isCurrent: true });
-		expect(reopenedAttempt?.attemptId).not.toBe(initialAttempt.attemptId);
-		expect(
-			db
-				.prepare("SELECT state FROM legacy_team_setup_drafts WHERE attempt_id = ?")
-				.pluck()
-				.get(initialAttempt.attemptId),
-		).toBe("completed");
+		expect(rediscovered.status).toBe("needs_setup");
+		expect(rediscoveredAttempt).toMatchObject({
+			candidateId: initial.candidateRef,
+			isCurrent: true,
+		});
+		expect(rediscoveredAttempt?.attemptId).not.toBe(initialAttempt.attemptId);
+		expect(getLegacyTeamSetupDraft(db, initial.candidateRef)?.state).toBe("needs_setup");
 	});
 });

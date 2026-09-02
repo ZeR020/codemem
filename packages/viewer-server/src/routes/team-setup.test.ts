@@ -17,6 +17,29 @@ function createRouteStore(): { store: MemoryStore; close: () => void } {
 }
 
 describe("Team setup roster loading", () => {
+	it("rolls back a mutation when response projection fails", () => {
+		const { store, close } = createRouteStore();
+		try {
+			store.db.exec("CREATE TABLE projection_rollback_test(value TEXT NOT NULL)");
+
+			expect(() =>
+				__teamSetupTestHooks.projectMutationAtomically(
+					store,
+					() =>
+						store.db.prepare("INSERT INTO projection_rollback_test(value) VALUES (?)").run("saved"),
+					() => {
+						throw new Error("projection failed");
+					},
+				),
+			).toThrow("projection failed");
+			expect(store.db.prepare("SELECT COUNT(*) FROM projection_rollback_test").pluck().get()).toBe(
+				0,
+			);
+		} finally {
+			close();
+		}
+	});
+
 	it("reuses successful summary snapshots until the cache expires", async () => {
 		let now = 1_000;
 		const snapshots = [{ groupId: "group-alpha" }] as never;
@@ -125,6 +148,116 @@ describe("Team setup roster loading", () => {
 				timeoutS: expectedTimeoutS,
 			}),
 		);
+	});
+
+	it("retries transient coordinator timeouts while loading a candidate roster", async () => {
+		const publicKey = "public-key-a";
+		const timeoutError = Object.assign(new Error("The operation was aborted due to timeout"), {
+			name: "TimeoutError",
+		});
+		const listGroups = vi
+			.fn()
+			.mockRejectedValueOnce(timeoutError)
+			.mockRejectedValueOnce(timeoutError)
+			.mockRejectedValueOnce(timeoutError)
+			.mockRejectedValueOnce(timeoutError)
+			.mockResolvedValue([
+				{
+					group_id: "group-alpha",
+					display_name: "Migration Team",
+					archived_at: null,
+					created_at: "2026-08-24T00:00:00.000Z",
+				},
+			]);
+		const listDevices = vi
+			.fn()
+			.mockRejectedValueOnce(timeoutError)
+			.mockRejectedValueOnce(timeoutError)
+			.mockRejectedValueOnce(timeoutError)
+			.mockRejectedValueOnce(timeoutError)
+			.mockResolvedValue([
+				{
+					group_id: "group-alpha",
+					device_id: "device-a",
+					public_key: publicKey,
+					fingerprint: fingerprintPublicKey(publicKey),
+					identity_id: null,
+					display_name: "Laptop",
+					enabled: 1,
+					created_at: "2026-08-24T00:00:00.000Z",
+				},
+			]);
+
+		await expect(
+			__teamSetupTestHooks.loadConfiguredLegacyTeamGroupSnapshotsWith({
+				readConfig: () => ({
+					...readCoordinatorSyncConfig({}),
+					syncCoordinatorUrl: "http://localhost:8787",
+					syncCoordinatorGroups: ["group-alpha"],
+					syncCoordinatorAdminSecret: "private-admin-secret",
+				}),
+				listGroups,
+				listDevices,
+			}),
+		).resolves.toEqual([
+			expect.objectContaining({ groupId: "group-alpha", displayName: "Migration Team" }),
+		]);
+		expect(listGroups).toHaveBeenCalledTimes(5);
+		expect(listDevices).toHaveBeenCalledTimes(5);
+	});
+
+	it("retries transient coordinator server errors", async () => {
+		const listGroups = vi
+			.fn()
+			.mockRejectedValueOnce(new Error("Remote coordinator request failed (503): unavailable"))
+			.mockResolvedValue([
+				{
+					group_id: "group-alpha",
+					display_name: "Migration Team",
+					archived_at: null,
+					created_at: "2026-08-24T00:00:00.000Z",
+				},
+			]);
+		const listDevices = vi.fn(async () => []);
+
+		await expect(
+			__teamSetupTestHooks.loadConfiguredLegacyTeamGroupSnapshotsWith({
+				readConfig: () => ({
+					...readCoordinatorSyncConfig({}),
+					syncCoordinatorUrl: "http://localhost:8787",
+					syncCoordinatorGroups: ["group-alpha"],
+					syncCoordinatorAdminSecret: "private-admin-secret",
+				}),
+				listGroups,
+				listDevices,
+			}),
+		).resolves.toEqual([
+			expect.objectContaining({ groupId: "group-alpha", displayName: "Migration Team" }),
+		]);
+		expect(listGroups).toHaveBeenCalledTimes(2);
+		expect(listDevices).toHaveBeenCalledTimes(1);
+	});
+
+	it("does not retry permanent coordinator failures", async () => {
+		const listGroups = vi
+			.fn()
+			.mockRejectedValue(new Error("Remote coordinator request failed (403): forbidden"));
+		const listDevices = vi.fn(async () => []);
+
+		await expect(
+			__teamSetupTestHooks.loadConfiguredLegacyTeamGroupSnapshotsWith({
+				readConfig: () => ({
+					...readCoordinatorSyncConfig({}),
+					syncCoordinatorUrl: "http://localhost:8787",
+					syncCoordinatorGroups: ["group-alpha"],
+					syncCoordinatorAdminSecret: "private-admin-secret",
+				}),
+				listGroups,
+				listDevices,
+			}),
+		).rejects.toThrow("team_setup_roster_unavailable");
+		expect(listGroups).toHaveBeenCalledTimes(1);
+		expect(listDevices).not.toHaveBeenCalled();
 	});
 
 	it("canonicalizes equivalent coordinator URLs while preserving non-root paths", () => {
@@ -453,7 +586,6 @@ describe("Team setup roster loading", () => {
 			);
 			expect(listDevices.mock.calls.map(([input]) => input.groupId).toSorted()).toEqual([
 				"nerdworld",
-				"sre",
 				"sre",
 			]);
 		} finally {

@@ -240,7 +240,7 @@ describe("recipient-focused Sharing", () => {
 		expect(visiblePanel().textContent).toContain("Add a device");
 		expect(visiblePanel().textContent).toContain("Share exact Projects");
 		expect(visiblePanel().textContent).toContain(
-			"Legacy invitation import remains under Advanced (legacy), in Sync",
+			"Legacy invitation import remains under Advanced, in Sync",
 		);
 	});
 
@@ -850,15 +850,6 @@ describe("recipient-focused Sharing", () => {
 						unresolvedDeviceCount: 0,
 						unresolvedProjectCount: 0,
 					},
-					{
-						candidateRef: "candidate-ready",
-						displayName: "Ready Team",
-						status: "ready",
-						deviceCount: 0,
-						projectCount: 0,
-						unresolvedDeviceCount: 5,
-						unresolvedProjectCount: 5,
-					},
 				],
 			},
 		});
@@ -983,18 +974,14 @@ describe("recipient-focused Sharing", () => {
 		expect(document.querySelector(".project-status-badge")).toBeNull();
 	});
 
-	it("labels cached Team setup status as previous while refreshing", () => {
+	it("keeps cached Team setup visible without a transient refresh banner", () => {
 		mount(intent(), {
 			teamSetupLoading: true,
 			teamSetupSummary: { version: 1, candidates: [] },
 		});
 
-		const status = [...document.querySelectorAll<HTMLElement>('[role="status"]')].find(
-			(item) =>
-				item.textContent ===
-				"Team setup status is being refreshed. The previous Team setup status is being shown.",
-		);
-		expect(status?.getAttribute("aria-live")).toBe("polite");
+		expect(document.body.textContent).not.toContain("Team setup status is being refreshed");
+		expect(document.body.textContent).not.toContain("previous Team setup status");
 	});
 
 	it("labels first-load Team setup discovery as loading without claiming stale status", () => {
@@ -1074,21 +1061,11 @@ describe("recipient-focused Sharing", () => {
 		expect(onOpenTeamSetup).toHaveBeenCalledWith("opaque-scope-backed-candidate");
 	});
 
-	it("hides migration work after every legacy candidate is migrated", () => {
+	it("hides migration work when the pending summary is empty", () => {
 		mount(intent(), {
 			teamSetupSummary: {
 				version: 1,
-				candidates: [
-					{
-						candidateRef: "completed-candidate",
-						displayName: "Migrated Team",
-						status: "ready",
-						deviceCount: 2,
-						projectCount: 1,
-						unresolvedDeviceCount: 0,
-						unresolvedProjectCount: 0,
-					},
-				],
+				candidates: [],
 			},
 		});
 

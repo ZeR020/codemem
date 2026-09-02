@@ -1,4 +1,5 @@
 import type { Database } from "./db.js";
+import { isFilesystemRootProjectIdentity } from "./legacy-team-project-policy.js";
 import { preferredActiveUnmergedLocalActorId } from "./recipient-policy-actor-eligibility.js";
 import {
 	RECIPIENT_POLICY_CONTRACT_VERSION,
@@ -177,6 +178,10 @@ export interface ListLegacyRecipientPolicyProjectionsOptions {
 export interface LegacyTeamProjectEvidence {
 	project: RecipientPolicyProjectV1;
 	teamCandidateIds: string[];
+	teamCandidateScopes: Array<{
+		teamCandidateId: string;
+		targetScopeId?: string | null;
+	}>;
 	sourceFingerprint: string;
 	deterministicProjectIdentity: string | null;
 }
@@ -204,6 +209,10 @@ function hasWildcard(value: string): boolean {
 
 function normalizedIdentity(value: string): string {
 	return value.trim().replaceAll("\\", "/").replace(/\/+$/u, "");
+}
+
+export function normalizeLegacyProjectMappingIdentity(value: string): string {
+	return normalizedIdentity(value);
 }
 
 function wildcardMatches(identity: string, pattern: string): boolean {
@@ -666,8 +675,13 @@ export function projectLegacyRecipientPolicyProjections(
 	options: ListLegacyRecipientPolicyProjectionsOptions,
 ): LegacyRecipientPolicyProjectionV1[] {
 	const scopes = new Map(snapshot.scopes.map((scope) => [scope.scopeId, scope]));
-	const projectsByScope = scopeProjectIndex(snapshot);
-	return snapshot.projects
+	const projects = snapshot.projects.filter(
+		(project) =>
+			project.canonicalIdentity !== "" &&
+			!isFilesystemRootProjectIdentity(project.canonicalIdentity),
+	);
+	const projectsByScope = scopeProjectIndex({ ...snapshot, projects });
+	return projects
 		.map((project): LegacyRecipientPolicyProjectionV1 => {
 			const projectShareOperations = snapshot.shareOperations.filter(
 				(operation) => operation.canonicalProjectIdentity === project.canonicalIdentity,
@@ -846,6 +860,7 @@ function loadSnapshot(
 				AND mi.active = 1 AND mi.deleted_at IS NULL
 			 WHERE (COALESCE(TRIM(s.git_remote), TRIM(s.cwd), TRIM(s.project), TRIM(mi.workspace_id), '') <> '')
 			   AND (s.cwd IS NULL OR substr(s.cwd, 1, length(?)) <> ?)
+			   AND COALESCE(s.tool_version, '') <> 'sync_replication'
 			 ORDER BY s.id, mi.id`,
 		)
 		.all(SYNC_BOOTSTRAP_CWD_PREFIX, SYNC_BOOTSTRAP_CWD_PREFIX) as Array<{
@@ -1179,15 +1194,41 @@ export function listLegacyTeamProjectEvidence(
 		const projectShareOperations = snapshot.shareOperations.filter(
 			(operation) => operation.canonicalProjectIdentity === project.canonicalIdentity,
 		);
+		const candidates = teamCandidates(relevantScopes, projectShareOperations, snapshot.scopes);
+		const teamCandidateScopes = candidates.map((candidate) => {
+			const matchingScopeIds = uniqueSorted(
+				relevantScopes
+					.filter(
+						(scope) =>
+							scope.authorityType === "coordinator" &&
+							scope.coordinatorId != null &&
+							scope.groupId != null &&
+							legacyTeamCandidateId(scope.coordinatorId, scope.groupId) ===
+								candidate.teamCandidateId,
+					)
+					.map((scope) => scope.scopeId),
+			);
+			return {
+				teamCandidateId: candidate.teamCandidateId,
+				// A Project can authorize one reviewed boundary only. Missing evidence
+				// remains absent so draft creation can apply its sole-group-scope
+				// fallback; contradictory evidence stays explicit and fails closed.
+				targetScopeId:
+					matchingScopeIds.length === 1
+						? (matchingScopeIds[0] ?? null)
+						: matchingScopeIds.length > 1
+							? null
+							: undefined,
+			};
+		});
 		return {
 			project: projection.project,
-			teamCandidateIds: teamCandidates(relevantScopes, projectShareOperations, snapshot.scopes).map(
-				(candidate) => candidate.teamCandidateId,
-			),
+			teamCandidateIds: candidates.map((candidate) => candidate.teamCandidateId),
+			teamCandidateScopes,
 			// Hash only stable identifiers and enforcement facts. Display labels
 			// and row timestamps refresh independently and are not security
 			// evidence, so they must not invalidate open setup drafts.
-			sourceFingerprint: recipientPolicyDigest("legacy-team-project-source-v1", {
+			sourceFingerprint: recipientPolicyDigest("legacy-team-project-source-v2", {
 				project: {
 					canonicalIdentity: project.canonicalIdentity,
 					identitySource: project.identitySource,
@@ -1206,6 +1247,10 @@ export function listLegacyTeamProjectEvidence(
 					identityId: operation.identityId,
 					coordinatorGroupId: operation.coordinatorGroupId,
 					state: operation.state,
+				})),
+				teamCandidateScopes: teamCandidateScopes.map((scope) => ({
+					...scope,
+					targetScopeId: scope.targetScopeId ?? null,
 				})),
 				enforcement: projection.enforcement,
 			}),

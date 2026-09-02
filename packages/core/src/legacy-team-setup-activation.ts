@@ -3,7 +3,10 @@ import {
 	assignIdentityDeviceInTransaction,
 	IdentityDeviceAssignmentError,
 } from "./identity-device-assignment.js";
-import { selectedProjectScopeMapping } from "./legacy-recipient-policy-projection.js";
+import {
+	normalizeLegacyProjectMappingIdentity,
+	selectedProjectScopeMapping,
+} from "./legacy-recipient-policy-projection.js";
 import { isStoredLegacyTeamAssignmentExpectationWellFormed } from "./legacy-team-assignment-expectation.js";
 import { isLegacyTeamProjectCanonicalStateValid } from "./legacy-team-project-canonical-preflight.js";
 import {
@@ -125,6 +128,7 @@ interface DraftProjectRow {
 	source_fingerprint: string;
 	resolution_kind: string;
 	resolved_project_identity: string | null;
+	target_scope_id: string | null;
 }
 
 interface TeamRow {
@@ -397,7 +401,7 @@ function loadModel(db: Database, input: PreviewLegacyTeamSetupActivationInput): 
 	const projects = db
 		.prepare(
 			`SELECT project_ref, source_project_identity, display_name, source_fingerprint,
-			        resolution_kind, resolved_project_identity
+			        resolution_kind, resolved_project_identity, target_scope_id
 			 FROM legacy_team_setup_draft_projects WHERE attempt_id = ? ORDER BY project_ref`,
 		)
 		.all(input.attemptId) as DraftProjectRow[];
@@ -447,7 +451,8 @@ function loadModel(db: Database, input: PreviewLegacyTeamSetupActivationInput): 
 		db
 			.prepare(
 				`SELECT scope_id FROM replication_scopes
-				 WHERE coordinator_id = ? AND group_id = ? AND status = 'active'
+				 WHERE coordinator_id = ? AND group_id = ? AND authority_type = 'coordinator'
+				   AND status = 'active'
 				 ORDER BY scope_id`,
 			)
 			.all(draft.coordinator_id, draft.group_id) as Array<{ scope_id: string }>
@@ -552,11 +557,11 @@ function loadModel(db: Database, input: PreviewLegacyTeamSetupActivationInput): 
 			.toSorted(compareText),
 	};
 	validateAssignmentExpectations(model);
-	validateCanonicalState(model);
+	validateCanonicalState(db, model);
 	return model;
 }
 
-function validateCanonicalState(model: ActivationModel): void {
+function validateCanonicalState(db: Database, model: ActivationModel): void {
 	const { groupScopeIds, memberships, projects, recipients, scopeIds, team, teamId } = model;
 	if (team) {
 		const baseCompatible =
@@ -607,30 +612,53 @@ function validateCanonicalState(model: ActivationModel): void {
 	}
 
 	if (
-		!isLegacyTeamProjectCanonicalStateValid({
-			teamId,
-			scopeIds,
-			groupScopeIds,
-			projects: projects.map((project) => ({
-				sourceProjectIdentity: project.source_project_identity,
-				resolvedProjectIdentity: project.resolved_project_identity,
-			})),
-			mappings: model.mappings.map((mapping) => ({
-				workspaceIdentity: mapping.workspace_identity,
-				projectPattern: mapping.project_pattern,
-				scopeId: mapping.scope_id,
-				source: mapping.source,
-			})),
-			recipients: recipients.map((recipient) => ({
-				canonicalProjectIdentity: recipient.canonical_project_identity,
-				recipientKind: recipient.recipient_kind,
-				recipientId: recipient.recipient_id,
-				status: recipient.status,
-			})),
-		})
+		!isLegacyTeamProjectCanonicalStateValid(
+			{
+				teamId,
+				scopeIds,
+				groupScopeIds,
+				projects: projects.map((project) => ({
+					sourceProjectIdentity: project.source_project_identity,
+					resolvedProjectIdentity: project.resolved_project_identity,
+					targetScopeId: targetScopeId(model, project),
+				})),
+				mappings: model.mappings.map((mapping) => ({
+					workspaceIdentity: mapping.workspace_identity,
+					projectPattern: mapping.project_pattern,
+					scopeId: mapping.scope_id,
+					source: mapping.source,
+				})),
+				recipients: recipients.map((recipient) => ({
+					canonicalProjectIdentity: recipient.canonical_project_identity,
+					recipientKind: recipient.recipient_kind,
+					recipientId: recipient.recipient_id,
+					status: recipient.status,
+				})),
+			},
+			db,
+		)
 	) {
 		activationError("team_setup_conflict");
 	}
+}
+
+function targetScopeId(model: ActivationModel, project: DraftProjectRow): string | null {
+	if (project.target_scope_id) {
+		return model.scopeIds.includes(project.target_scope_id) ? project.target_scope_id : null;
+	}
+	const matchingScopeIds = [
+		...new Set(
+			model.mappings
+				.filter(
+					(mapping) =>
+						mapping.project_pattern === project.source_project_identity &&
+						mapping.workspace_identity === project.resolved_project_identity &&
+						model.scopeIds.includes(mapping.scope_id),
+				)
+				.map((mapping) => mapping.scope_id),
+		),
+	];
+	return matchingScopeIds.length === 1 ? (matchingScopeIds[0] ?? null) : null;
 }
 
 /**
@@ -1045,11 +1073,12 @@ function buildAccessDelta(model: ActivationModel): LegacyTeamSetupAccessDeltaV1 
 	const plannedRecipientIdentities = new Set<string>();
 	for (const project of model.projects) {
 		const resolvedIdentity = project.resolved_project_identity as string;
+		const projectTargetScopeId = targetScopeId(model, project);
 		const mapping = model.mappings.find(
 			(row) =>
 				row.project_pattern === project.source_project_identity &&
 				row.workspace_identity === resolvedIdentity &&
-				model.scopeIds.includes(row.scope_id),
+				row.scope_id === projectTargetScopeId,
 		);
 		if (!mapping) {
 			// A re-resolution supersedes the prior setup-owned mapping in
@@ -1214,12 +1243,23 @@ function buildPreview(model: ActivationModel): LegacyTeamSetupActivationPreviewV
 	};
 }
 
-export function previewLegacyTeamSetupActivation(
+export function inspectLegacyTeamSetupActivation(
 	db: Database,
 	input: PreviewLegacyTeamSetupActivationInput,
 ): LegacyTeamSetupActivationPreviewV1 {
 	try {
 		return buildPreview(loadModel(db, input));
+	} catch (error) {
+		throw normalizedActivationError(error);
+	}
+}
+
+export function previewLegacyTeamSetupActivation(
+	db: Database,
+	input: PreviewLegacyTeamSetupActivationInput,
+): LegacyTeamSetupActivationPreviewV1 {
+	try {
+		return inspectLegacyTeamSetupActivation(db, input);
 	} catch (error) {
 		const normalized = normalizedActivationError(error);
 		persistSafeError(db, input, normalized);
@@ -1487,15 +1527,17 @@ function applyActivation(
 
 	for (const project of model.projects) {
 		const resolvedIdentity = project.resolved_project_identity as string;
+		const projectTargetScopeId = targetScopeId(model, project);
 		const mapping = model.mappings.find(
 			(row) =>
 				row.project_pattern === project.source_project_identity &&
 				row.workspace_identity === resolvedIdentity &&
-				model.scopeIds.includes(row.scope_id),
+				row.scope_id === projectTargetScopeId,
 		);
 		if (!mapping) {
-			const targetScopeId = model.scopeIds.length === 1 ? model.scopeIds[0] : null;
-			if (!targetScopeId) activationError("team_setup_conflict");
+			if (!projectTargetScopeId) {
+				activationError("team_setup_conflict");
+			}
 			// A reviewed re-resolution supersedes the prior activation's
 			// setup-owned mapping in place; inserting a second row for the
 			// same source would leave a stale boundary competing on priority.
@@ -1512,13 +1554,13 @@ function applyActivation(
 					`UPDATE project_scope_mappings
 					 SET workspace_identity = ?, scope_id = ?, updated_at = ?
 					 WHERE id = ?`,
-				).run(resolvedIdentity, targetScopeId, now, staleSetupMapping.id);
+				).run(resolvedIdentity, projectTargetScopeId, now, staleSetupMapping.id);
 			} else {
 				db.prepare(
 					`INSERT INTO project_scope_mappings(
 					 workspace_identity, project_pattern, scope_id, priority, source, created_at, updated_at
 					 ) VALUES (?, ?, ?, 1000, 'reviewed_team_setup', ?, ?)`,
-				).run(resolvedIdentity, project.source_project_identity, targetScopeId, now, now);
+				).run(resolvedIdentity, project.source_project_identity, projectTargetScopeId, now, now);
 			}
 		}
 		db.prepare(
@@ -1600,20 +1642,32 @@ function applyActivation(
 	// mapping writes because merged resolutions map several confirmed source
 	// patterns onto one identity and selection can pick only one of them: the
 	// authoritative pattern is valid when it matches ANY confirmed source.
-	const confirmedSourcesByResolved = new Map<string, Set<string>>();
+	const confirmedSourcesByResolved = new Map<
+		string,
+		{ sources: Set<string>; targetScopeIds: Set<string> }
+	>();
 	for (const project of model.projects) {
 		const resolvedIdentity = project.resolved_project_identity as string;
-		const sources = confirmedSourcesByResolved.get(resolvedIdentity) ?? new Set();
-		sources.add(project.source_project_identity);
-		confirmedSourcesByResolved.set(resolvedIdentity, sources);
+		const evidence = confirmedSourcesByResolved.get(resolvedIdentity) ?? {
+			sources: new Set<string>(),
+			targetScopeIds: new Set<string>(),
+		};
+		evidence.sources.add(project.source_project_identity);
+		const projectTargetScopeId = targetScopeId(model, project);
+		if (projectTargetScopeId) evidence.targetScopeIds.add(projectTargetScopeId);
+		confirmedSourcesByResolved.set(resolvedIdentity, evidence);
 	}
-	for (const [resolvedIdentity, sources] of confirmedSourcesByResolved) {
+	for (const [resolvedIdentity, evidence] of confirmedSourcesByResolved) {
+		const reviewedTargetScopeId = [...evidence.targetScopeIds][0];
 		const selected = selectedProjectScopeMapping(db, resolvedIdentity);
 		if (
+			evidence.targetScopeIds.size !== 1 ||
 			!selected ||
 			selected.workspaceIdentity == null ||
-			!sources.has(selected.projectPattern) ||
-			!model.scopeIds.includes(selected.scopeId)
+			(normalizeLegacyProjectMappingIdentity(selected.workspaceIdentity) !==
+				normalizeLegacyProjectMappingIdentity(resolvedIdentity) &&
+				!evidence.sources.has(selected.projectPattern)) ||
+			selected.scopeId !== reviewedTargetScopeId
 		) {
 			activationError("team_setup_conflict");
 		}

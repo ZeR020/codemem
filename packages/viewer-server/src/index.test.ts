@@ -632,6 +632,17 @@ describe("viewer-server", () => {
 					unresolvedDeviceCount: 1,
 					unresolvedProjectCount: 0,
 				});
+				const beforeDetail = {
+					drafts: store.db.prepare("SELECT * FROM legacy_team_setup_drafts ORDER BY rowid").all(),
+					devices: store.db
+						.prepare("SELECT * FROM legacy_team_setup_draft_devices ORDER BY attempt_id, device_id")
+						.all(),
+					projects: store.db
+						.prepare(
+							"SELECT * FROM legacy_team_setup_draft_projects ORDER BY attempt_id, project_ref",
+						)
+						.all(),
+				};
 
 				const incompleteResponse = await app.request(`/api/sync/team-setup/v1/${candidateRef}`);
 				expect(incompleteResponse.status).toBe(200);
@@ -639,14 +650,27 @@ describe("viewer-server", () => {
 				expect(incomplete).toMatchObject({
 					version: 1,
 					candidate: { candidateRef },
-					draftState: "needs_setup",
-					conflictState: "team_setup_incomplete",
-					canFinish: false,
+					state: "reviewing",
+					actions: { finish: { enabled: false, blockedReason: "setup_incomplete" } },
 				});
 				expect(incomplete).not.toHaveProperty("finishDigest");
 				expect(incomplete).not.toHaveProperty("accessDeltaDigest");
 				expect(incomplete).not.toHaveProperty("accessDelta");
-
+				expect(incomplete).not.toHaveProperty("unavailableReason");
+				expect(incomplete).toHaveProperty("devices.0.actions");
+				expect(incomplete).toHaveProperty("projects.0.actions");
+				expect((await app.request(`/api/sync/team-setup/v1/${candidateRef}`)).status).toBe(200);
+				expect({
+					drafts: store.db.prepare("SELECT * FROM legacy_team_setup_drafts ORDER BY rowid").all(),
+					devices: store.db
+						.prepare("SELECT * FROM legacy_team_setup_draft_devices ORDER BY attempt_id, device_id")
+						.all(),
+					projects: store.db
+						.prepare(
+							"SELECT * FROM legacy_team_setup_draft_projects ORDER BY attempt_id, project_ref",
+						)
+						.all(),
+				}).toEqual(beforeDetail);
 				const draft = core.getLegacyTeamSetupDraft(store.db, candidateRef);
 				expect(draft).not.toBeNull();
 				store.db
@@ -671,6 +695,15 @@ describe("viewer-server", () => {
 					"legacy-team-viewer-identity-ref-v1",
 					[candidateRef, replacementIdentityId],
 				);
+				const expectFullView = async (response: Response) => {
+					const payload = (await response.clone().json()) as Record<string, unknown>;
+					expect(payload).toMatchObject({ version: 1, candidate: { candidateRef } });
+					expect(payload).toHaveProperty("state");
+					expect(payload).toHaveProperty("actions");
+					expect(payload).toHaveProperty("devices");
+					expect(payload).toHaveProperty("projects");
+					expect(payload).toHaveProperty("identityChoices");
+				};
 				const assignmentResponse = await app.request(
 					`/api/sync/team-setup/v1/${candidateRef}/devices/${deviceRef}/assignment`,
 					{
@@ -684,6 +717,7 @@ describe("viewer-server", () => {
 					},
 				);
 				expect(assignmentResponse.status).toBe(200);
+				await expectFullView(assignmentResponse);
 				const replacementAssignmentResponse = await app.request(
 					`/api/sync/team-setup/v1/${candidateRef}/devices/${deviceRef}/assignment`,
 					{
@@ -697,6 +731,7 @@ describe("viewer-server", () => {
 					},
 				);
 				expect(replacementAssignmentResponse.status).toBe(200);
+				await expectFullView(replacementAssignmentResponse);
 				const staleDecisionResponse = await app.request(
 					`/api/sync/team-setup/v1/${candidateRef}/devices/${deviceRef}/decision`,
 					{
@@ -726,6 +761,7 @@ describe("viewer-server", () => {
 					},
 				);
 				expect(restoredAssignmentResponse.status).toBe(200);
+				await expectFullView(restoredAssignmentResponse);
 				const decisionResponse = await app.request(
 					`/api/sync/team-setup/v1/${candidateRef}/devices/${deviceRef}/decision`,
 					{
@@ -739,6 +775,7 @@ describe("viewer-server", () => {
 					},
 				);
 				expect(decisionResponse.status).toBe(200);
+				await expectFullView(decisionResponse);
 				const clearResponse = await app.request(
 					`/api/sync/team-setup/v1/${candidateRef}/devices/${deviceRef}/decision`,
 					{
@@ -748,8 +785,10 @@ describe("viewer-server", () => {
 					},
 				);
 				expect(clearResponse.status).toBe(200);
+				await expectFullView(clearResponse);
 				expect(await clearResponse.json()).toMatchObject({
-					canFinish: false,
+					state: "reviewing",
+					candidate: { candidateRef },
 					unresolvedDeviceCount: 1,
 				});
 				const restoredDecisionResponse = await app.request(
@@ -765,6 +804,7 @@ describe("viewer-server", () => {
 					},
 				);
 				expect(restoredDecisionResponse.status).toBe(200);
+				await expectFullView(restoredDecisionResponse);
 				const rawPreview = core.previewLegacyTeamSetupActivation(store.db, {
 					candidateRef,
 					attemptId: draft?.attemptId ?? "",
@@ -777,8 +817,8 @@ describe("viewer-server", () => {
 					version: 1,
 					attemptId: draft?.attemptId,
 					finishDigest: rawPreview.finishDigest,
-					canFinish: true,
-					conflictState: null,
+					state: "ready_to_finish",
+					actions: { finish: { enabled: true, blockedReason: null } },
 					accessDeltaDigest: rawPreview.accessDeltaDigest,
 				});
 				expect(JSON.stringify(detail)).not.toContain(coordinatorId);
@@ -900,6 +940,52 @@ describe("viewer-server", () => {
 				expect(JSON.stringify(finished)).not.toContain(
 					rawPreview.accessDelta.teamChanges[0]?.teamId,
 				);
+				const pendingAfterFinish = await app.request("/api/sync/team-setup/v1");
+				expect(pendingAfterFinish.status).toBe(200);
+				expect(await pendingAfterFinish.json()).toEqual({ version: 1, candidates: [] });
+				store.db
+					.prepare(
+						`DELETE FROM project_recipients
+						 WHERE recipient_kind = 'team' AND recipient_id = ?
+						   AND provenance = 'reviewed_team_setup'`,
+					)
+					.run(core.deterministicPolicyTeamId(candidateRef));
+				expect(store.db.prepare("SELECT COUNT(*) FROM project_recipients").pluck().get()).toBe(0);
+				const reconciledSummary = await app.request("/api/sync/team-setup/v1");
+				expect(reconciledSummary.status).toBe(200);
+				expect(await reconciledSummary.json()).toEqual({ version: 1, candidates: [] });
+				expect(store.db.prepare("SELECT COUNT(*) FROM project_recipients").pluck().get()).toBe(1);
+				expect(
+					store.db
+						.prepare(
+							`SELECT attempt_id FROM legacy_team_setup_drafts
+							 WHERE candidate_id = ? ORDER BY rowid DESC LIMIT 1`,
+						)
+						.pluck()
+						.get(candidateRef),
+				).toBe(draft?.attemptId);
+				const canonicalSnapshot = () => ({
+					teams: store.db.prepare("SELECT * FROM policy_teams ORDER BY team_id").all(),
+					memberships: store.db
+						.prepare("SELECT * FROM policy_team_memberships ORDER BY team_id, identity_id")
+						.all(),
+					decisions: store.db
+						.prepare("SELECT * FROM policy_team_device_decisions ORDER BY team_id, device_id")
+						.all(),
+					assignments: store.db.prepare("SELECT * FROM identity_devices ORDER BY device_id").all(),
+					mappings: store.db.prepare("SELECT * FROM project_scope_mappings ORDER BY id").all(),
+					recipients: store.db
+						.prepare(
+							`SELECT * FROM project_recipients
+							 ORDER BY canonical_project_identity, recipient_kind, recipient_id`,
+						)
+						.all(),
+					drafts: store.db.prepare("SELECT * FROM legacy_team_setup_drafts ORDER BY rowid").all(),
+					completions: store.db
+						.prepare("SELECT * FROM legacy_team_setup_completions ORDER BY rowid")
+						.all(),
+				});
+				const beforeReplay = canonicalSnapshot();
 				const replayResponse = await app.request(`/api/sync/team-setup/v1/${candidateRef}/finish`, {
 					method: "POST",
 					headers: { "content-type": "application/json" },
@@ -907,6 +993,7 @@ describe("viewer-server", () => {
 				});
 				expect(replayResponse.status).toBe(200);
 				expect(await replayResponse.json()).toEqual(finished);
+				expect(canonicalSnapshot()).toEqual(beforeReplay);
 				const missingConfirmation = await app.request(
 					`/api/sync/team-setup/v1/${candidateRef}/finish`,
 					{
@@ -990,15 +1077,41 @@ describe("viewer-server", () => {
 				const ready = (await readyResponse.json()) as Record<string, unknown>;
 				expect(ready).toMatchObject({
 					candidate: { candidateRef, status: "ready" },
-					draftState: "completed",
-					canFinish: false,
-					conflictState: null,
+					state: "completed",
+					actions: {
+						refresh: { enabled: false, blockedReason: "setup_completed" },
+						finish: { enabled: false, blockedReason: "setup_completed" },
+					},
 				});
 				expect(ready).not.toHaveProperty("finishDigest");
 				expect(ready).not.toHaveProperty("accessDeltaDigest");
 				expect(ready).not.toHaveProperty("accessDelta");
 				expect(ready.identityChoices).toHaveLength(501);
 				expect(loadSnapshots).not.toHaveBeenCalled();
+				const completedMutation = await app.request(
+					`/api/sync/team-setup/v1/${candidateRef}/devices/${deviceRef}/decision`,
+					{
+						method: "PUT",
+						headers: { "content-type": "application/json" },
+						body: JSON.stringify({ attemptId: draft?.attemptId, decision: "excluded" }),
+					},
+				);
+				expect(completedMutation.status).toBe(409);
+				expect(await completedMutation.json()).toEqual({
+					error: "team_setup_confirmation_stale",
+				});
+				const completedRefresh = await app.request(
+					`/api/sync/team-setup/v1/${candidateRef}/refresh`,
+					{
+						method: "POST",
+						headers: { "content-type": "application/json" },
+						body: "{}",
+					},
+				);
+				expect(completedRefresh.status).toBe(409);
+				expect(await completedRefresh.json()).toEqual({
+					error: "team_setup_confirmation_stale",
+				});
 
 				store.db.prepare("DELETE FROM actors WHERE actor_id LIKE 'unrelated-%'").run();
 				store.db
@@ -1012,9 +1125,59 @@ describe("viewer-server", () => {
 				expect(reopenedResponse.status).toBe(200);
 				const reopened = (await reopenedResponse.json()) as Record<string, unknown>;
 				expect(reopened).toMatchObject({ candidate: { candidateRef } });
-				expect((reopened.candidate as { status: string }).status).not.toBe("ready");
-				expect(reopened.draftState).not.toBe("completed");
-				expect(loadSnapshots).toHaveBeenCalledWith({ candidateRef });
+				expect((reopened.candidate as { status: string }).status).toBe("ready");
+				expect(reopened.state).toBe("completed");
+				expect(loadSnapshots).not.toHaveBeenCalled();
+
+				const supersedingAttemptId = "legacy-team-attempt:00000000-0000-4000-8000-000000000099";
+				store.db
+					.prepare(
+						`INSERT INTO legacy_team_setup_drafts(
+						 attempt_id, candidate_id, coordinator_id, group_id, state, display_name,
+						 roster_fingerprint, projection_fingerprint, created_at, updated_at
+						 ) VALUES (?, ?, ?, ?, 'needs_setup', 'Migration Team', 'new-roster',
+						 'new-projection', ?, ?)`,
+					)
+					.run(supersedingAttemptId, candidateRef, coordinatorId, groupId, now, now);
+				loadSnapshots.mockClear();
+				const terminalSummaryResponse = await app.request("/api/sync/team-setup/v1");
+				expect(terminalSummaryResponse.status).toBe(200);
+				const terminalSummary = (await terminalSummaryResponse.json()) as {
+					candidates: Array<{ candidateRef: string }>;
+				};
+				expect(terminalSummary.candidates).not.toContainEqual(
+					expect.objectContaining({ candidateRef }),
+				);
+				const staleSupersedingDetail = await app.request(`/api/sync/team-setup/v1/${candidateRef}`);
+				expect(staleSupersedingDetail.status).toBe(404);
+				expect(await staleSupersedingDetail.json()).toEqual({
+					error: "team_setup_confirmation_stale",
+				});
+				const staleSupersedingDecision = await app.request(
+					`/api/sync/team-setup/v1/${candidateRef}/devices/${deviceRef}/decision`,
+					{
+						method: "PUT",
+						headers: { "content-type": "application/json" },
+						body: JSON.stringify({ attemptId: supersedingAttemptId, decision: "excluded" }),
+					},
+				);
+				expect(staleSupersedingDecision.status).toBe(409);
+				expect(await staleSupersedingDecision.json()).toEqual({
+					error: "team_setup_confirmation_stale",
+				});
+				const staleSupersedingRefresh = await app.request(
+					`/api/sync/team-setup/v1/${candidateRef}/refresh`,
+					{
+						method: "POST",
+						headers: { "content-type": "application/json" },
+						body: "{}",
+					},
+				);
+				expect(staleSupersedingRefresh.status).toBe(409);
+				expect(await staleSupersedingRefresh.json()).toEqual({
+					error: "team_setup_confirmation_stale",
+				});
+				expect(loadSnapshots).not.toHaveBeenCalled();
 			} finally {
 				cleanup();
 			}
@@ -1045,8 +1208,10 @@ describe("viewer-server", () => {
 			expect(safe.projectChanges[0]).toEqual({
 				projectRef,
 				projectDisplayName: "Project outside this setup (1)",
+				fromCanonicalProjectRef: core.legacyTeamCanonicalProjectRef(candidateRef, fromIdentity),
 				fromResolvedProjectRef: fromRef,
 				fromResolvedProjectDisplayName: "Project outside this setup (2)",
+				toCanonicalProjectRef: core.legacyTeamCanonicalProjectRef(candidateRef, toIdentity),
 				toResolvedProjectRef: toRef,
 				toResolvedProjectDisplayName: "Project outside this setup (3)",
 				change: "update",
@@ -1113,6 +1278,39 @@ describe("viewer-server", () => {
 			]);
 			expect(JSON.stringify(safe)).not.toContain("external-device");
 			expect(JSON.stringify(safe)).not.toContain("file:///private");
+		});
+
+		it("labels synthetic default-sharing cleanup without pretending it is a Project", () => {
+			const safe = __teamSetupTestHooks.viewerSafeAccessDelta(candidateRef, {
+				teamChanges: [],
+				membershipChanges: [],
+				projectChanges: [],
+				recipientChanges: [
+					{
+						canonicalProjectIdentity: "shared:default",
+						recipientKind: "team",
+						recipientId: "team-id",
+						change: "remove",
+					},
+				],
+				deviceAccessChanges: [
+					{
+						canonicalProjectIdentity: "shared:default",
+						deviceId: "device-id",
+						change: "remove",
+					},
+				],
+			});
+
+			expect(safe.recipientChanges[0]).toMatchObject({
+				canonicalProjectDisplayName: "Legacy default sharing",
+				canonicalProjectKind: "legacy_default_sharing",
+			});
+			expect(safe.deviceAccessChanges[0]).toMatchObject({
+				canonicalProjectDisplayName: "Legacy default sharing",
+				canonicalProjectKind: "legacy_default_sharing",
+			});
+			expect(JSON.stringify(safe)).not.toContain("shared:default");
 		});
 
 		it("fails closed when active identity choices exceed their response cap", async () => {
@@ -1418,8 +1616,9 @@ describe("viewer-server", () => {
 				expect(response.status).toBe(200);
 				const payload = await response.json();
 				expect(payload).toMatchObject({
-					candidateRef,
+					candidate: { candidateRef },
 					attemptId: draft.attemptId,
+					state: "reviewing",
 					unresolvedProjectCount: 0,
 				});
 				const saved = core.getLegacyTeamSetupDraft(store.db, candidateRef);
@@ -1780,6 +1979,11 @@ describe("viewer-server", () => {
 				resolveRefresh();
 				const refresh = await refreshPromise;
 				expect(refresh.status).toBe(200);
+				expect(await refresh.clone().json()).toMatchObject({
+					version: 1,
+					candidate: { candidateRef },
+					state: "reviewing",
+				});
 				const refreshedAttemptId = core.getLegacyTeamSetupDraft(
 					ensureStore().db,
 					candidateRef,
@@ -1790,7 +1994,118 @@ describe("viewer-server", () => {
 				expect(core.getLegacyTeamSetupDraft(ensureStore().db, candidateRef)?.attemptId).toBe(
 					refreshedAttemptId,
 				);
+				// Explicit refresh invalidates the summary before and after its fresh
+				// roster load; read-only detail loads retain the display cache instead.
 				expect(loadSnapshots).toHaveBeenCalledTimes(4);
+			} finally {
+				cleanup();
+			}
+		});
+
+		it("rejects a refresh when migration completes during the roster load", async () => {
+			let resolveRefresh!: () => void;
+			const loadSnapshots = vi.fn((options?: { candidateRef?: string }) =>
+				options?.candidateRef
+					? new Promise<core.LegacyTeamConfiguredGroupSnapshot[]>((resolve) => {
+							resolveRefresh = () =>
+								resolve([
+									{
+										...snapshots[0],
+										devices: snapshots[0].devices.map((device) => ({
+											...device,
+											fingerprint: "refreshed-fingerprint",
+										})),
+									},
+								]);
+						})
+					: Promise.resolve(snapshots),
+			);
+			const { app, ensureStore, cleanup } = createTestApp({
+				loadLegacyTeamConfiguredGroupSnapshots: loadSnapshots,
+			});
+			try {
+				expect((await app.request("/api/sync/team-setup/v1")).status).toBe(200);
+				const store = ensureStore();
+				const initialAttemptId = core.getLegacyTeamSetupDraft(store.db, candidateRef)?.attemptId;
+				const refreshPromise = app.request(`/api/sync/team-setup/v1/${candidateRef}/refresh`, {
+					method: "POST",
+					headers: { "content-type": "application/json" },
+					body: "{}",
+				});
+				await vi.waitFor(() => expect(loadSnapshots).toHaveBeenCalledTimes(2));
+				store.db
+					.prepare(
+						`INSERT INTO policy_teams(
+						 team_id, display_name, status, device_eligibility_mode, provenance,
+						 revision, migration_state, source_fingerprint, idempotency_key, created_at, updated_at
+						 ) VALUES (?, 'Migration Team', 'active', 'reviewed_allowlist',
+						 'reviewed_team_candidate', 'revision-1', 'completed', 'roster', 'team-key', ?, ?)`,
+					)
+					.run(
+						core.deterministicPolicyTeamId(candidateRef),
+						"2026-08-26T00:00:00.000Z",
+						"2026-08-26T00:00:00.000Z",
+					);
+				resolveRefresh();
+
+				const refresh = await refreshPromise;
+				expect(refresh.status).toBe(409);
+				expect(await refresh.json()).toEqual({ error: "team_setup_confirmation_stale" });
+				expect(
+					store.db
+						.prepare(
+							`SELECT attempt_id FROM legacy_team_setup_drafts
+							 WHERE candidate_id = ? ORDER BY rowid DESC LIMIT 1`,
+						)
+						.pluck()
+						.get(candidateRef),
+				).toBe(initialAttemptId);
+			} finally {
+				cleanup();
+			}
+		});
+
+		it("keeps an active review attempt stable across read-only summary and detail loads", async () => {
+			let currentSnapshots = snapshots;
+			const loadSnapshots = vi.fn(async () => currentSnapshots);
+			const { app, ensureStore, cleanup } = createTestApp({
+				loadLegacyTeamConfiguredGroupSnapshots: loadSnapshots,
+			});
+			try {
+				expect((await app.request("/api/sync/team-setup/v1")).status).toBe(200);
+				const initialAttemptId = core.getLegacyTeamSetupDraft(
+					ensureStore().db,
+					candidateRef,
+				)?.attemptId;
+				expect(initialAttemptId).toBeTruthy();
+				currentSnapshots = [
+					{
+						...snapshots[0],
+						devices: snapshots[0].devices.map((device) => ({
+							...device,
+							fingerprint: "new-fingerprint",
+						})),
+					},
+				];
+				loadSnapshots.mockClear();
+
+				expect((await app.request(`/api/sync/team-setup/v1/${candidateRef}`)).status).toBe(200);
+				expect((await app.request("/api/sync/team-setup/v1")).status).toBe(200);
+				expect(core.getLegacyTeamSetupDraft(ensureStore().db, candidateRef)?.attemptId).toBe(
+					initialAttemptId,
+				);
+				expect(loadSnapshots).not.toHaveBeenCalledWith({ candidateRef });
+
+				const refreshed = await app.request(`/api/sync/team-setup/v1/${candidateRef}/refresh`, {
+					method: "POST",
+					headers: { "content-type": "application/json" },
+					body: "{}",
+				});
+				expect(refreshed.status).toBe(200);
+				expect(core.getLegacyTeamSetupDraft(ensureStore().db, candidateRef)?.attemptId).not.toBe(
+					initialAttemptId,
+				);
+				expect(loadSnapshots).toHaveBeenCalledWith({ candidateRef });
 			} finally {
 				cleanup();
 			}

@@ -1,3 +1,6 @@
+import type { Database } from "./db.js";
+import { isMigratableLegacyTeamProjectIdentity } from "./legacy-team-project-policy.js";
+
 export interface LegacyTeamProjectCanonicalPreflightInput {
 	teamId: string;
 	scopeIds: readonly string[];
@@ -5,6 +8,7 @@ export interface LegacyTeamProjectCanonicalPreflightInput {
 	projects: ReadonlyArray<{
 		sourceProjectIdentity: string;
 		resolvedProjectIdentity: string | null;
+		targetScopeId: string | null;
 	}>;
 	mappings: ReadonlyArray<{
 		workspaceIdentity: string | null;
@@ -35,10 +39,13 @@ export interface LegacyTeamProjectCanonicalPreflightInput {
  */
 export function isLegacyTeamProjectCanonicalStateValid(
 	input: LegacyTeamProjectCanonicalPreflightInput,
+	db?: Database,
 ): boolean {
 	for (const project of input.projects) {
 		const resolvedIdentity = project.resolvedProjectIdentity;
 		if (!resolvedIdentity || resolvedIdentity.startsWith("unmapped:")) return false;
+		if (!isMigratableLegacyTeamProjectIdentity(resolvedIdentity, db)) return false;
+		if (!project.targetScopeId || !input.scopeIds.includes(project.targetScopeId)) return false;
 
 		const relatedMappings = input.mappings.filter(
 			(mapping) => mapping.projectPattern === project.sourceProjectIdentity,
@@ -48,17 +55,11 @@ export function isLegacyTeamProjectCanonicalStateValid(
 				mapping.source === "reviewed_team_setup" && input.groupScopeIds.includes(mapping.scopeId);
 			return (
 				!ownSetupMapping &&
-				(!input.scopeIds.includes(mapping.scopeId) ||
+				(mapping.scopeId !== project.targetScopeId ||
 					mapping.workspaceIdentity !== resolvedIdentity)
 			);
 		});
 		if (hasConflictingMapping) return false;
-
-		const hasCurrentMapping = relatedMappings.some(
-			(mapping) =>
-				mapping.workspaceIdentity === resolvedIdentity && input.scopeIds.includes(mapping.scopeId),
-		);
-		if (!hasCurrentMapping && input.scopeIds.length > 1) return false;
 
 		const hasConflictingRecipient = input.recipients.some(
 			(recipient) =>
@@ -68,6 +69,16 @@ export function isLegacyTeamProjectCanonicalStateValid(
 					(recipient.recipientKind !== "team" && recipient.recipientKind !== "identity")),
 		);
 		if (hasConflictingRecipient) return false;
+	}
+	const targetScopesByResolvedIdentity = new Map<string, Set<string>>();
+	for (const project of input.projects) {
+		const resolvedIdentity = project.resolvedProjectIdentity as string;
+		const targetScopes = targetScopesByResolvedIdentity.get(resolvedIdentity) ?? new Set<string>();
+		targetScopes.add(project.targetScopeId as string);
+		targetScopesByResolvedIdentity.set(resolvedIdentity, targetScopes);
+	}
+	if ([...targetScopesByResolvedIdentity.values()].some((scopeIds) => scopeIds.size !== 1)) {
+		return false;
 	}
 
 	return true;

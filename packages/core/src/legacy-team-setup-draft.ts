@@ -5,11 +5,21 @@ import {
 	isValidLegacyTeamAssignmentVersion,
 	type StoredLegacyTeamAssignmentExpectation,
 } from "./legacy-team-assignment-expectation.js";
+import {
+	type LegacyTeamAttemptState,
+	planLegacyTeamAttempt,
+} from "./legacy-team-attempt-lifecycle.js";
 import { isLegacyTeamProjectCanonicalStateValid } from "./legacy-team-project-canonical-preflight.js";
+import { isMigratableLegacyTeamProjectIdentity } from "./legacy-team-project-policy.js";
 import {
 	latestLegacyTeamSetupAttempt,
 	legacyTeamSetupAttemptCurrentness,
 } from "./legacy-team-setup-attempt.js";
+import {
+	humanGroupLabelAlias,
+	safeLabel,
+	setupLabelForbiddenIds,
+} from "./legacy-team-setup-label-policy.js";
 import {
 	requireLegacyTeamSetupEffectiveDevicesWithinLimit,
 	requireLegacyTeamSetupSnapshotWithinLimits,
@@ -29,7 +39,7 @@ import {
 } from "./recipient-policy-identifiers.js";
 import { canonicalWorkspaceIdentity } from "./scope-resolution.js";
 
-export type LegacyTeamSetupDraftState = "needs_setup" | "in_progress" | "stale" | "completed";
+export type LegacyTeamSetupDraftState = LegacyTeamAttemptState;
 export type LegacyTeamDeviceDecision = "unresolved" | "included" | "excluded" | "removed";
 export type LegacyTeamProjectResolution = "unresolved" | "deterministic" | "explicit";
 export type LegacyTeamAssignmentExpectation =
@@ -50,6 +60,8 @@ export interface LegacyTeamSetupProjectInput {
 	displayName: string;
 	sourceFingerprint: string;
 	deterministicProjectIdentity: string | null;
+	/** Unique active coordinator scope evidenced for this Project and candidate. */
+	targetScopeId?: string | null;
 }
 
 export interface LegacyTeamSetupDraftSnapshotInput {
@@ -142,6 +154,7 @@ interface ProjectRow {
 	source_fingerprint: string;
 	resolution_kind: LegacyTeamProjectResolution;
 	resolved_project_identity: string | null;
+	target_scope_id: string | null;
 }
 
 function projectCanonicalStateValid(
@@ -163,7 +176,8 @@ function projectCanonicalStateValid(
 	const scopeIds = db
 		.prepare(
 			`SELECT scope_id FROM replication_scopes
-			 WHERE coordinator_id = ? AND group_id = ? AND status = 'active'
+			 WHERE coordinator_id = ? AND group_id = ? AND authority_type = 'coordinator'
+			   AND status = 'active'
 			 ORDER BY scope_id`,
 		)
 		.pluck()
@@ -188,6 +202,24 @@ function projectCanonicalStateValid(
 		scope_id: string;
 		source: string | null;
 	}>;
+	const targetScopeIdFor = (project: ProjectRow): string | null => {
+		if (project.target_scope_id) {
+			return scopeIds.includes(project.target_scope_id) ? project.target_scope_id : null;
+		}
+		const matchingScopeIds = [
+			...new Set(
+				mappings
+					.filter(
+						(mapping) =>
+							mapping.project_pattern === project.source_project_identity &&
+							mapping.workspace_identity === project.resolved_project_identity &&
+							scopeIds.includes(mapping.scope_id),
+					)
+					.map((mapping) => mapping.scope_id),
+			),
+		];
+		return matchingScopeIds.length === 1 ? (matchingScopeIds[0] ?? null) : null;
+	};
 	const recipients =
 		resolvedProjectIdentities.length === 0
 			? []
@@ -205,152 +237,30 @@ function projectCanonicalStateValid(
 					status: string;
 				}>);
 
-	return isLegacyTeamProjectCanonicalStateValid({
-		teamId: deterministicPolicyTeamId(draft.candidate_id),
-		scopeIds,
-		groupScopeIds,
-		projects: projects.map((project) => ({
-			sourceProjectIdentity: project.source_project_identity,
-			resolvedProjectIdentity: project.resolved_project_identity,
-		})),
-		mappings: mappings.map((mapping) => ({
-			workspaceIdentity: mapping.workspace_identity,
-			projectPattern: mapping.project_pattern,
-			scopeId: mapping.scope_id,
-			source: mapping.source,
-		})),
-		recipients: recipients.map((recipient) => ({
-			canonicalProjectIdentity: recipient.canonical_project_identity,
-			recipientKind: recipient.recipient_kind,
-			recipientId: recipient.recipient_id,
-			status: recipient.status,
-		})),
-	});
-}
-
-/**
- * Characters a display label may contain: letters, numbers, spaces, and a
- * small set of name punctuation. Everything else — separators (`/ \ : @ ~ $
- * %`), brackets, quotes — is what paths, URLs, endpoints, and hostnames are
- * made of, so their absence removes the entire leak surface at once.
- */
-const SAFE_LABEL_PATTERN = /^[\p{L}\p{N} '&,.()_-]*$/u;
-
-function normalizeLabelText(value: string): string {
-	return (
-		value
-			.normalize("NFKC")
-			// Format characters (zero-width joiners, bidi controls) are removed
-			// entirely so they cannot split an address or identifier into innocent
-			// halves; control characters become word separators.
-			.replace(/\p{Cf}/gu, "")
-			.replace(/\p{Cc}/gu, " ")
-			.replace(/\s+/gu, " ")
-			.trim()
-	);
-}
-
-function labelComparisonForm(value: string): string {
-	return normalizeLabelText(value).toLowerCase();
-}
-
-// A coordinator display name is affirmative evidence that a compact alphabetic
-// group slug is a human label alias. Separators, digits, long values, or a
-// mismatched display name remain opaque and stay in the redaction set.
-function humanGroupLabelAlias(groupId: string, displayName: string): string | null {
-	const comparableGroupId = labelComparisonForm(groupId);
-	if (!/^[a-z]{2,24}$/u.test(comparableGroupId)) return null;
-	return labelComparisonForm(displayName) === comparableGroupId ? comparableGroupId : null;
-}
-
-/**
- * Coordinator-supplied display labels are sanitized with an allowlist, not a
- * denylist: multiple review rounds each found one more denylisted shape (bare
- * IPs, `host:port`, dot-relative paths, rooted backslash paths), and forms
- * like `home/alice/projects` vs `50/50` or a dotless internal hostname vs a
- * product name are not separable by any pattern. Labels are display-only and
- * the fallbacks are meaningful, so the cheap failure mode is showing the
- * generic name — never exporting private topology. Anything that does not
- * match a conservative name grammar falls back:
- *
- * - NFKC-normalize first so full-width or compatibility lookalikes cannot
- *   smuggle separators past the grammar; strip every control and format
- *   character (zero-width joiners, bidi overrides) rather than only C0.
- * - Reject any character outside letters/numbers/space and `' & , . ( ) _ -`.
- * - Reject `.` squeezed between letters/numbers on both sides: that single
- *   rule removes hostnames, IPs, and dotted file names while keeping ordinary
- *   sentence punctuation like `v2 release.` intact.
- * - Reject labels embedding opaque lookup identifiers (coordinator, device,
- *   project, and non-display group references).
- */
-function safeLabel(value: string, fallback: string, forbiddenIds: ReadonlySet<string>): string {
-	const boundedValue = value.slice(0, 512);
-	const normalized = normalizeLabelText(boundedValue);
-	const sanitized = normalized.slice(0, 120).trim();
-	if (!sanitized) return fallback;
-	if (!SAFE_LABEL_PATTERN.test(sanitized)) return fallback;
-	if (/[\p{L}\p{N}]\.[\p{L}\p{N}]/u.test(sanitized)) return fallback;
-	// Key-material markers are pure letters/hyphens, so the grammar alone
-	// would keep surrounding text; fail closed on the markers themselves.
-	if (/-----|\b(?:ssh|ecdsa|sk)-[\p{L}\p{N}-]+ /iu.test(sanitized)) return fallback;
-	// Compare the complete bounded input before display truncation so an
-	// identifier cannot be hidden just past the visible label boundary.
-	const comparable = normalized.toLowerCase();
-	for (const forbiddenId of forbiddenIds) {
-		if (comparable.includes(forbiddenId)) return fallback;
-	}
-	return sanitized;
-}
-
-function setupLabelForbiddenIds(
-	contextIds: ReadonlyArray<string>,
-	groupId: string,
-	humanGroupAlias: string | null,
-	devices: ReadonlyArray<LegacyTeamSetupRosterDeviceInput>,
-	projects: ReadonlyArray<LegacyTeamSetupProjectInput>,
-	persistedDevices: ReadonlyArray<{
-		deviceId: string;
-		fingerprint: string;
-		existingIdentityId: string | null;
-		targetIdentityId: string | null;
-	}>,
-	persistedProjects: ReadonlyArray<{
-		projectRef: string;
-		sourceProjectIdentity: string;
-		sourceFingerprint: string;
-		resolvedProjectIdentity: string | null;
-	}>,
-): ReadonlySet<string> {
-	return new Set(
-		[
-			...contextIds,
-			...(humanGroupAlias ? [] : [groupId]),
-			...devices.flatMap((device) => [
-				device.deviceId,
-				device.fingerprint,
-				...(device.labelRedactionIds ?? []),
-			]),
-			...persistedDevices.flatMap((device) => [
-				device.deviceId,
-				device.fingerprint,
-				device.existingIdentityId ?? "",
-				device.targetIdentityId ?? "",
-			]),
-			...projects.flatMap((project) => [
-				project.projectRef,
-				project.sourceProjectIdentity,
-				project.sourceFingerprint,
-				project.deterministicProjectIdentity ?? "",
-			]),
-			...persistedProjects.flatMap((project) => [
-				project.projectRef,
-				project.sourceProjectIdentity,
-				project.sourceFingerprint,
-				project.resolvedProjectIdentity ?? "",
-			]),
-		]
-			.map(labelComparisonForm)
-			.filter(Boolean),
+	return isLegacyTeamProjectCanonicalStateValid(
+		{
+			teamId: deterministicPolicyTeamId(draft.candidate_id),
+			scopeIds,
+			groupScopeIds,
+			projects: projects.map((project) => ({
+				sourceProjectIdentity: project.source_project_identity,
+				resolvedProjectIdentity: project.resolved_project_identity,
+				targetScopeId: targetScopeIdFor(project),
+			})),
+			mappings: mappings.map((mapping) => ({
+				workspaceIdentity: mapping.workspace_identity,
+				projectPattern: mapping.project_pattern,
+				scopeId: mapping.scope_id,
+				source: mapping.source,
+			})),
+			recipients: recipients.map((recipient) => ({
+				canonicalProjectIdentity: recipient.canonical_project_identity,
+				recipientKind: recipient.recipient_kind,
+				recipientId: recipient.recipient_id,
+				status: recipient.status,
+			})),
+		},
+		db,
 	);
 }
 
@@ -458,12 +368,13 @@ function storedAssignmentRowMatchesLive(
  */
 export function legacyTeamProjectionFingerprint(projects: LegacyTeamSetupProjectInput[]): string {
 	return recipientPolicyDigest(
-		"legacy-team-project-inventory-v1",
+		"legacy-team-project-inventory-v2",
 		projects
 			.map((project) => ({
 				projectRef: project.projectRef,
 				sourceFingerprint: project.sourceFingerprint,
 				deterministicProjectIdentity: project.deterministicProjectIdentity,
+				targetScopeId: project.targetScopeId ?? null,
 			}))
 			.toSorted((left, right) => compareCodepoints(left.projectRef, right.projectRef)),
 	);
@@ -514,7 +425,7 @@ function createAttempt(
 		? (db
 				.prepare(
 					`SELECT project_ref, source_project_identity, display_name, source_fingerprint,
-					        resolution_kind, resolved_project_identity
+					        resolution_kind, resolved_project_identity, target_scope_id
 					 FROM legacy_team_setup_draft_projects WHERE attempt_id = ?`,
 				)
 				.all(previousAttemptId) as ProjectRow[])
@@ -565,6 +476,7 @@ function createAttempt(
 			sourceProjectIdentity: project.source_project_identity,
 			sourceFingerprint: project.source_fingerprint,
 			resolvedProjectIdentity: project.resolved_project_identity,
+			targetScopeId: project.target_scope_id,
 		})),
 	);
 	db.prepare(
@@ -646,20 +558,29 @@ function createAttempt(
 	const previousByProject = new Map(
 		previousProjects.map((project) => [project.project_ref, project]),
 	);
+	const activeGroupScopeIds = db
+		.prepare(
+			`SELECT scope_id FROM replication_scopes
+			 WHERE coordinator_id = ? AND group_id = ? AND status = 'active'
+			 ORDER BY scope_id`,
+		)
+		.pluck()
+		.all(input.coordinatorId, input.groupId) as string[];
 	const insertProject = db.prepare(
 		`INSERT INTO legacy_team_setup_draft_projects(
 			attempt_id, project_ref, source_project_identity, display_name, source_fingerprint,
-			resolution_kind, resolved_project_identity, updated_at
-		 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+			resolution_kind, resolved_project_identity, target_scope_id, updated_at
+		 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 	);
 	for (const project of input.projects) {
 		const previous = previousByProject.get(project.projectRef);
-		const resolution = project.deterministicProjectIdentity
-			? "deterministic"
-			: previous?.source_fingerprint === project.sourceFingerprint &&
-					previous.resolution_kind === "explicit"
-				? "explicit"
-				: "unresolved";
+		const resolution =
+			project.deterministicProjectIdentity && project.targetScopeId
+				? "deterministic"
+				: previous?.source_fingerprint === project.sourceFingerprint &&
+						previous.resolution_kind === "explicit"
+					? "explicit"
+					: "unresolved";
 		insertProject.run(
 			attemptId,
 			project.projectRef,
@@ -667,8 +588,14 @@ function createAttempt(
 			safeLabel(project.displayName, "Project", forbiddenIds),
 			project.sourceFingerprint,
 			resolution,
-			project.deterministicProjectIdentity ??
-				(resolution === "explicit" ? previous?.resolved_project_identity : null),
+			resolution === "deterministic"
+				? project.deterministicProjectIdentity
+				: resolution === "explicit"
+					? previous?.resolved_project_identity
+					: null,
+			project.targetScopeId === undefined && activeGroupScopeIds.length === 1
+				? (activeGroupScopeIds[0] ?? null)
+				: (project.targetScopeId ?? null),
 			now,
 		);
 	}
@@ -708,7 +635,7 @@ function loadDraftView(db: Database, attemptId: string): LegacyTeamSetupDraftVie
 	const projectRows = db
 		.prepare(
 			`SELECT project_ref, source_project_identity, display_name, source_fingerprint, resolution_kind,
-			        resolved_project_identity
+			        resolved_project_identity, target_scope_id
 			 FROM legacy_team_setup_draft_projects WHERE attempt_id = ? ORDER BY project_ref`,
 		)
 		.all(attemptId) as ProjectRow[];
@@ -763,6 +690,7 @@ function loadDraftView(db: Database, attemptId: string): LegacyTeamSetupDraftVie
 			projectRef: row.project_ref,
 			resolution: row.resolution_kind,
 			resolvedProjectIdentity: row.resolved_project_identity,
+			targetScopeId: row.target_scope_id,
 		})),
 	});
 	const reviewComplete =
@@ -899,6 +827,25 @@ export function refreshLegacyTeamSetupDraft(
 	requireLegacyTeamSetupSnapshotWithinLimits(input);
 	const now = validatedNow(input.now);
 	const refresh = db.transaction(() => {
+		const activeGroupScopeIds = db
+			.prepare(
+				`SELECT scope_id FROM replication_scopes
+				 WHERE coordinator_id = ? AND group_id = ? AND authority_type = 'coordinator'
+				   AND status = 'active'
+				 ORDER BY scope_id`,
+			)
+			.pluck()
+			.all(input.coordinatorId, input.groupId) as string[];
+		const normalizedInput: LegacyTeamSetupDraftSnapshotInput = {
+			...input,
+			projects: input.projects.map((project) => ({
+				...project,
+				targetScopeId:
+					project.targetScopeId === undefined && activeGroupScopeIds.length === 1
+						? (activeGroupScopeIds[0] ?? null)
+						: (project.targetScopeId ?? null),
+			})),
+		};
 		const existing = currentDraft(db, input.candidateId);
 		requireLegacyTeamSetupEffectiveDevicesWithinLimit(
 			db,
@@ -919,17 +866,21 @@ export function refreshLegacyTeamSetupDraft(
 			identityId: assignment?.active ? assignment.identityId : null,
 		}));
 		const rosterFingerprint = legacyTeamRosterFingerprint(assignments);
-		const projectFingerprint = legacyTeamProjectionFingerprint(input.projects);
-		if (
-			existing &&
-			(existing.state === "needs_setup" || existing.state === "in_progress") &&
+		const projectFingerprint = legacyTeamProjectionFingerprint(normalizedInput.projects);
+		const evidenceMatches =
+			existing != null &&
 			existing.roster_fingerprint === rosterFingerprint &&
 			existing.projection_fingerprint === projectFingerprint &&
-			storedAssignmentEvidenceMatches(db, existing.attempt_id, assignmentSnapshots)
-		) {
-			return refreshLegacyTeamSetupDraftLabels(db, existing.attempt_id, input);
+			storedAssignmentEvidenceMatches(db, existing.attempt_id, assignmentSnapshots);
+		const plan = planLegacyTeamAttempt({
+			state: existing?.state ?? null,
+			evidenceMatches,
+			completionReady: false,
+		});
+		if (plan.kind === "reuse" && existing) {
+			return refreshLegacyTeamSetupDraftLabels(db, existing.attempt_id, normalizedInput);
 		}
-		if (existing && (existing.state === "needs_setup" || existing.state === "in_progress")) {
+		if (existing && existing.state !== "completed") {
 			db.prepare(
 				`UPDATE legacy_team_setup_drafts
 				 SET state = 'stale', superseded_at = ?, updated_at = ?
@@ -945,7 +896,7 @@ export function refreshLegacyTeamSetupDraft(
 		}
 		const attemptId = createAttempt(
 			db,
-			input,
+			normalizedInput,
 			rosterFingerprint,
 			projectFingerprint,
 			existing?.attempt_id ?? null,
@@ -1007,7 +958,7 @@ export function refreshLegacyTeamSetupDraftLabels(
 		const persistedProjects = db
 			.prepare(
 				`SELECT project_ref, source_project_identity, display_name, source_fingerprint,
-				        resolved_project_identity
+				        resolved_project_identity, target_scope_id
 				 FROM legacy_team_setup_draft_projects WHERE attempt_id = ?`,
 			)
 			.all(attemptId) as Array<{
@@ -1016,6 +967,7 @@ export function refreshLegacyTeamSetupDraftLabels(
 			display_name: string;
 			source_fingerprint: string;
 			resolved_project_identity: string | null;
+			target_scope_id: string | null;
 		}>;
 		const forbiddenIds = setupLabelForbiddenIds(
 			[...contextIds, ...liveAssignmentIds],
@@ -1034,32 +986,28 @@ export function refreshLegacyTeamSetupDraftLabels(
 				sourceProjectIdentity: project.source_project_identity,
 				sourceFingerprint: project.source_fingerprint,
 				resolvedProjectIdentity: project.resolved_project_identity,
+				targetScopeId: project.target_scope_id,
 			})),
 		);
-		const result = db
-			.prepare(
-				"UPDATE legacy_team_setup_drafts SET display_name = ?, updated_at = ? WHERE attempt_id = ?",
-			)
-			.run(safeLabel(input.displayName, "Legacy Team", forbiddenIds), now, attemptId);
-		if (result.changes !== 1) throw new Error("legacy_team_setup_draft_not_found");
+		const teamDisplayName = safeLabel(input.displayName, "Legacy Team", forbiddenIds);
+		db.prepare(
+			`UPDATE legacy_team_setup_drafts SET display_name = ?, updated_at = ?
+				 WHERE attempt_id = ? AND display_name <> ?`,
+		).run(teamDisplayName, now, attemptId, teamDisplayName);
 		const updateDevice = db.prepare(
 			`UPDATE legacy_team_setup_draft_devices SET display_name = ?, updated_at = ?
-			 WHERE attempt_id = ? AND device_id = ?`,
+			 WHERE attempt_id = ? AND device_id = ? AND display_name <> ?`,
 		);
 		const inputDeviceById = new Map(input.devices.map((device) => [device.deviceId, device]));
 		for (const persistedDevice of persistedDevices) {
 			const displayName =
 				inputDeviceById.get(persistedDevice.device_id)?.displayName ?? persistedDevice.display_name;
-			updateDevice.run(
-				safeLabel(displayName, "Device", forbiddenIds),
-				now,
-				attemptId,
-				persistedDevice.device_id,
-			);
+			const safeDisplayName = safeLabel(displayName, "Device", forbiddenIds);
+			updateDevice.run(safeDisplayName, now, attemptId, persistedDevice.device_id, safeDisplayName);
 		}
 		const updateProject = db.prepare(
 			`UPDATE legacy_team_setup_draft_projects SET display_name = ?, updated_at = ?
-			 WHERE attempt_id = ? AND project_ref = ?`,
+			 WHERE attempt_id = ? AND project_ref = ? AND display_name <> ?`,
 		);
 		const inputProjectByRef = new Map(
 			input.projects.map((project) => [project.projectRef, project]),
@@ -1068,11 +1016,13 @@ export function refreshLegacyTeamSetupDraftLabels(
 			const displayName =
 				inputProjectByRef.get(persistedProject.project_ref)?.displayName ??
 				persistedProject.display_name;
+			const safeDisplayName = safeLabel(displayName, "Project", forbiddenIds);
 			updateProject.run(
-				safeLabel(displayName, "Project", forbiddenIds),
+				safeDisplayName,
 				now,
 				attemptId,
 				persistedProject.project_ref,
+				safeDisplayName,
 			);
 		}
 		return loadDraftView(db, attemptId);
@@ -1283,7 +1233,7 @@ export function clearLegacyTeamSetupDeviceDecision(
 	return clearDecision.immediate();
 }
 
-export function isLegacyTeamSetupProjectMappingIdentity(value: string): boolean {
+export function isLegacyTeamSetupProjectMappingIdentity(value: string, db?: Database): boolean {
 	const identity = value.trim();
 	// The repair target becomes a mapping workspace identity and an active
 	// recipient edge at activation; anything that is not itself a shareable
@@ -1309,6 +1259,7 @@ export function isLegacyTeamSetupProjectMappingIdentity(value: string): boolean 
 	return !(
 		!isStrictRecipientPolicyProjectIdentity(identity) ||
 		identity.startsWith("unmapped:") ||
+		!isMigratableLegacyTeamProjectIdentity(identity, db) ||
 		/\s/u.test(identity) ||
 		(/[/\\]/u.test(identity) && !isRemoteForm) ||
 		/^(?:[~.$%]|[A-Za-z]:[\\/])/.test(identity) ||
@@ -1326,7 +1277,7 @@ export function setLegacyTeamSetupProjectMapping(
 	},
 ): LegacyTeamSetupDraftView {
 	const identity = input.resolvedProjectIdentity.trim();
-	if (!isLegacyTeamSetupProjectMappingIdentity(identity)) {
+	if (!isLegacyTeamSetupProjectMappingIdentity(identity, db)) {
 		throw new Error("legacy_team_setup_project_mapping_invalid");
 	}
 	const now = validatedNow(input.now);
@@ -1334,11 +1285,19 @@ export function setLegacyTeamSetupProjectMapping(
 		requireMutableAttempt(db, input.attemptId);
 		const project = db
 			.prepare(
-				`SELECT resolution_kind FROM legacy_team_setup_draft_projects
-				 WHERE attempt_id = ? AND project_ref = ?`,
+				`SELECT project.resolution_kind, project.target_scope_id,
+				        draft.coordinator_id, draft.group_id
+				 FROM legacy_team_setup_draft_projects project
+				 JOIN legacy_team_setup_drafts draft ON draft.attempt_id = project.attempt_id
+				 WHERE project.attempt_id = ? AND project.project_ref = ?`,
 			)
 			.get(input.attemptId, input.projectRef) as
-			| { resolution_kind: LegacyTeamProjectResolution }
+			| {
+					resolution_kind: LegacyTeamProjectResolution;
+					target_scope_id: string | null;
+					coordinator_id: string;
+					group_id: string;
+			  }
 			| undefined;
 		if (!project) throw new Error("legacy_team_setup_project_not_found");
 		// Explicit repair is only for ambiguous Projects; a deterministic source
@@ -1346,13 +1305,28 @@ export function setLegacyTeamSetupProjectMapping(
 		if (project.resolution_kind === "deterministic") {
 			throw new Error("legacy_team_setup_project_not_ambiguous");
 		}
+		const mappedScopeIds = db
+			.prepare(
+				`SELECT DISTINCT mapping.scope_id
+				 FROM project_scope_mappings mapping
+				 JOIN replication_scopes scope ON scope.scope_id = mapping.scope_id
+				 WHERE mapping.workspace_identity = ?
+				   AND scope.coordinator_id = ? AND scope.group_id = ?
+				   AND scope.authority_type = 'coordinator' AND scope.status = 'active'
+				 ORDER BY mapping.scope_id`,
+			)
+			.pluck()
+			.all(identity, project.coordinator_id, project.group_id) as string[];
+		const targetScopeId =
+			project.target_scope_id ?? (mappedScopeIds.length === 1 ? (mappedScopeIds[0] ?? null) : null);
 		const result = db
 			.prepare(
 				`UPDATE legacy_team_setup_draft_projects
-				 SET resolution_kind = 'explicit', resolved_project_identity = ?, updated_at = ?
+				 SET resolution_kind = 'explicit', resolved_project_identity = ?, target_scope_id = ?,
+				     updated_at = ?
 				 WHERE attempt_id = ? AND project_ref = ?`,
 			)
-			.run(identity, now, input.attemptId, input.projectRef);
+			.run(identity, targetScopeId, now, input.attemptId, input.projectRef);
 		if (result.changes !== 1) throw new Error("legacy_team_setup_project_not_found");
 		db.prepare(
 			`UPDATE legacy_team_setup_drafts SET state = 'in_progress', updated_at = ? WHERE attempt_id = ?`,

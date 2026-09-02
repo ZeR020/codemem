@@ -34,6 +34,11 @@ CREATE TABLE IF NOT EXISTS request_nonces (
   PRIMARY KEY (device_id, nonce)
 );
 
+-- Keeps the per-request expiry sweep off a full table scan; see migration
+-- 0014_add_request_nonces_created_at_index.sql.
+CREATE INDEX IF NOT EXISTS idx_request_nonces_created_at
+ON request_nonces(created_at);
+
 CREATE TABLE IF NOT EXISTS coordinator_invites (
   invite_id TEXT PRIMARY KEY,
   group_id TEXT NOT NULL,
@@ -75,6 +80,11 @@ ON coordinator_invites(operation_id) WHERE operation_id IS NOT NULL;
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_coordinator_invites_token_digest
 ON coordinator_invites(token_digest) WHERE token_digest IS NOT NULL;
+
+-- Serves listInvites' group filter and created_at ordering from one seek; see
+-- migration 0015_add_coordinator_invites_group_created_index.sql.
+CREATE INDEX IF NOT EXISTS idx_coordinator_invites_group_created
+ON coordinator_invites(group_id, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS coordinator_join_requests (
   request_id TEXT PRIMARY KEY,

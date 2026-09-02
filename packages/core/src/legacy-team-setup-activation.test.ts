@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { discoverLegacyTeamCandidates } from "./legacy-team-candidate.js";
 import {
 	finishLegacyTeamSetupActivation,
+	inspectLegacyTeamSetupActivation,
 	previewLegacyTeamSetupActivation,
 } from "./legacy-team-setup-activation.js";
 import { latestLegacyTeamSetupAttempt } from "./legacy-team-setup-attempt.js";
@@ -48,6 +49,7 @@ function snapshot() {
 				displayName: "API",
 				sourceFingerprint: "source-a",
 				deterministicProjectIdentity: PROJECT_A,
+				targetScopeId: "scope-engineering",
 			},
 			{
 				projectRef: "project-ref-b",
@@ -55,6 +57,7 @@ function snapshot() {
 				displayName: "Web",
 				sourceFingerprint: "source-b",
 				deterministicProjectIdentity: null,
+				targetScopeId: "scope-engineering",
 			},
 		],
 		now: NOW,
@@ -89,8 +92,8 @@ describe("legacy Team setup activation", () => {
 
 	afterEach(() => db.close());
 
-	function readyDraft(): ReadyDraft {
-		let draft = refreshLegacyTeamSetupDraft(db, snapshot());
+	function readyDraft(input = snapshot()): ReadyDraft {
+		let draft = refreshLegacyTeamSetupDraft(db, input);
 		for (const device of draft.devices) {
 			const identityId =
 				device.displayName === "Laptop"
@@ -136,7 +139,7 @@ describe("legacy Team setup activation", () => {
 			db
 				.prepare(
 					`SELECT project_ref, source_project_identity, display_name, source_fingerprint,
-					        resolution_kind, resolved_project_identity
+					        resolution_kind, resolved_project_identity, target_scope_id
 					 FROM legacy_team_setup_draft_projects WHERE attempt_id = ?`,
 				)
 				.all(attemptId) as Array<{
@@ -146,6 +149,7 @@ describe("legacy Team setup activation", () => {
 				source_fingerprint: string;
 				resolution_kind: string;
 				resolved_project_identity: string | null;
+				target_scope_id: string | null;
 			}>
 		).map((row) => ({
 			projectRef: row.project_ref,
@@ -154,6 +158,7 @@ describe("legacy Team setup activation", () => {
 			sourceFingerprint: row.source_fingerprint,
 			deterministicProjectIdentity:
 				row.resolution_kind === "deterministic" ? row.resolved_project_identity : null,
+			targetScopeId: row.target_scope_id,
 		}));
 	}
 
@@ -533,6 +538,25 @@ describe("legacy Team setup activation", () => {
 		expect(operation).toThrow("team_setup_incomplete");
 		expect(db.prepare("SELECT COUNT(*) FROM policy_teams").pluck().get()).toBe(0);
 		expect(db.prepare("SELECT COUNT(*) FROM identity_devices").pluck().get()).toBe(0);
+	});
+
+	it("keeps read-only inspection from persisting activation errors", () => {
+		const draft = refreshLegacyTeamSetupDraft(db, snapshot());
+		const input = { candidateRef: draft.candidateRef, attemptId: draft.attemptId };
+
+		expect(() => inspectLegacyTeamSetupActivation(db, input)).toThrow("team_setup_incomplete");
+		expect(
+			db
+				.prepare("SELECT state, safe_error_code FROM legacy_team_setup_drafts WHERE attempt_id = ?")
+				.get(draft.attemptId),
+		).toEqual({ state: "needs_setup", safe_error_code: null });
+
+		expect(() => previewLegacyTeamSetupActivation(db, input)).toThrow("team_setup_incomplete");
+		expect(
+			db
+				.prepare("SELECT state, safe_error_code FROM legacy_team_setup_drafts WHERE attempt_id = ?")
+				.get(draft.attemptId),
+		).toEqual({ state: "needs_setup", safe_error_code: "team_setup_incomplete" });
 	});
 
 	it.each([
@@ -1357,7 +1381,15 @@ describe("legacy Team setup activation", () => {
 			 workspace_identity, project_pattern, scope_id, priority, source, created_at, updated_at
 			 ) VALUES (?, 'unmapped:web', 'scope-engineering-2', 1000, 'user', ?, ?)`,
 		).run(PROJECT_B, NOW, NOW);
-		const draft = readyDraft();
+		const current = snapshot();
+		const draft = readyDraft({
+			...current,
+			projects: current.projects.map((project) => ({
+				...project,
+				targetScopeId:
+					project.projectRef === "project-ref-b" ? "scope-engineering-2" : project.targetScopeId,
+			})),
+		});
 
 		// Act
 		const result = await finish(draft);
@@ -1907,6 +1939,26 @@ describe("legacy Team setup activation", () => {
 		).toBe(0);
 	});
 
+	it("accepts a normalized exact mapping already targeting the reviewed scope", async () => {
+		db.prepare(
+			`INSERT INTO project_scope_mappings(
+			 workspace_identity, project_pattern, scope_id, priority, source, created_at, updated_at
+			 ) VALUES (?, ?, 'scope-engineering', 5000, 'test', ?, ?)`,
+		).run(`${PROJECT_B}/`, "older-exact-pattern", NOW, NOW);
+		const draft = readyDraft();
+
+		await expect(finish(draft)).resolves.toMatchObject({ status: "completed" });
+		expect(
+			db
+				.prepare(
+					`SELECT COUNT(*) FROM project_recipients
+					 WHERE canonical_project_identity = ? AND status = 'active'`,
+				)
+				.pluck()
+				.get(PROJECT_B),
+		).toBe(1);
+	});
+
 	it("reads as Ready in candidate discovery after activation completes", async () => {
 		// Arrange: the full seam — activation writes assignments, mappings
 		// (including an explicit unmapped resolution), recipients, and the
@@ -2034,7 +2086,7 @@ describe("legacy Team setup activation", () => {
 		).toEqual({ status: "reviewed_active", provenance: "coordinator_invite" });
 	});
 
-	it("invalidates the confirmation when the group's active scope set changes", async () => {
+	it("blocks activation when the reviewed target scope is no longer active", async () => {
 		// Arrange
 		const draft = readyDraft();
 		const review = preview(draft);
@@ -2053,7 +2105,7 @@ describe("legacy Team setup activation", () => {
 		const operation = finish(draft, review);
 
 		// Assert
-		await expect(operation).rejects.toThrow("team_setup_confirmation_stale");
+		await expect(operation).rejects.toThrow("team_setup_conflict");
 		expect(db.prepare("SELECT COUNT(*) FROM policy_teams").pluck().get()).toBe(0);
 	});
 

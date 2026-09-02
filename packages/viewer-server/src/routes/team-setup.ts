@@ -12,10 +12,12 @@ import {
 	clearLegacyTeamSetupDeviceDecision,
 	coordinatorListDevicesAction,
 	coordinatorListGroupsAction,
+	deterministicPolicyTeamId,
 	discoverLegacyTeamCandidates,
 	fingerprintPublicKey,
 	finishLegacyTeamSetupActivation,
 	getLegacyTeamSetupDraft,
+	inspectLegacyTeamSetupActivation,
 	isLegacyTeamCandidateSelectable,
 	isLegacyTeamSetupProjectMappingIdentity,
 	legacyTeamCandidateId,
@@ -34,6 +36,37 @@ import {
 	setLegacyTeamSetupProjectMapping,
 } from "@codemem/core";
 import { type Context, Hono } from "hono";
+import {
+	type LegacyTeamSetupCandidateSummaryV1,
+	type LegacyTeamSetupDetailResponseV1,
+	type LegacyTeamSetupDeviceV1,
+	type LegacyTeamSetupFinishResponseV1,
+	type LegacyTeamSetupIdentityChoiceV1,
+	type LegacyTeamSetupPendingCandidateSummaryV1,
+	type LegacyTeamSetupProjectV1,
+	type LegacyTeamSetupSummaryResponseV1,
+	type LegacyTeamSetupUnavailableReasonV1,
+	type LegacyTeamSetupViewerAccessDeltaV1,
+	projectLegacyTeamSetupView,
+} from "./team-setup-view.js";
+
+export type {
+	LegacyTeamSetupActionBlockedReasonV1,
+	LegacyTeamSetupActionGateV1,
+	LegacyTeamSetupCandidateSummaryV1,
+	LegacyTeamSetupDetailResponseV1,
+	LegacyTeamSetupDeviceV1,
+	LegacyTeamSetupErrorResponseV1,
+	LegacyTeamSetupFinishResponseV1,
+	LegacyTeamSetupIdentityChoiceV1,
+	LegacyTeamSetupMutationResponseV1,
+	LegacyTeamSetupPendingCandidateSummaryV1,
+	LegacyTeamSetupProjectV1,
+	LegacyTeamSetupSummaryResponseV1,
+	LegacyTeamSetupUnavailableReasonV1,
+	LegacyTeamSetupViewerAccessDeltaV1,
+	LegacyTeamSetupViewV1,
+} from "./team-setup-view.js";
 
 const TEAM_SETUP_VERSION = 1 as const;
 const MAX_CONFIGURED_GROUPS = 25;
@@ -49,6 +82,7 @@ const MAX_PROJECT_MAPPING_SCAN_ROWS = 10_000;
 const MAX_PROJECT_MAPPING_METADATA_ROWS = 10_000;
 const MAX_MUTATION_BODY_BYTES = 8_192;
 const SUMMARY_SNAPSHOT_CACHE_TTL_MS = 30_000;
+const COORDINATOR_ROSTER_READ_BUDGET_MS = 60_000;
 export const TEAM_SETUP_ROUTE_PREFIX = "/api/sync/team-setup/v1";
 const CANDIDATE_REF_PATTERN = /^legacy-team-candidate:[0-9a-f]{32}$/u;
 const DEVICE_REF_PATTERN = /^legacy-team-device-ref-v1:[0-9a-f]{64}$/u;
@@ -72,141 +106,6 @@ export interface LegacyTeamCandidateGroupDescriptor {
 export type LegacyTeamConfiguredGroupSnapshotLoader = (
 	options?: LegacyTeamConfiguredGroupSnapshotLoadOptions,
 ) => Promise<LegacyTeamConfiguredGroupSnapshot[]>;
-
-export interface LegacyTeamSetupCandidateSummaryV1 {
-	candidateRef: string;
-	displayName: string;
-	status: "needs_setup" | "in_progress" | "stale" | "ready";
-	deviceCount: number;
-	projectCount: number;
-	unresolvedDeviceCount: number;
-	unresolvedProjectCount: number;
-}
-
-export interface LegacyTeamSetupSummaryResponseV1 {
-	version: 1;
-	candidates: LegacyTeamSetupCandidateSummaryV1[];
-}
-
-export interface LegacyTeamSetupDeviceV1 {
-	deviceRef: string;
-	displayName: string;
-	enabled: boolean;
-	existingIdentityRef: string | null;
-	suggestedIdentityRef: string | null;
-	verifiedEvidenceKind: "active_assignment" | null;
-	decision: "unresolved" | "included" | "excluded" | "removed";
-	targetIdentityRef: string | null;
-	expectation:
-		| { kind: "absent" }
-		| { kind: "existing"; assignmentVersion: number; identityRef: string };
-}
-
-export interface LegacyTeamSetupProjectV1 {
-	projectRef: string;
-	displayName: string;
-	resolution: "unresolved" | "deterministic" | "explicit";
-	canonicalProjectRef: string | null;
-	resolvedProjectRef: string | null;
-	mappingChoices: Array<{ resolvedProjectRef: string; displayName: string }>;
-}
-
-export interface LegacyTeamSetupIdentityChoiceV1 {
-	identityRef: string;
-	displayName: string;
-}
-
-export interface LegacyTeamSetupViewerAccessDeltaV1 {
-	teamChanges: Array<{
-		teamRef: string;
-		teamDisplayName: string;
-		change: "add" | "update" | "remove";
-		fromDeviceEligibilityMode: "person_all_devices" | "reviewed_allowlist" | null;
-		toDeviceEligibilityMode: "reviewed_allowlist";
-	}>;
-	membershipChanges: Array<{
-		teamRef: string;
-		teamDisplayName: string;
-		identityRef: string;
-		identityDisplayName: string;
-		change: "add" | "update" | "remove";
-	}>;
-	projectChanges: Array<{
-		projectRef: string;
-		projectDisplayName: string;
-		fromResolvedProjectRef: string | null;
-		fromResolvedProjectDisplayName: string | null;
-		toResolvedProjectRef: string | null;
-		toResolvedProjectDisplayName: string | null;
-		change: "add" | "update" | "remove";
-	}>;
-	recipientChanges: Array<{
-		canonicalProjectRef: string;
-		canonicalProjectDisplayName: string;
-		recipientKind: "team";
-		recipientRef: string;
-		recipientDisplayName: string;
-		change: "add" | "update" | "remove";
-	}>;
-	deviceAccessChanges: Array<{
-		canonicalProjectRef: string;
-		canonicalProjectDisplayName: string;
-		deviceRef: string;
-		deviceDisplayName: string;
-		change: "add" | "remove";
-	}>;
-}
-
-interface LegacyTeamSetupDetailBaseV1 {
-	version: 1;
-	candidate: LegacyTeamSetupCandidateSummaryV1;
-	attemptId: string;
-	draftState: "needs_setup" | "in_progress" | "stale" | "completed";
-	unresolvedDeviceCount: number;
-	unresolvedProjectCount: number;
-	devices: LegacyTeamSetupDeviceV1[];
-	projects: LegacyTeamSetupProjectV1[];
-	identityChoices: LegacyTeamSetupIdentityChoiceV1[];
-}
-
-export type LegacyTeamSetupDetailResponseV1 = LegacyTeamSetupDetailBaseV1 &
-	(
-		| {
-				canFinish: true;
-				conflictState: null;
-				finishDigest: string;
-				accessDeltaDigest: string;
-				viewerAccessDeltaDigest: string;
-				accessDelta: LegacyTeamSetupViewerAccessDeltaV1;
-		  }
-		| {
-				canFinish: false;
-				conflictState: LegacyTeamSetupActivationErrorCode | null;
-		  }
-	);
-
-export interface LegacyTeamSetupErrorResponseV1 {
-	error: LegacyTeamSetupActivationErrorCode;
-}
-
-export interface LegacyTeamSetupMutationResponseV1 {
-	version: 1;
-	candidateRef: string;
-	attemptId: string;
-	draftState: LegacyTeamSetupDraftView["state"];
-	canFinish: boolean;
-	unresolvedDeviceCount: number;
-	unresolvedProjectCount: number;
-}
-
-export interface LegacyTeamSetupFinishResponseV1 {
-	version: 1;
-	status: "completed";
-	teamRef: string;
-	attemptId: string;
-	accessDeltaDigest: string;
-	completedAt: string;
-}
 
 export interface TeamSetupRoutesOptions {
 	getStore: () => MemoryStore;
@@ -233,6 +132,39 @@ function safeCoordinatorError(): Error {
 
 function isCoordinatorRosterTooLargeError(error: unknown): boolean {
 	return error instanceof Error && error.message === "coordinator_response_too_large";
+}
+
+function isTransientCoordinatorReadError(error: unknown): boolean {
+	if (!(error instanceof Error)) return false;
+	const remoteStatus = /Remote coordinator request failed \((\d{3})\):/u.exec(error.message)?.[1];
+	if (remoteStatus) return ["408", "429", "500", "502", "503", "504"].includes(remoteStatus);
+	return (
+		error.name === "TimeoutError" ||
+		error.name === "AbortError" ||
+		/request_timeout|fetch failed|timed out|timeout/iu.test(error.message)
+	);
+}
+
+async function retryTransientCoordinatorRead<T>(
+	read: (timeoutS: number) => Promise<T>,
+	configuredTimeoutS: number,
+	deadlineMs: number,
+): Promise<T> {
+	let lastError: unknown;
+	for (let attempt = 0; attempt < 8; attempt += 1) {
+		const remainingMs = deadlineMs - Date.now();
+		if (remainingMs <= 0) throw lastError ?? safeCoordinatorError();
+		try {
+			return await read(Math.max(0.1, Math.min(configuredTimeoutS, remainingMs / 1_000)));
+		} catch (error) {
+			lastError = error;
+			if (!isTransientCoordinatorReadError(error) || attempt === 7) throw error;
+			const delayMs = Math.min(100 * 2 ** attempt, 2_000, deadlineMs - Date.now());
+			if (delayMs <= 0) throw error;
+			await new Promise((resolve) => setTimeout(resolve, delayMs));
+		}
+	}
+	throw lastError;
 }
 
 function configuredGroupIds(groups: string[]): string[] {
@@ -398,18 +330,24 @@ async function loadConfiguredLegacyTeamGroupSnapshotsWith(
 		);
 		if (groupDescriptors.length === 0) throw safeCoordinatorError();
 		const timeoutS = Math.max(1, config.syncCoordinatorTimeoutS);
+		const deadlineMs = Date.now() + COORDINATOR_ROSTER_READ_BUDGET_MS;
 		const requestedGroupDescriptors = options.candidateRef
 			? groupDescriptors.filter(
 					({ coordinatorId, groupId }) =>
 						legacyTeamCandidateId(coordinatorId, groupId) === options.candidateRef,
 				)
 			: groupDescriptors;
-		const groups = await dependencies.listGroups({
-			remoteUrl,
-			adminSecret: config.syncCoordinatorAdminSecret,
-			includeArchived: false,
+		const groups = await retryTransientCoordinatorRead(
+			(attemptTimeoutS) =>
+				dependencies.listGroups({
+					remoteUrl,
+					adminSecret: config.syncCoordinatorAdminSecret,
+					includeArchived: false,
+					timeoutS: attemptTimeoutS,
+				}),
 			timeoutS,
-		});
+			deadlineMs,
+		);
 		const groupById = new Map(groups.map((group) => [group.group_id, group]));
 		const outcomes = await Promise.all(
 			requestedGroupDescriptors.map(async ({ coordinatorId, groupId }) => {
@@ -429,13 +367,18 @@ async function loadConfiguredLegacyTeamGroupSnapshotsWith(
 				}
 				let devices: Awaited<ReturnType<typeof coordinatorListDevicesAction>>;
 				try {
-					devices = await dependencies.listDevices({
-						groupId,
-						includeDisabled: true,
-						remoteUrl,
-						adminSecret: config.syncCoordinatorAdminSecret,
+					devices = await retryTransientCoordinatorRead(
+						(attemptTimeoutS) =>
+							dependencies.listDevices({
+								groupId,
+								includeDisabled: true,
+								remoteUrl,
+								adminSecret: config.syncCoordinatorAdminSecret,
+								timeoutS: attemptTimeoutS,
+							}),
 						timeoutS,
-					});
+						deadlineMs,
+					);
 				} catch (error) {
 					if (!options.candidateRef) return { kind: "unavailable" as const };
 					if (isCoordinatorRosterTooLargeError(error)) {
@@ -534,16 +477,58 @@ function candidateSummaryForDraft(
 	};
 }
 
-function completedCandidateFromDraft(draft: LegacyTeamSetupDraftView): LegacyTeamCandidateView {
+function candidateFromDraft(draft: LegacyTeamSetupDraftView): LegacyTeamCandidateView {
 	return {
 		candidateRef: draft.candidateRef,
 		displayName: draft.displayName,
-		status: "ready",
+		status: draft.state === "completed" ? "ready" : draft.state,
 		deviceCount: draft.devices.length,
 		projectCount: draft.projects.length,
 		unresolvedDeviceCount: draft.unresolvedDeviceCount,
 		unresolvedProjectCount: draft.unresolvedProjectCount,
 	};
+}
+
+function readPureCandidateViews(
+	store: MemoryStore,
+	groups: LegacyTeamConfiguredGroupSnapshot[],
+): LegacyTeamCandidateView[] {
+	const existing: LegacyTeamCandidateView[] = [];
+	const discoverable: LegacyTeamConfiguredGroupSnapshot[] = [];
+	for (const group of groups) {
+		const candidateRef = legacyTeamCandidateId(group.coordinatorId, group.groupId);
+		const draft = getLegacyTeamSetupDraft(store.db, candidateRef);
+		if (hasCompletedLegacyTeamSetup(store, candidateRef)) {
+			// Only canonical terminal completions pass through discovery: they can
+			// reconcile missing setup recipient edges while preserving newer drafts.
+			if (isLegacyTeamCandidateSelectable(store.db, candidateRef)) discoverable.push(group);
+			continue;
+		}
+		if (!draft || draft.state === "completed") {
+			discoverable.push(group);
+			continue;
+		}
+		existing.push(candidateFromDraft(draft));
+	}
+	return [...existing, ...discoverCandidates(store, discoverable)]
+		.filter((candidate) => !hasCompletedLegacyTeamSetup(store, candidate.candidateRef))
+		.toSorted((left, right) =>
+			left.candidateRef < right.candidateRef ? -1 : left.candidateRef > right.candidateRef ? 1 : 0,
+		);
+}
+
+function hasCompletedLegacyTeamSetup(store: MemoryStore, candidateRef: string): boolean {
+	return Boolean(
+		store.db
+			.prepare(
+				`SELECT 1 FROM policy_teams
+				 WHERE team_id = ? AND status = 'active'
+				   AND provenance = 'reviewed_team_candidate'
+				   AND migration_state = 'completed' LIMIT 1`,
+			)
+			.pluck()
+			.get(deterministicPolicyTeamId(candidateRef)),
+	);
 }
 
 function identityRef(candidateRef: string, identityId: string | null): string | null {
@@ -569,8 +554,8 @@ function viewerSafeAccessDelta(
 	delta: LegacyTeamSetupAccessDeltaV1,
 	labels?: {
 		teamDisplayName: string;
-		devices: LegacyTeamSetupDeviceV1[];
-		projects: LegacyTeamSetupProjectV1[];
+		devices: Array<Omit<LegacyTeamSetupDeviceV1, "actions">>;
+		projects: Array<Omit<LegacyTeamSetupProjectV1, "actions">>;
 		identityChoices: LegacyTeamSetupIdentityChoiceV1[];
 	},
 ): LegacyTeamSetupViewerAccessDeltaV1 {
@@ -614,6 +599,15 @@ function viewerSafeAccessDelta(
 		labels?.identityChoices.map((identity) => [identity.identityRef, identity]),
 	);
 	const devicesByRef = new Map(labels?.devices.map((device) => [device.deviceRef, device]));
+	const canonicalProjectPresentation = (identity: string, ref: string) => {
+		if (identity === "shared:default") {
+			return { displayName: "Legacy default sharing", kind: "legacy_default_sharing" as const };
+		}
+		return {
+			displayName: projectsByCanonicalRef.get(ref)?.displayName ?? fallbackLabel("Project", ref),
+			kind: "project" as const,
+		};
+	};
 	const resolvedDisplayName = (projectRef: string, ref: string | null): string | null => {
 		if (!ref) return null;
 		const project = projectsByRef.get(projectRef);
@@ -653,8 +647,14 @@ function viewerSafeAccessDelta(
 				projectDisplayName:
 					projectsByRef.get(change.projectRef)?.displayName ??
 					fallbackLabel("Project", change.projectRef),
+				fromCanonicalProjectRef: change.fromProjectIdentity
+					? legacyTeamCanonicalProjectRef(candidateRef, change.fromProjectIdentity)
+					: null,
 				fromResolvedProjectRef: fromRef,
 				fromResolvedProjectDisplayName: resolvedDisplayName(change.projectRef, fromRef),
+				toCanonicalProjectRef: change.toProjectIdentity
+					? legacyTeamCanonicalProjectRef(candidateRef, change.toProjectIdentity)
+					: null,
 				toResolvedProjectRef: toRef,
 				toResolvedProjectDisplayName: resolvedDisplayName(change.projectRef, toRef),
 				change: change.change,
@@ -666,11 +666,14 @@ function viewerSafeAccessDelta(
 				change.canonicalProjectIdentity,
 			);
 			const recipientRef = teamRef(candidateRef, change.recipientId);
+			const projectPresentation = canonicalProjectPresentation(
+				change.canonicalProjectIdentity,
+				canonicalProjectRef,
+			);
 			return {
 				canonicalProjectRef,
-				canonicalProjectDisplayName:
-					projectsByCanonicalRef.get(canonicalProjectRef)?.displayName ??
-					fallbackLabel("Project", canonicalProjectRef),
+				canonicalProjectDisplayName: projectPresentation.displayName,
+				canonicalProjectKind: projectPresentation.kind,
 				recipientKind: change.recipientKind,
 				recipientRef,
 				recipientDisplayName: labels?.teamDisplayName ?? fallbackLabel("Team", recipientRef),
@@ -683,11 +686,14 @@ function viewerSafeAccessDelta(
 				change.canonicalProjectIdentity,
 			);
 			const deviceRef = legacyTeamDeviceRef(candidateRef, change.deviceId);
+			const projectPresentation = canonicalProjectPresentation(
+				change.canonicalProjectIdentity,
+				canonicalProjectRef,
+			);
 			return {
 				canonicalProjectRef,
-				canonicalProjectDisplayName:
-					projectsByCanonicalRef.get(canonicalProjectRef)?.displayName ??
-					fallbackLabel("Project", canonicalProjectRef),
+				canonicalProjectDisplayName: projectPresentation.displayName,
+				canonicalProjectKind: projectPresentation.kind,
 				deviceRef,
 				deviceDisplayName:
 					devicesByRef.get(deviceRef)?.displayName ?? fallbackLabel("Device", deviceRef),
@@ -810,7 +816,10 @@ function createCachedSnapshotLoader(
 	load: () => Promise<LegacyTeamConfiguredGroupSnapshot[]>,
 	ttlMs: number,
 	now: () => number = Date.now,
-): (() => Promise<LegacyTeamConfiguredGroupSnapshot[]>) & { invalidate: () => void } {
+): (() => Promise<LegacyTeamConfiguredGroupSnapshot[]>) & {
+	invalidate: () => void;
+	peek: () => LegacyTeamConfiguredGroupSnapshot[] | null;
+} {
 	let cached: { expiresAt: number; snapshots: LegacyTeamConfiguredGroupSnapshot[] } | null = null;
 	let inFlight: Promise<LegacyTeamConfiguredGroupSnapshot[]> | null = null;
 	let generation = 0;
@@ -836,13 +845,34 @@ function createCachedSnapshotLoader(
 		cached = null;
 		inFlight = null;
 	};
+	cachedLoad.peek = () => (cached && now() < cached.expiresAt ? cached.snapshots : null);
 	return cachedLoad;
+}
+
+async function loadMutableCandidateSnapshots(
+	store: MemoryStore,
+	candidateRef: string,
+	load: () => Promise<LegacyTeamConfiguredGroupSnapshot[]>,
+): Promise<LegacyTeamConfiguredGroupSnapshot[]> {
+	if (getLegacyTeamSetupDraft(store.db, candidateRef)?.state === "completed") {
+		throw new Error("team_setup_confirmation_stale");
+	}
+	return load();
+}
+
+function projectMutationAtomically<Mutation, Projection>(
+	store: MemoryStore,
+	mutate: () => Mutation,
+	project: (mutation: Mutation) => Projection,
+): Projection {
+	return store.db.transaction(() => project(mutate())).immediate();
 }
 
 export const __teamSetupTestHooks = {
 	createCachedSnapshotLoader,
 	loadConfiguredLegacyTeamGroupSnapshotsWith,
 	normalizedCoordinatorId,
+	projectMutationAtomically,
 	requireCompleteMappingChoices,
 	disambiguateChoiceLabels,
 	safeChoiceLabel,
@@ -931,7 +961,7 @@ function projectMappingChoices(store: MemoryStore): ProjectMappingChoiceInternal
 		}).filter(
 			(candidate) =>
 				!candidate.read_only &&
-				isLegacyTeamSetupProjectMappingIdentity(candidate.workspace_identity),
+				isLegacyTeamSetupProjectMappingIdentity(candidate.workspace_identity, store.db),
 		);
 	} catch (error) {
 		if (
@@ -952,14 +982,13 @@ function projectMappingChoices(store: MemoryStore): ProjectMappingChoiceInternal
 	}));
 }
 
-function viewerSafeDraft(
-	store: MemoryStore,
-	draft: LegacyTeamSetupDraftView,
-): {
-	devices: LegacyTeamSetupDeviceV1[];
-	projects: LegacyTeamSetupProjectV1[];
+interface ViewerSafeDraft {
+	devices: Array<Omit<LegacyTeamSetupDeviceV1, "actions">>;
+	projects: Array<Omit<LegacyTeamSetupProjectV1, "actions">>;
 	identityChoices: LegacyTeamSetupIdentityChoiceV1[];
-} {
+}
+
+function viewerSafeDraft(store: MemoryStore, draft: LegacyTeamSetupDraftView): ViewerSafeDraft {
 	if (draft.devices.length > MAX_DEVICES || draft.projects.length > MAX_PROJECTS) {
 		throw new Error("legacy_team_setup_roster_too_large");
 	}
@@ -1024,6 +1053,23 @@ function viewerSafeDraft(
 			identityRef,
 			displayName,
 		})),
+	};
+}
+
+function viewerSafePreview(
+	draft: LegacyTeamSetupDraftView,
+	safeDraft: ViewerSafeDraft,
+	preview: ReturnType<typeof inspectLegacyTeamSetupActivation>,
+) {
+	const accessDelta = viewerSafeAccessDelta(draft.candidateRef, preview.accessDelta, {
+		teamDisplayName: draft.displayName,
+		...safeDraft,
+	});
+	return {
+		finishDigest: preview.finishDigest,
+		accessDeltaDigest: preview.accessDeltaDigest,
+		viewerAccessDeltaDigest: viewerAccessDeltaDigest(accessDelta),
+		accessDelta,
 	};
 }
 
@@ -1092,16 +1138,40 @@ function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): 
 	return actual.length === expected.length && actual.every((key, index) => key === expected[index]);
 }
 
-function mutationResponse(draft: LegacyTeamSetupDraftView): LegacyTeamSetupMutationResponseV1 {
-	return {
+function detailResponse(
+	store: MemoryStore,
+	draft: LegacyTeamSetupDraftView,
+	candidate: LegacyTeamCandidateView = candidateFromDraft(draft),
+): LegacyTeamSetupDetailResponseV1 {
+	let unavailableReason: LegacyTeamSetupUnavailableReasonV1 | null = null;
+	let preview: ReturnType<typeof inspectLegacyTeamSetupActivation> | null = null;
+	if (draft.state !== "completed") {
+		try {
+			preview = inspectLegacyTeamSetupActivation(store.db, {
+				candidateRef: draft.candidateRef,
+				attemptId: draft.attemptId,
+			});
+		} catch (error) {
+			const code = apiErrorCode(error);
+			if (code === "team_setup_failed") throw error;
+			if (code === "team_setup_projection_changed") unavailableReason = "team_setup_conflict";
+			else if (code !== "team_setup_incomplete") unavailableReason = code;
+		}
+	}
+	if (preview) requireBoundedAccessDelta(preview.accessDelta);
+	const safeDraft = viewerSafeDraft(store, draft);
+	const safePreview = preview ? viewerSafePreview(draft, safeDraft, preview) : null;
+	return projectLegacyTeamSetupView({
 		version: TEAM_SETUP_VERSION,
-		candidateRef: draft.candidateRef,
-		attemptId: draft.attemptId,
+		candidate: candidateSummaryForDraft(candidate, draft),
 		draftState: draft.state,
-		canFinish: draft.canFinish,
+		attemptId: draft.attemptId,
 		unresolvedDeviceCount: draft.unresolvedDeviceCount,
 		unresolvedProjectCount: draft.unresolvedProjectCount,
-	};
+		...safeDraft,
+		unavailableReason,
+		preview: safePreview,
+	});
 }
 
 function finishResponse(
@@ -1148,12 +1218,27 @@ export function teamSetupRoutes(options: TeamSetupRoutesOptions): Hono {
 	options.registerSummaryInvalidator?.(() => loadedSummarySnapshots.invalidate());
 	async function loadedCandidateSnapshots(
 		candidateRef: string,
+		loadOptions: {
+			allowCachedSummaryFallback?: boolean;
+			invalidateSummaryCache?: boolean;
+		} = {},
 	): Promise<LegacyTeamConfiguredGroupSnapshot[]> {
-		loadedSummarySnapshots.invalidate();
+		const allowCachedSummaryFallback = loadOptions.allowCachedSummaryFallback ?? false;
+		const invalidateSummaryCache = loadOptions.invalidateSummaryCache ?? true;
+		if (invalidateSummaryCache) loadedSummarySnapshots.invalidate();
 		try {
 			return await loadedSnapshots(candidateRef);
+		} catch (error) {
+			if (!allowCachedSummaryFallback) throw error;
+			const cachedGroups = loadedSummarySnapshots.peek();
+			if (!cachedGroups) throw error;
+			const matching = cachedGroups.filter(
+				(group) => legacyTeamCandidateId(group.coordinatorId, group.groupId) === candidateRef,
+			);
+			if (matching.length !== 1) throw error;
+			return matching;
 		} finally {
-			loadedSummarySnapshots.invalidate();
+			if (invalidateSummaryCache) loadedSummarySnapshots.invalidate();
 		}
 	}
 
@@ -1166,9 +1251,15 @@ export function teamSetupRoutes(options: TeamSetupRoutesOptions): Hono {
 			return c.json({ error: code }, errorStatus(code));
 		}
 		try {
+			const store = options.getStore();
 			const response = {
 				version: TEAM_SETUP_VERSION,
-				candidates: discoverCandidates(options.getStore(), groups).map(candidateSummary),
+				candidates: readPureCandidateViews(store, groups)
+					.map(candidateSummary)
+					.filter(
+						(candidate): candidate is LegacyTeamSetupPendingCandidateSummaryV1 =>
+							candidate.status !== "ready",
+					),
 			} satisfies LegacyTeamSetupSummaryResponseV1;
 			return c.json(response);
 		} catch (error) {
@@ -1186,86 +1277,45 @@ export function teamSetupRoutes(options: TeamSetupRoutesOptions): Hono {
 		try {
 			const store = options.getStore();
 			let draft = getLegacyTeamSetupDraft(store.db, candidateRef);
+			const terminal = hasCompletedLegacyTeamSetup(store, candidateRef);
+			if (terminal && draft?.state !== "completed") {
+				return c.json({ error: "team_setup_confirmation_stale" as const }, 404);
+			}
 			let candidate: LegacyTeamCandidateView;
-			if (
-				draft?.state === "completed" &&
-				isLegacyTeamCandidateSelectable(store.db, candidateRef, {
-					projects: legacyTeamCandidateProjectInventory(
-						store.db,
-						projectionOptions(store),
-						candidateRef,
-					),
-				})
-			) {
-				candidate = completedCandidateFromDraft(draft);
+			if (draft && (draft.state !== "completed" || terminal)) {
+				candidate = candidateFromDraft(draft);
 			} else {
-				const groups = await loadedCandidateSnapshots(candidateRef);
+				// Revalidation may replace a completed draft, so it must never decide
+				// against a stale summary-cache roster. Cache fallback remains safe for
+				// candidates that have no persisted attempt yet.
+				const groups = await loadedCandidateSnapshots(candidateRef, {
+					allowCachedSummaryFallback: draft == null,
+					invalidateSummaryCache: false,
+				});
 				const candidateGroups = groups.filter(
 					(group) => legacyTeamCandidateId(group.coordinatorId, group.groupId) === candidateRef,
 				);
-				const discoveredCandidate = discoverCandidates(store, candidateGroups).find(
-					(item) => item.candidateRef === candidateRef,
-				);
-				if (!discoveredCandidate) {
-					return c.json({ error: "team_setup_confirmation_stale" as const }, 404);
+				const postLoadDraft = getLegacyTeamSetupDraft(store.db, candidateRef);
+				if (hasCompletedLegacyTeamSetup(store, candidateRef)) {
+					if (postLoadDraft?.state !== "completed") {
+						return c.json({ error: "team_setup_confirmation_stale" as const }, 404);
+					}
+					draft = postLoadDraft;
+					candidate = candidateFromDraft(postLoadDraft);
+				} else {
+					const discoveredCandidate = discoverCandidates(store, candidateGroups).find(
+						(item) => item.candidateRef === candidateRef,
+					);
+					if (!discoveredCandidate) {
+						return c.json({ error: "team_setup_confirmation_stale" as const }, 404);
+					}
+					candidate = discoveredCandidate;
+					draft = getLegacyTeamSetupDraft(store.db, candidateRef);
 				}
-				candidate = discoveredCandidate;
-				draft = getLegacyTeamSetupDraft(store.db, candidateRef);
 			}
 			if (!draft) return c.json({ error: "team_setup_confirmation_stale" as const }, 404);
 
-			let conflictState: LegacyTeamSetupActivationErrorCode | null = null;
-			let preview: ReturnType<typeof previewLegacyTeamSetupActivation> | null = null;
-			if (draft.state !== "completed") {
-				try {
-					preview = previewLegacyTeamSetupActivation(store.db, {
-						candidateRef,
-						attemptId: draft.attemptId,
-					});
-				} catch (error) {
-					const code = apiErrorCode(error);
-					if (code === "team_setup_failed") return c.json({ error: code }, 503);
-					preview = null;
-					conflictState = code;
-				}
-			}
-			if (preview) requireBoundedAccessDelta(preview.accessDelta);
-
-			const viewDraft = conflictState
-				? (getLegacyTeamSetupDraft(store.db, candidateRef) ?? draft)
-				: draft;
-			const safeDraft = viewerSafeDraft(store, viewDraft);
-			const responseBase = {
-				version: TEAM_SETUP_VERSION,
-				candidate: candidateSummaryForDraft(candidate, viewDraft),
-				attemptId: viewDraft.attemptId,
-				draftState: viewDraft.state,
-				unresolvedDeviceCount: viewDraft.unresolvedDeviceCount,
-				unresolvedProjectCount: viewDraft.unresolvedProjectCount,
-				...safeDraft,
-			};
-			if (!preview) {
-				const response = {
-					...responseBase,
-					canFinish: false,
-					conflictState,
-				} satisfies LegacyTeamSetupDetailResponseV1;
-				return c.json(response);
-			}
-			const accessDelta = viewerSafeAccessDelta(candidateRef, preview.accessDelta, {
-				teamDisplayName: viewDraft.displayName,
-				...safeDraft,
-			});
-			const response = {
-				...responseBase,
-				canFinish: true,
-				conflictState: null,
-				finishDigest: preview.finishDigest,
-				accessDeltaDigest: preview.accessDeltaDigest,
-				viewerAccessDeltaDigest: viewerAccessDeltaDigest(accessDelta),
-				accessDelta,
-			} satisfies LegacyTeamSetupDetailResponseV1;
-			return c.json(response);
+			return c.json(detailResponse(store, draft, candidate));
 		} catch (error) {
 			const code = apiErrorCode(error);
 			return c.json({ error: code }, errorStatus(code));
@@ -1301,7 +1351,13 @@ export function teamSetupRoutes(options: TeamSetupRoutesOptions): Hono {
 			const store = options.getStore();
 			const draft = getLegacyTeamSetupDraft(store.db, candidateRef);
 			if (!draft) return c.json({ error: "team_setup_confirmation_stale" as const }, 404);
+			if (draft.state !== "completed" && hasCompletedLegacyTeamSetup(store, candidateRef)) {
+				return c.json({ error: "team_setup_confirmation_stale" as const }, 409);
+			}
 			if (draft.attemptId !== attemptId) {
+				return c.json({ error: "team_setup_confirmation_stale" as const }, 409);
+			}
+			if (draft.state === "completed") {
 				return c.json({ error: "team_setup_confirmation_stale" as const }, 409);
 			}
 			const device = draft.devices.find((item) => item.deviceRef === deviceRef);
@@ -1323,13 +1379,16 @@ export function teamSetupRoutes(options: TeamSetupRoutesOptions): Hono {
 			);
 			if (!target) return c.json({ error: "team_setup_confirmation_stale" as const }, 404);
 			return c.json(
-				mutationResponse(
-					setLegacyTeamSetupDeviceAssignment(store.db, {
-						attemptId,
-						deviceRef,
-						targetIdentityId: target.identityId,
-						expectation: device.expectation,
-					}),
+				projectMutationAtomically(
+					store,
+					() =>
+						setLegacyTeamSetupDeviceAssignment(store.db, {
+							attemptId,
+							deviceRef,
+							targetIdentityId: target.identityId,
+							expectation: device.expectation,
+						}),
+					(draft) => detailResponse(store, draft),
 				),
 			);
 		} catch (error) {
@@ -1365,7 +1424,13 @@ export function teamSetupRoutes(options: TeamSetupRoutesOptions): Hono {
 			const store = options.getStore();
 			const draft = getLegacyTeamSetupDraft(store.db, candidateRef);
 			if (!draft) return c.json({ error: "team_setup_confirmation_stale" as const }, 404);
+			if (draft.state !== "completed" && hasCompletedLegacyTeamSetup(store, candidateRef)) {
+				return c.json({ error: "team_setup_confirmation_stale" as const }, 409);
+			}
 			if (draft.attemptId !== attemptId) {
+				return c.json({ error: "team_setup_confirmation_stale" as const }, 409);
+			}
+			if (draft.state === "completed") {
 				return c.json({ error: "team_setup_confirmation_stale" as const }, 409);
 			}
 			const device = draft.devices.find((item) => item.deviceRef === deviceRef);
@@ -1380,12 +1445,15 @@ export function teamSetupRoutes(options: TeamSetupRoutesOptions): Hono {
 				return c.json({ error: "team_setup_assignment_changed" as const }, 409);
 			}
 			return c.json(
-				mutationResponse(
-					setLegacyTeamSetupDeviceDecision(store.db, {
-						attemptId,
-						deviceRef,
-						decision: decision as "included" | "excluded" | "removed",
-					}),
+				projectMutationAtomically(
+					store,
+					() =>
+						setLegacyTeamSetupDeviceDecision(store.db, {
+							attemptId,
+							deviceRef,
+							decision: decision as "included" | "excluded" | "removed",
+						}),
+					(draft) => detailResponse(store, draft),
 				),
 			);
 		} catch (error) {
@@ -1412,14 +1480,24 @@ export function teamSetupRoutes(options: TeamSetupRoutesOptions): Hono {
 			const store = options.getStore();
 			const draft = getLegacyTeamSetupDraft(store.db, candidateRef);
 			if (!draft) return c.json({ error: "team_setup_confirmation_stale" as const }, 404);
+			if (draft.state !== "completed" && hasCompletedLegacyTeamSetup(store, candidateRef)) {
+				return c.json({ error: "team_setup_confirmation_stale" as const }, 409);
+			}
 			if (draft.attemptId !== attemptId) {
+				return c.json({ error: "team_setup_confirmation_stale" as const }, 409);
+			}
+			if (draft.state === "completed") {
 				return c.json({ error: "team_setup_confirmation_stale" as const }, 409);
 			}
 			if (!draft.devices.some((item) => item.deviceRef === deviceRef)) {
 				return c.json({ error: "team_setup_confirmation_stale" as const }, 404);
 			}
 			return c.json(
-				mutationResponse(clearLegacyTeamSetupDeviceDecision(store.db, { attemptId, deviceRef })),
+				projectMutationAtomically(
+					store,
+					() => clearLegacyTeamSetupDeviceDecision(store.db, { attemptId, deviceRef }),
+					(draft) => detailResponse(store, draft),
+				),
 			);
 		} catch (error) {
 			const code = apiErrorCode(error);
@@ -1450,7 +1528,13 @@ export function teamSetupRoutes(options: TeamSetupRoutesOptions): Hono {
 			const store = options.getStore();
 			const draft = getLegacyTeamSetupDraft(store.db, candidateRef);
 			if (!draft) return c.json({ error: "team_setup_confirmation_stale" as const }, 404);
+			if (draft.state !== "completed" && hasCompletedLegacyTeamSetup(store, candidateRef)) {
+				return c.json({ error: "team_setup_confirmation_stale" as const }, 409);
+			}
 			if (draft.attemptId !== attemptId) {
+				return c.json({ error: "team_setup_confirmation_stale" as const }, 409);
+			}
+			if (draft.state === "completed") {
 				return c.json({ error: "team_setup_confirmation_stale" as const }, 409);
 			}
 			const project = draft.projects.find((item) => item.projectRef === projectRef);
@@ -1466,12 +1550,15 @@ export function teamSetupRoutes(options: TeamSetupRoutesOptions): Hono {
 			);
 			if (!target) return c.json({ error: "team_setup_confirmation_stale" as const }, 404);
 			return c.json(
-				mutationResponse(
-					setLegacyTeamSetupProjectMapping(store.db, {
-						attemptId,
-						projectRef,
-						resolvedProjectIdentity: target.projectIdentity,
-					}),
+				projectMutationAtomically(
+					store,
+					() =>
+						setLegacyTeamSetupProjectMapping(store.db, {
+							attemptId,
+							projectRef,
+							resolvedProjectIdentity: target.projectIdentity,
+						}),
+					(draft) => detailResponse(store, draft),
 				),
 			);
 		} catch (error) {
@@ -1489,9 +1576,22 @@ export function teamSetupRoutes(options: TeamSetupRoutesOptions): Hono {
 		if (!parsed.ok || !hasExactKeys(parsed.value, [])) {
 			return c.json({ error: "team_setup_incomplete" as const }, 400);
 		}
+		let store: MemoryStore;
+		try {
+			store = options.getStore();
+			const currentDraft = getLegacyTeamSetupDraft(store.db, candidateRef);
+			if (currentDraft?.state === "completed" || hasCompletedLegacyTeamSetup(store, candidateRef)) {
+				return c.json({ error: "team_setup_confirmation_stale" as const }, 409);
+			}
+		} catch (error) {
+			const code = apiErrorCode(error);
+			return c.json({ error: code }, errorStatus(code));
+		}
 		let groups: LegacyTeamConfiguredGroupSnapshot[];
 		try {
-			groups = await loadedCandidateSnapshots(candidateRef);
+			groups = await loadMutableCandidateSnapshots(store, candidateRef, () =>
+				loadedCandidateSnapshots(candidateRef),
+			);
 		} catch (error) {
 			const code = apiErrorCode(error);
 			return c.json({ error: code }, errorStatus(code));
@@ -1504,14 +1604,24 @@ export function teamSetupRoutes(options: TeamSetupRoutesOptions): Hono {
 			return c.json({ error: "team_setup_confirmation_stale" as const }, 404);
 		}
 		try {
-			const store = options.getStore();
 			return c.json(
-				mutationResponse(
-					refreshLegacyTeamCandidate(
-						store.db,
-						{ projection: projectionOptions(store), groups },
-						candidateRef,
-					),
+				projectMutationAtomically(
+					store,
+					() => {
+						const currentDraft = getLegacyTeamSetupDraft(store.db, candidateRef);
+						if (
+							currentDraft?.state === "completed" ||
+							hasCompletedLegacyTeamSetup(store, candidateRef)
+						) {
+							throw new Error("team_setup_confirmation_stale");
+						}
+						return refreshLegacyTeamCandidate(
+							store.db,
+							{ projection: projectionOptions(store), groups },
+							candidateRef,
+						);
+					},
+					(draft) => detailResponse(store, draft),
 				),
 			);
 		} catch (error) {
@@ -1564,6 +1674,9 @@ export function teamSetupRoutes(options: TeamSetupRoutesOptions): Hono {
 			const store = options.getStore();
 			const draft = getLegacyTeamSetupDraft(store.db, candidateRef);
 			if (!draft) return c.json({ error: "team_setup_confirmation_stale" as const }, 404);
+			if (draft.state !== "completed" && hasCompletedLegacyTeamSetup(store, candidateRef)) {
+				return c.json({ error: "team_setup_confirmation_stale" as const }, 409);
+			}
 			if (draft.attemptId !== attemptId) {
 				return c.json({ error: "team_setup_confirmation_stale" as const }, 409);
 			}

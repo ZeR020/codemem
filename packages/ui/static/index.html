@@ -1326,18 +1326,27 @@
         opacity: 0.55;
         cursor: not-allowed;
       }
-      .legacy-team-setup-body h3 { margin: var(--sp-2) 0; }
+      .legacy-team-setup-body h3 { margin: var(--sp-4) 0 var(--sp-2); }
       .legacy-team-setup-body p { overflow-wrap: anywhere; }
       .legacy-team-setup-error { display: grid; gap: var(--sp-2); justify-items: start; }
+      .legacy-team-setup-recovery {
+        max-width: 44rem;
+        margin-block: var(--sp-4);
+        padding: var(--sp-4);
+        border: 1px solid var(--accent-warm);
+        border-radius: var(--radius-sm);
+        background: var(--accent-warm-subtle);
+      }
+      .legacy-team-setup-recovery p { margin: 0; }
       .legacy-team-setup-actions { justify-content: flex-end; }
       .legacy-team-setup-target { min-width: 24px; min-height: 24px; }
-      .legacy-team-device-list { display: grid; gap: var(--sp-3); margin-top: var(--sp-3); }
+      .legacy-team-device-list { display: grid; gap: var(--sp-4); margin-top: var(--sp-4); }
       .legacy-team-device-row {
         display: grid;
         gap: var(--sp-2);
         min-width: 0;
         margin: 0;
-        padding: var(--sp-3);
+        padding: var(--sp-4);
         border: 1px solid var(--border);
         border-radius: var(--radius-md);
         background: var(--surface-2);
@@ -1349,16 +1358,23 @@
       }
       .legacy-team-device-row label { font-size: var(--font-size-sm); font-weight: var(--font-weight-semibold); }
       .legacy-team-device-evidence { display: grid; gap: var(--sp-1); }
-      .legacy-team-device-select { width: 100%; margin: 0; }
+      .legacy-team-device-select { box-sizing: border-box; width: 100%; min-width: 0; max-width: 100%; margin: 0; }
       .legacy-team-device-select:disabled { opacity: 0.55; cursor: not-allowed; }
       .legacy-team-device-actions { display: flex; flex-wrap: wrap; gap: var(--sp-2); }
-      .legacy-team-project-list { display: grid; gap: var(--sp-3); margin-top: var(--sp-3); }
-      .legacy-team-project-row {
+      .legacy-team-project-list {
         display: grid;
-        gap: var(--sp-2);
+        grid-template-columns: minmax(0, 1fr);
+        gap: var(--sp-4);
         min-width: 0;
+        margin-top: var(--sp-4);
+      }
+      .legacy-team-project-row {
+        box-sizing: border-box;
+        width: 100%;
+        min-width: 0;
+        max-width: 100%;
         margin: 0;
-        padding: var(--sp-3);
+        padding: var(--sp-4);
         border: 1px solid var(--border);
         border-radius: var(--radius-md);
         background: var(--surface-2);
@@ -1367,10 +1383,44 @@
         padding: 0 var(--sp-1);
         color: var(--text-primary);
         font-weight: var(--font-weight-semibold);
+        overflow-wrap: anywhere;
       }
+      .legacy-team-project-row-content {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr);
+        gap: var(--sp-2);
+        min-width: 0;
+        max-width: 100%;
+      }
+      .legacy-team-project-row-content > * { min-width: 0; max-width: 100%; overflow-wrap: anywhere; }
       .legacy-team-project-row label { font-size: var(--font-size-sm); font-weight: var(--font-weight-semibold); }
-      .legacy-team-project-select { width: 100%; margin: 0; }
+      .legacy-team-project-select { box-sizing: border-box; width: 100%; min-width: 0; max-width: 100%; margin: 0; }
       .legacy-team-project-select:disabled { opacity: 0.55; cursor: not-allowed; }
+      .legacy-team-setup-row-needs-attention {
+        border-color: var(--accent);
+        background: var(--accent-subtle);
+        scroll-margin-block: var(--sp-4);
+      }
+      .legacy-team-setup-row-needs-attention:focus,
+      .legacy-team-setup-body h3:focus {
+        outline: 2px solid var(--accent);
+        outline-offset: 2px;
+      }
+      .legacy-team-setup-status {
+        width: fit-content;
+        padding: var(--sp-1) var(--sp-2);
+        border: 1px solid var(--accent);
+        border-radius: 999px;
+        color: var(--text-primary);
+        font-size: var(--font-size-xs);
+        font-weight: var(--font-weight-semibold);
+      }
+      .legacy-team-setup-row-needs-attention .legacy-team-device-actions button:not([aria-disabled="true"]),
+      .legacy-team-setup-row-needs-attention .legacy-team-project-row-content button:not([aria-disabled="true"]) {
+        border-color: var(--accent);
+      }
+      .legacy-team-setup-next-action { display: grid; gap: var(--sp-2); margin-top: var(--sp-4); justify-items: start; }
+      .legacy-team-setup-next-action p { margin: 0; }
       .legacy-team-setup-delta { display: grid; gap: var(--sp-3); }
       .legacy-team-setup-review-summary {
         display: grid;
@@ -1383,6 +1433,13 @@
       }
       .legacy-team-setup-review-summary p,
       .legacy-team-setup-review-summary ul { margin: 0; }
+      .legacy-team-setup-net-effect {
+        padding: var(--sp-3);
+        border-inline-start: 4px solid var(--accent);
+        border-radius: var(--radius-sm);
+        background: var(--accent-subtle);
+        line-height: 1.5;
+      }
       .legacy-team-setup-delta section { padding-block: var(--sp-2); border-bottom: 1px solid var(--border); }
       .legacy-team-setup-delta h4 { margin: 0 0 var(--sp-2); }
       .legacy-team-setup-delta ul { display: grid; gap: var(--sp-1); margin: 0; padding-inline-start: var(--sp-5); }
@@ -1396,6 +1453,30 @@
       }
       .legacy-team-setup-confirmation { display: flex; gap: var(--sp-2); align-items: flex-start; margin-block: var(--sp-4); }
       .legacy-team-setup-confirmation input { flex: 0 0 auto; margin-top: 0.2em; min-width: 24px; min-height: 24px; }
+      .legacy-team-setup-finish-progress {
+        display: flex;
+        gap: var(--sp-2);
+        align-items: flex-start;
+        margin-block: var(--sp-3);
+        padding: var(--sp-3);
+        border: 1px solid var(--accent);
+        border-radius: var(--radius-sm);
+        background: var(--accent-subtle);
+      }
+      .legacy-team-setup-spinner {
+        width: 1rem;
+        height: 1rem;
+        flex: 0 0 auto;
+        margin-top: 0.15em;
+        border: 2px solid var(--border);
+        border-top-color: var(--accent);
+        border-radius: 50%;
+        animation: legacy-team-setup-spin 0.8s linear infinite;
+      }
+      @keyframes legacy-team-setup-spin { to { transform: rotate(360deg); } }
+      @media (prefers-reduced-motion: reduce) {
+        .legacy-team-setup-spinner { animation: none; }
+      }
       .recipient-policy-management-selection fieldset { border: 0; padding: 0; margin: var(--sp-4) 0 0; }
       .recipient-policy-management-selection legend { font-weight: var(--font-weight-semibold); }
       .recipient-policy-management-review section + section { margin-top: var(--sp-4); }
@@ -1758,6 +1839,13 @@
       }
       .feed-search::placeholder { color: var(--text-tertiary); }
       .feed-search:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--focus-ring); }
+      .feed-search.legacy-team-device-select,
+      .feed-search.legacy-team-project-select {
+        box-sizing: border-box;
+        width: 100%;
+        min-width: 0;
+        max-width: 100%;
+      }
 
       .feed-inspector-files {
         width: 100%;
@@ -3991,7 +4079,7 @@
       <button class="tab-btn" id="tabBtn-sharing">Sharing</button>
       <button class="tab-btn" id="tabBtn-devices">Devices</button>
       <button class="tab-btn" id="tabBtn-health">Health</button>
-      <button class="tab-btn" id="tabBtn-advanced">Advanced (legacy)</button>
+      <button class="tab-btn" id="tabBtn-advanced">Advanced</button>
     </nav>
     <div id="toastRoot"></div>
     <div id="recipientPolicyManagementMount"></div>
@@ -4347,12 +4435,12 @@
       <div class="card">
         <div class="section-header advanced-legacy-header">
           <div>
-            <h2>Advanced (legacy)</h2>
-            <div class="section-meta">Compatibility and recovery tools for device sync and coordinator administration.</div>
+            <h2>Advanced</h2>
+            <div class="section-meta">Device sync, legacy Team and Space setup, and coordinator administration.</div>
           </div>
           <div class="section-actions" aria-label="Advanced sections" role="group">
             <button class="settings-button" id="advancedSyncButton" type="button" aria-pressed="true">Sync</button>
-            <button class="settings-button" id="advancedTeamsButton" type="button" aria-pressed="false">Coordinator administration (legacy)</button>
+            <button class="settings-button" id="advancedTeamsButton" type="button" aria-pressed="false">Coordinator Administration</button>
           </div>
         </div>
       </div>
@@ -4513,18 +4601,15 @@
             role="note"
           >
             <div class="coordinator-admin-legacy-notice-copy">
-              <h3 id="coordinatorAdminLegacyNoticeTitle" tabindex="-1">Sharing is the supported Team experience</h3>
+              <h3 id="coordinatorAdminLegacyNoticeTitle" tabindex="-1">Looking for Team settings?</h3>
               <div class="peer-submeta">
-                Coordinator groups and Spaces here are legacy technical discovery and transport boundaries, not policy Teams. Changes here do not safely manage Team membership, Project access, Identity, or Team names in Sharing.
-              </div>
-              <div class="peer-submeta">
-                Keep using these controls for compatibility and recovery. Use Sharing for ordinary Team and access administration.
+                Manage Team members, names, and Project access in Sharing. Use this page only for older coordinator groups and Spaces.
               </div>
             </div>
             <button class="settings-button" id="coordinatorAdminOpenSharing" type="button">Open Sharing</button>
           </aside>
           <details class="advanced-administration-disclosure" open>
-            <summary>Advanced coordinator administration (legacy)</summary>
+            <summary>Coordinator Administration</summary>
             <div class="section-meta">Technical coordinator groups, Spaces, enrollment, and recovery controls.</div>
             <div id="coordinatorAdminMount"></div>
           </details>

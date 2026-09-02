@@ -2,9 +2,16 @@ import type { Database } from "./db.js";
 import {
 	type ListLegacyRecipientPolicyProjectionsOptions,
 	listLegacyTeamProjectEvidence,
+	normalizeLegacyProjectMappingIdentity,
 	selectedProjectScopeMappings,
 } from "./legacy-recipient-policy-projection.js";
+import { planLegacyTeamAttempt } from "./legacy-team-attempt-lifecycle.js";
 import {
+	isFilesystemRootProjectIdentity,
+	isMigratableLegacyTeamProjectIdentity,
+} from "./legacy-team-project-policy.js";
+import {
+	type LegacyTeamSetupDraftState,
 	type LegacyTeamSetupDraftView,
 	type LegacyTeamSetupProjectInput,
 	legacyTeamProjectionFingerprint,
@@ -24,6 +31,7 @@ import {
 	legacyTeamCandidateId,
 	legacyTeamProjectRef,
 	legacyTeamRosterFingerprint,
+	recipientPolicyDigest,
 } from "./recipient-policy-identifiers.js";
 import {
 	deriveRecipientPolicyEffectiveDevicesFromDatabase,
@@ -67,7 +75,7 @@ interface DraftFreshnessRow {
 	attempt_id: string;
 	coordinator_id: string;
 	group_id: string;
-	state: "needs_setup" | "in_progress" | "stale" | "completed";
+	state: LegacyTeamSetupDraftState;
 	roster_fingerprint: string;
 	projection_fingerprint: string;
 	completed_team_id: string | null;
@@ -205,19 +213,43 @@ function activeAssignmentIdentityLookup(db: Database): (deviceId: string) => str
 }
 
 function projectInventory(
+	db: Database,
 	candidateId: string,
 	evidence: ReturnType<typeof listLegacyTeamProjectEvidence>,
 ): LegacyTeamSetupProjectInput[] {
+	const activeCandidateScopeIds = (
+		db
+			.prepare(
+				`SELECT scope_id, coordinator_id, group_id FROM replication_scopes
+				 WHERE authority_type = 'coordinator' AND coordinator_id IS NOT NULL
+				   AND group_id IS NOT NULL AND status = 'active'`,
+			)
+			.all() as Array<{ scope_id: string; coordinator_id: string; group_id: string }>
+	)
+		.filter((scope) => legacyTeamCandidateId(scope.coordinator_id, scope.group_id) === candidateId)
+		.map((scope) => scope.scope_id);
 	return evidence
-		.filter((project) => project.teamCandidateIds.includes(candidateId))
+		.filter(
+			(project) =>
+				isMigratableLegacyTeamProjectIdentity(project.project.canonicalIdentity, db) &&
+				project.teamCandidateIds.includes(candidateId),
+		)
 		.map((project) => {
 			const sourceProjectIdentity = project.project.canonicalIdentity;
+			const evidencedTargetScopeId = project.teamCandidateScopes.find(
+				(candidate) => candidate.teamCandidateId === candidateId,
+			)?.targetScopeId;
+			const targetScopeId =
+				evidencedTargetScopeId === undefined && activeCandidateScopeIds.length === 1
+					? activeCandidateScopeIds[0]
+					: evidencedTargetScopeId;
 			return {
 				projectRef: legacyTeamProjectRef(candidateId, sourceProjectIdentity),
 				sourceProjectIdentity,
 				displayName: project.project.displayName,
 				sourceFingerprint: project.sourceFingerprint,
 				deterministicProjectIdentity: project.deterministicProjectIdentity,
+				targetScopeId,
 			};
 		})
 		.toSorted((left, right) => compareCodepoints(left.projectRef, right.projectRef));
@@ -229,11 +261,20 @@ function projectInventory(
  * `unmapped:` source mapped to its reviewed target), which legitimately
  * changes the recomputed evidence without changing what the user authorized.
  * A current Project is accounted for when it matches a completion-bound row's
- * source or resolved identity; anything else — a new Project, or a reviewed
- * Project that disappeared — reopens setup. Canonical row integrity (teams,
- * decisions, memberships, mappings, recipients) is separately enforced by
- * `isCompatibleReadyTeam`.
+ * source or resolved identity. Other inventory changes make the completion
+ * incompatible for legacy reconciliation diagnostics, but never reopen the
+ * terminal migration. Canonical row integrity is separately checked by
+ * `isCompatibleReadyTeam` while deciding whether reconciliation is safe.
  */
+function isRetiredFilesystemRootProjectRow(row: {
+	source_project_identity: string;
+	resolved_project_identity: string | null;
+}): boolean {
+	return isFilesystemRootProjectIdentity(
+		row.resolved_project_identity ?? row.source_project_identity,
+	);
+}
+
 function completedInventoryCompatible(
 	db: Database,
 	attemptId: string,
@@ -248,21 +289,26 @@ function completedInventoryCompatible(
 		source_project_identity: string;
 		resolved_project_identity: string | null;
 	}>;
+	const reviewableRows = rows.filter((row) => !isRetiredFilesystemRootProjectRow(row));
 	const reviewedIdentities = new Set<string>();
-	for (const row of rows) {
-		reviewedIdentities.add(row.source_project_identity);
-		if (row.resolved_project_identity) reviewedIdentities.add(row.resolved_project_identity);
+	for (const row of reviewableRows) {
+		reviewedIdentities.add(normalizeLegacyProjectMappingIdentity(row.source_project_identity));
+		if (row.resolved_project_identity) {
+			reviewedIdentities.add(normalizeLegacyProjectMappingIdentity(row.resolved_project_identity));
+		}
 	}
-	const currentIdentities = new Set(projects.map((project) => project.sourceProjectIdentity));
+	const currentIdentities = new Set(
+		projects.map((project) => normalizeLegacyProjectMappingIdentity(project.sourceProjectIdentity)),
+	);
 	for (const identity of currentIdentities) {
 		if (!reviewedIdentities.has(identity)) return false;
 	}
-	for (const row of rows) {
-		const materialized = row.resolved_project_identity ?? row.source_project_identity;
-		if (
-			!currentIdentities.has(materialized) &&
-			!currentIdentities.has(row.source_project_identity)
-		) {
+	for (const row of reviewableRows) {
+		const sourceIdentity = normalizeLegacyProjectMappingIdentity(row.source_project_identity);
+		const materialized = normalizeLegacyProjectMappingIdentity(
+			row.resolved_project_identity ?? row.source_project_identity,
+		);
+		if (!currentIdentities.has(materialized) && !currentIdentities.has(sourceIdentity)) {
 			return false;
 		}
 	}
@@ -283,6 +329,26 @@ function currentDraftRow(db: Database, candidateId: string): DraftFreshnessRow |
 	);
 }
 
+function canonicalCompletedDraftRow(db: Database, candidateId: string): DraftFreshnessRow | null {
+	return (
+		(db
+			.prepare(
+				`SELECT draft.attempt_id, draft.coordinator_id, draft.group_id, draft.state,
+				        draft.roster_fingerprint, draft.projection_fingerprint,
+				        draft.completed_team_id
+				 FROM legacy_team_setup_drafts AS draft
+				 JOIN policy_teams AS team ON team.team_id = draft.completed_team_id
+				 WHERE draft.candidate_id = ? AND draft.state = 'completed'
+				   AND draft.completed_team_id = ? AND team.status = 'active'
+				   AND team.provenance = 'reviewed_team_candidate'
+				   AND team.migration_state = 'completed'
+				 ORDER BY draft.rowid DESC LIMIT 1`,
+			)
+			.get(candidateId, deterministicPolicyTeamId(candidateId)) as DraftFreshnessRow | undefined) ??
+		null
+	);
+}
+
 /**
  * A completed setup is Ready only while every canonical row it committed still
  * holds: the Team header, each included device's assignment, decision, and
@@ -295,30 +361,34 @@ function isCompatibleReadyTeam(
 	candidateId: string,
 	draftRow: DraftFreshnessRow,
 	rosterFingerprint: string,
+	options: { allowMissingSetupRecipients?: boolean } = {},
 ): boolean {
 	const { attempt_id: attemptId, completed_team_id: completedTeamId } = draftRow;
 	const expectedTeamId = deterministicPolicyTeamId(candidateId);
 	if (completedTeamId !== expectedTeamId) return false;
-	// Confirmed mappings are bound to the setup's coordinator group. A group
-	// may expose multiple active scopes (for example per-Project boundaries),
-	// so a mapping targeting any of them is valid; a mapping with the same
-	// identities but a scope outside the group is drifted state. Scopes are
+	// Confirmed mappings are bound to their completion-reviewed target scopes.
+	// A group may expose multiple active scopes (for example per-Project
+	// boundaries), but moving a mapping between them is still drift. Scopes are
 	// only required when the completed draft has Project rows to validate: a
 	// configured group with no displayed Projects has no mapping whose scope
 	// could drift, so its completion stays Ready without a local scope row.
-	const completionProjectRows = db
-		.prepare(
-			`SELECT source_project_identity, resolved_project_identity
-			 FROM legacy_team_setup_draft_projects WHERE attempt_id = ?`,
-		)
-		.all(attemptId) as Array<{
-		source_project_identity: string;
-		resolved_project_identity: string | null;
-	}>;
+	const completionProjectRows = (
+		db
+			.prepare(
+				`SELECT source_project_identity, resolved_project_identity, target_scope_id
+				 FROM legacy_team_setup_draft_projects WHERE attempt_id = ?`,
+			)
+			.all(attemptId) as Array<{
+			source_project_identity: string;
+			resolved_project_identity: string | null;
+			target_scope_id: string | null;
+		}>
+	).filter((row) => !isRetiredFilesystemRootProjectRow(row));
 	const setupScopeIds = db
 		.prepare(
 			`SELECT scope_id FROM replication_scopes
-			 WHERE coordinator_id = ? AND group_id = ? AND status = 'active'`,
+			 WHERE coordinator_id = ? AND group_id = ? AND authority_type = 'coordinator'
+			   AND status = 'active'`,
 		)
 		.pluck()
 		.all(draftRow.coordinator_id, draftRow.group_id) as string[];
@@ -484,15 +554,17 @@ function isCompatibleReadyTeam(
 		expectedEffectiveDevices.set(device.device_id, device.target_identity_id);
 	}
 	// Merged resolutions map several confirmed source patterns onto one
-	// canonical identity; selection can pick only one of those mappings, so
-	// the authoritative pattern is valid when it matches ANY confirmed source
-	// for that identity.
-	const confirmedSourcesByResolved = new Map<string, Set<string>>();
+	// canonical identity; selection can pick only one of those mappings. Keep
+	// each source's completion-bound target so the selected pattern is checked
+	// against its own reviewed scope rather than another merged source's scope.
+	const confirmedProjectsByResolved = new Map<string, Map<string, string | null>>();
 	for (const project of completionProjectRows) {
 		if (!project.resolved_project_identity) return false;
-		const sources = confirmedSourcesByResolved.get(project.resolved_project_identity) ?? new Set();
-		sources.add(project.source_project_identity);
-		confirmedSourcesByResolved.set(project.resolved_project_identity, sources);
+		const sources =
+			confirmedProjectsByResolved.get(project.resolved_project_identity) ??
+			new Map<string, string | null>();
+		sources.set(project.source_project_identity, project.target_scope_id);
+		confirmedProjectsByResolved.set(project.resolved_project_identity, sources);
 	}
 	// Several confirmed sources may resolve to the same canonical Project. Keep
 	// the expensive live-policy derivation scoped to this compatibility check so
@@ -507,24 +579,31 @@ function isCompatibleReadyTeam(
 		 WHERE canonical_project_identity = ? AND recipient_kind = 'team'
 		   AND recipient_id = ? AND status = 'active' LIMIT 1`,
 	);
-	const selectedMappings = selectedProjectScopeMappings(db, [...confirmedSourcesByResolved.keys()]);
+	const selectedMappings = selectedProjectScopeMappings(db, [
+		...confirmedProjectsByResolved.keys(),
+	]);
 	for (const project of completionProjectRows) {
 		const resolvedIdentity = project.resolved_project_identity as string;
 		const recipientActive = activeTeamRecipient.get(resolvedIdentity, completedTeamId);
-		if (!recipientActive) return false;
+		if (!recipientActive && !options.allowMissingSetupRecipients) return false;
 		let effectiveDevices = effectiveDevicesByProject.get(resolvedIdentity);
 		if (!effectiveDevices) {
 			effectiveDevices = deriveRecipientPolicyEffectiveDevicesFromDatabase(db, resolvedIdentity);
 			effectiveDevicesByProject.set(resolvedIdentity, effectiveDevices);
 		}
+		// Missing this Team's edge cannot excuse unrelated malformed or dangling
+		// recipients on the same Project. Reconciliation must never commit a new
+		// grant that the strict post-write readiness derivation would reject.
 		if (effectiveDevices.status === "blocked") return false;
-		for (const [deviceId, identityId] of expectedEffectiveDevices) {
-			if (
-				!effectiveDevices.devices.some(
-					(device) => device.deviceId === deviceId && device.identityId === identityId,
-				)
-			) {
-				return false;
+		if (recipientActive) {
+			for (const [deviceId, identityId] of expectedEffectiveDevices) {
+				if (
+					!effectiveDevices.devices.some(
+						(device) => device.deviceId === deviceId && device.identityId === identityId,
+					)
+				) {
+					return false;
+				}
 			}
 		}
 		// The completion-bound mapping must still be the SELECTED mapping for
@@ -533,11 +612,41 @@ function isCompatibleReadyTeam(
 		// enforcement to another boundary; mere existence of the shadowed row
 		// is not evidence that the completion still governs the Project.
 		const selected = selectedMappings.get(resolvedIdentity);
+		const confirmedSources = confirmedProjectsByResolved.get(resolvedIdentity);
+		const normalizedSelectedPattern = selected
+			? normalizeLegacyProjectMappingIdentity(selected.projectPattern)
+			: null;
+		const confirmedSourceTargetScopeIds = new Set(
+			[...(confirmedSources?.entries() ?? [])]
+				.filter(
+					([sourceIdentity]) =>
+						normalizedSelectedPattern !== null &&
+						normalizeLegacyProjectMappingIdentity(sourceIdentity) === normalizedSelectedPattern,
+				)
+				.map(([, scopeId]) => scopeId),
+		);
+		if (confirmedSourceTargetScopeIds.size > 1) return false;
+		const hasConfirmedSource = confirmedSourceTargetScopeIds.size === 1;
+		const confirmedSourceTargetScopeId = [...confirmedSourceTargetScopeIds][0];
+		const confirmedTargetScopeIds = new Set(
+			[...(confirmedSources?.values() ?? [])].filter((scopeId): scopeId is string =>
+				Boolean(scopeId),
+			),
+		);
+		const confirmedTargetScopeId = hasConfirmedSource
+			? (confirmedSourceTargetScopeId ?? selected?.scopeId)
+			: selected?.workspaceIdentity &&
+					normalizeLegacyProjectMappingIdentity(selected.workspaceIdentity) ===
+						normalizeLegacyProjectMappingIdentity(resolvedIdentity) &&
+					confirmedTargetScopeIds.size === 1
+				? [...confirmedTargetScopeIds][0]
+				: undefined;
 		if (
 			!selected ||
 			selected.workspaceIdentity == null ||
-			!confirmedSourcesByResolved.get(resolvedIdentity)?.has(selected.projectPattern) ||
-			!setupScopeIds.includes(selected.scopeId)
+			!confirmedTargetScopeId ||
+			selected.scopeId !== confirmedTargetScopeId ||
+			!setupScopeIds.includes(confirmedTargetScopeId)
 		) {
 			return false;
 		}
@@ -545,19 +654,132 @@ function isCompatibleReadyTeam(
 	return true;
 }
 
-/**
- * A completed guided setup is selectable (for example by `choose_recipients`)
- * only while its full completion-bound canonical state is intact. Production
- * writers such as `commitDeviceIdentityBindings` can invalidate decisions
- * without clearing the Team fingerprint, so a header-only check is not enough.
- *
- * The stored draft cannot prove freshness against evidence it does not hold:
- * callers that can compute the current Project inventory or a current
- * coordinator roster fingerprint must pass them so that drift the next
- * discovery would reopen setup for also blocks selection. When a caller has
- * no coordinator snapshot (review/migration contexts run without coordinator
- * connectivity), roster drift admits no unreviewed grants — new devices have
- * no canonical decisions — and discovery reopens setup on its next pass.
+interface CompletionProjectRecipientRow {
+	project_ref: string;
+	source_project_identity: string;
+	resolved_project_identity: string | null;
+	source_fingerprint: string;
+}
+
+interface ExistingProjectRecipientRow {
+	status: string;
+	provenance: string;
+}
+
+function reconcileMissingCompletedProjectRecipients(
+	db: Database,
+	candidateId: string,
+	draftRow: DraftFreshnessRow,
+	rosterFingerprint: string,
+	currentProjects: LegacyTeamSetupProjectInput[],
+	now: string,
+): number {
+	if (
+		draftRow.state !== "completed" ||
+		!draftRow.completed_team_id ||
+		!completedInventoryCompatible(db, draftRow.attempt_id, currentProjects) ||
+		!isCompatibleReadyTeam(db, candidateId, draftRow, rosterFingerprint, {
+			allowMissingSetupRecipients: true,
+		})
+	) {
+		return 0;
+	}
+	const team = db
+		.prepare("SELECT revision FROM policy_teams WHERE team_id = ? AND status = 'active'")
+		.get(draftRow.completed_team_id) as { revision: string } | undefined;
+	if (!team) return 0;
+	const completionProjects = (
+		db
+			.prepare(
+				`SELECT project_ref, source_project_identity, resolved_project_identity,
+				        source_fingerprint
+				 FROM legacy_team_setup_draft_projects WHERE attempt_id = ? ORDER BY project_ref`,
+			)
+			.all(draftRow.attempt_id) as CompletionProjectRecipientRow[]
+	).filter((row) => !isRetiredFilesystemRootProjectRow(row));
+	const existingRecipient = db.prepare(
+		`SELECT status, provenance FROM project_recipients
+		 WHERE canonical_project_identity = ? AND recipient_kind = 'team' AND recipient_id = ?`,
+	);
+	const planned = new Map<string, { mode: "insert" | "reactivate"; sourceFingerprint: string }>();
+	for (const project of completionProjects) {
+		const resolvedIdentity = project.resolved_project_identity;
+		if (!resolvedIdentity || !isMigratableLegacyTeamProjectIdentity(resolvedIdentity, db)) return 0;
+		const existing = existingRecipient.get(resolvedIdentity, draftRow.completed_team_id) as
+			| ExistingProjectRecipientRow
+			| undefined;
+		if (existing?.status === "active") continue;
+		if (existing && existing.provenance !== "reviewed_team_setup") return 0;
+		planned.set(resolvedIdentity, {
+			mode: existing ? "reactivate" : "insert",
+			sourceFingerprint: project.source_fingerprint,
+		});
+	}
+	const insert = db.prepare(
+		`INSERT INTO project_recipients(
+		 canonical_project_identity, recipient_kind, recipient_id, status, provenance,
+		 policy_revision, migration_state, source_fingerprint, idempotency_key,
+		 created_at, updated_at
+		 ) VALUES (?, 'team', ?, 'active', 'reviewed_team_setup', ?, 'completed', ?, ?, ?, ?)`,
+	);
+	const reactivate = db.prepare(
+		`UPDATE project_recipients
+		 SET status = 'active', policy_revision = ?, migration_state = 'completed',
+		     source_fingerprint = ?, updated_at = ?
+		 WHERE canonical_project_identity = ? AND recipient_kind = 'team' AND recipient_id = ?
+		   AND provenance = 'reviewed_team_setup' AND status <> 'active'`,
+	);
+	let writeCount = 0;
+	for (const [resolvedIdentity, plan] of planned) {
+		if (plan.mode === "insert") {
+			insert.run(
+				resolvedIdentity,
+				draftRow.completed_team_id,
+				team.revision,
+				plan.sourceFingerprint,
+				recipientPolicyDigest("legacy-team-project-recipient-v1", [
+					resolvedIdentity,
+					draftRow.completed_team_id,
+				]),
+				now,
+				now,
+			);
+			writeCount += 1;
+			continue;
+		}
+		writeCount += reactivate.run(
+			team.revision,
+			plan.sourceFingerprint,
+			now,
+			resolvedIdentity,
+			draftRow.completed_team_id,
+		).changes;
+	}
+	return writeCount;
+}
+
+function hasTerminalLegacyTeamCompletion(
+	db: Database,
+	candidateId: string,
+	completedTeamId: string,
+): boolean {
+	if (completedTeamId !== deterministicPolicyTeamId(candidateId)) return false;
+	return Boolean(
+		db
+			.prepare(
+				`SELECT 1 FROM policy_teams
+				 WHERE team_id = ? AND status = 'active'
+				   AND provenance = 'reviewed_team_candidate'
+				   AND migration_state = 'completed' LIMIT 1`,
+			)
+			.pluck()
+			.get(completedTeamId),
+	);
+}
+
+/** A completed guided migration stays selectable as an active canonical Team.
+ * Later roster, Project, and policy changes belong to normal Team management;
+ * they must not reopen or revoke the one-time migration completion.
  */
 export function isLegacyTeamCandidateSelectable(
 	db: Database,
@@ -567,15 +789,23 @@ export function isLegacyTeamCandidateSelectable(
 		projects?: LegacyTeamSetupProjectInput[];
 	},
 ): boolean {
+	const canonicalCompletedRow = canonicalCompletedDraftRow(db, candidateId);
+	if (
+		canonicalCompletedRow?.completed_team_id &&
+		hasTerminalLegacyTeamCompletion(db, candidateId, canonicalCompletedRow.completed_team_id)
+	) {
+		return true;
+	}
 	const row = currentDraftRow(db, candidateId);
 	if (row?.state !== "completed" || !row.completed_team_id) return false;
-	if (current?.rosterFingerprint != null && current.rosterFingerprint !== row.roster_fingerprint) {
-		return false;
-	}
-	if (current?.projects && !completedInventoryCompatible(db, row.attempt_id, current.projects)) {
-		return false;
-	}
-	return isCompatibleReadyTeam(db, candidateId, row, row.roster_fingerprint);
+	// Keep compatibility with older canonical completions that predate the
+	// terminal provenance markers; their full completion evidence remains the gate.
+	const rosterFingerprint = current?.rosterFingerprint ?? row.roster_fingerprint;
+	return (
+		(current?.projects === undefined ||
+			completedInventoryCompatible(db, row.attempt_id, current.projects)) &&
+		isCompatibleReadyTeam(db, candidateId, row, rosterFingerprint)
+	);
 }
 
 function candidateStatus(
@@ -592,6 +822,18 @@ function isRosterTooLargeError(error: unknown): boolean {
 	return error instanceof Error && error.message === "legacy_team_setup_roster_too_large";
 }
 
+function isCompletionReconciliationError(error: unknown): boolean {
+	return (
+		error instanceof Error && error.message === "legacy_team_completion_reconciliation_invalid"
+	);
+}
+
+function validatedNow(now: string | undefined): string {
+	const value = now ?? new Date().toISOString();
+	if (Number.isNaN(new Date(value).getTime())) throw new Error("legacy_team_setup_time_invalid");
+	return value;
+}
+
 // Must run under the caller's top-level immediate transaction. Guard ordering
 // is intentional: reject oversized evidence before fingerprint assignment reads.
 function candidateAuthority(
@@ -599,10 +841,26 @@ function candidateAuthority(
 	candidateId: string,
 	rosterDevices: LegacyTeamRosterDeviceSnapshot[],
 	projects: LegacyTeamSetupProjectInput[],
-): { row: DraftFreshnessRow | null; rosterFingerprint: string; ready: boolean } {
+	now: string,
+): {
+	row: DraftFreshnessRow | null;
+	rosterFingerprint: string;
+	ready: boolean;
+	terminal: boolean;
+} {
 	const row = currentDraftRow(db, candidateId);
+	const canonicalCompletedRow = canonicalCompletedDraftRow(db, candidateId);
+	const terminal = Boolean(
+		canonicalCompletedRow?.completed_team_id &&
+			hasTerminalLegacyTeamCompletion(db, candidateId, canonicalCompletedRow.completed_team_id),
+	);
+	const authorityRow = terminal ? canonicalCompletedRow : row;
 	requireLegacyTeamSetupSnapshotWithinLimits({ devices: rosterDevices, projects });
-	requireLegacyTeamSetupEffectiveDevicesWithinLimit(db, rosterDevices, row?.attempt_id ?? null);
+	requireLegacyTeamSetupEffectiveDevicesWithinLimit(
+		db,
+		rosterDevices,
+		authorityRow?.attempt_id ?? null,
+	);
 	const activeAssignmentIdentity = activeAssignmentIdentityLookup(db);
 	const rosterFingerprint = legacyTeamRosterFingerprint(
 		rosterDevices.map((device) => ({
@@ -612,19 +870,45 @@ function candidateAuthority(
 			identityId: activeAssignmentIdentity(device.deviceId),
 		})),
 	);
-	const ready =
-		row?.state === "completed" &&
-		row.roster_fingerprint === rosterFingerprint &&
-		completedInventoryCompatible(db, row.attempt_id, projects) &&
-		isCompatibleReadyTeam(db, candidateId, row, rosterFingerprint);
-	return { row, rosterFingerprint, ready };
+	const completedRow = authorityRow?.state === "completed" ? authorityRow : canonicalCompletedRow;
+	const completionEvidenceMatches =
+		completedRow !== null &&
+		completedRow.roster_fingerprint === rosterFingerprint &&
+		completedInventoryCompatible(db, completedRow.attempt_id, projects);
+	let ready =
+		completionEvidenceMatches &&
+		isCompatibleReadyTeam(db, candidateId, completedRow, rosterFingerprint);
+	const reconciledWriteCount =
+		completionEvidenceMatches && completedRow && !ready
+			? reconcileMissingCompletedProjectRecipients(
+					db,
+					candidateId,
+					completedRow,
+					rosterFingerprint,
+					projects,
+					now,
+				)
+			: 0;
+	if (reconciledWriteCount > 0 && completedRow) {
+		ready = isCompatibleReadyTeam(db, candidateId, completedRow, rosterFingerprint);
+		if (!ready) throw new Error("legacy_team_completion_reconciliation_invalid");
+	}
+	return { row: authorityRow, rosterFingerprint, ready, terminal };
 }
 
 function candidateDisplayName(db: Database, candidateId: string, fallback: string): string {
 	const team = db
 		.prepare("SELECT display_name FROM policy_teams WHERE team_id = ? AND status = 'active'")
 		.get(deterministicPolicyTeamId(candidateId)) as { display_name: string } | undefined;
-	return team?.display_name ?? fallback;
+	if (team?.display_name) return team.display_name;
+	const historical = db
+		.prepare(
+			`SELECT display_name FROM legacy_team_setup_drafts
+			 WHERE candidate_id = ? AND display_name <> 'Legacy Team'
+			 ORDER BY rowid DESC LIMIT 1`,
+		)
+		.get(candidateId) as { display_name: string } | undefined;
+	return historical?.display_name ?? fallback;
 }
 
 function resolveDiscoveredCandidate(
@@ -636,66 +920,39 @@ function resolveDiscoveredCandidate(
 	const discover = db.transaction(() => {
 		const { candidateId, coordinatorId, groupId, devices: rosterDevices } = group;
 		const projects = legacyTeamCandidateProjectInventory(db, projection, candidateId);
-		const { row, rosterFingerprint, ready } = candidateAuthority(
+		const { row, rosterFingerprint, ready, terminal } = candidateAuthority(
 			db,
 			candidateId,
 			rosterDevices,
 			projects,
+			now,
 		);
 		const displayName = candidateDisplayName(db, candidateId, group.displayName);
-		let draft: LegacyTeamSetupDraftView;
 		const expectedProjectionFingerprint = legacyTeamProjectionFingerprint(projects);
-		if (!row || (row.state === "completed" && !ready)) {
-			draft = refreshLegacyTeamSetupDraft(db, {
-				candidateId,
-				coordinatorId,
-				groupId,
-				displayName,
-				devices: rosterDevices,
-				projects,
-				now,
-			});
-		} else if (row.state === "completed") {
-			draft = refreshLegacyTeamSetupDraftLabels(db, row.attempt_id, {
-				displayName,
-				devices: rosterDevices,
-				projects,
-				now,
-			});
-		} else if (row.state === "stale") {
-			draft = refreshLegacyTeamSetupDraftLabels(db, row.attempt_id, {
-				displayName,
-				devices: rosterDevices,
-				projects,
-				now,
-			});
-		} else if (
-			row.roster_fingerprint !== rosterFingerprint ||
-			row.projection_fingerprint !== expectedProjectionFingerprint
-		) {
-			if (row.state === "needs_setup" || row.state === "in_progress") {
-				db.prepare(
-					`UPDATE legacy_team_setup_drafts SET state = 'stale', updated_at = ?
-					 WHERE attempt_id = ?`,
-				).run(now, row.attempt_id);
-			}
-			draft = refreshLegacyTeamSetupDraftLabels(db, row.attempt_id, {
-				displayName,
-				devices: rosterDevices,
-				projects,
-				now,
-			});
-		} else {
-			draft = refreshLegacyTeamSetupDraft(db, {
-				candidateId,
-				coordinatorId,
-				groupId,
-				displayName,
-				devices: rosterDevices,
-				projects,
-				now,
-			});
-		}
+		const plan = planLegacyTeamAttempt({
+			state: row?.state ?? null,
+			evidenceMatches:
+				row?.roster_fingerprint === rosterFingerprint &&
+				row.projection_fingerprint === expectedProjectionFingerprint,
+			completionReady: ready || terminal,
+		});
+		const draft =
+			plan.kind === "preserve_completion" && row
+				? refreshLegacyTeamSetupDraftLabels(db, row.attempt_id, {
+						displayName,
+						devices: rosterDevices,
+						projects,
+						now,
+					})
+				: refreshLegacyTeamSetupDraft(db, {
+						candidateId,
+						coordinatorId,
+						groupId,
+						displayName,
+						devices: rosterDevices,
+						projects,
+						now,
+					});
 		return { draft, ready, projectCount: projects.length };
 	});
 	return discover.immediate();
@@ -705,10 +962,9 @@ export function discoverLegacyTeamCandidates(
 	db: Database,
 	options: DiscoverLegacyTeamCandidatesOptions,
 ): LegacyTeamCandidateView[] {
-	const now = options.now ?? new Date().toISOString();
+	const now = validatedNow(options.now);
 	// Discovery persists this timestamp directly (stale transitions) and
 	// forwards it to every draft write; garbage here corrupts ordering columns.
-	if (Number.isNaN(new Date(now).getTime())) throw new Error("legacy_team_setup_time_invalid");
 	const candidates: LegacyTeamCandidateView[] = [];
 	// A conflicting roster is not reviewable evidence; conflicted candidates
 	// are dropped rather than aborting discovery for every other group.
@@ -724,7 +980,7 @@ export function discoverLegacyTeamCandidates(
 		} catch (error) {
 			// Oversized evidence is local to this coordinator group. It must not
 			// hide otherwise reviewable candidates discovered in the same pass.
-			if (isRosterTooLargeError(error)) continue;
+			if (isRosterTooLargeError(error) || isCompletionReconciliationError(error)) continue;
 			throw error;
 		}
 		candidates.push({
@@ -756,7 +1012,7 @@ export function legacyTeamCandidateProjectInventory(
 	candidateRef: string,
 ): LegacyTeamSetupProjectInput[] {
 	const evidence = listLegacyTeamProjectEvidence(db, projection);
-	return projectInventory(candidateRef, evidence);
+	return projectInventory(db, candidateRef, evidence);
 }
 
 export function refreshLegacyTeamCandidate(
@@ -773,12 +1029,17 @@ export function refreshLegacyTeamCandidate(
 		if (candidateId !== candidateRef) continue;
 		const refresh = db.transaction(() => {
 			const projects = legacyTeamCandidateProjectInventory(db, options.projection, candidateId);
-			const { row, ready } = candidateAuthority(db, candidateId, rosterDevices, projects);
+			const { row } = candidateAuthority(
+				db,
+				candidateId,
+				rosterDevices,
+				projects,
+				validatedNow(options.now),
+			);
 			const displayName = candidateDisplayName(db, candidateId, group.displayName);
-			// A compatible Ready completion with unchanged evidence survives an
-			// explicit refresh: only labels update. Creating a replacement attempt
-			// here would immediately drop Ready and force a redundant review cycle.
-			if (row?.state === "completed" && ready) {
+			// Completion is terminal. Explicit refresh may reconcile compatible
+			// setup-owned edges and labels, but later drift never creates a new attempt.
+			if (row?.state === "completed") {
 				return refreshLegacyTeamSetupDraftLabels(db, row.attempt_id, {
 					displayName,
 					devices: rosterDevices,

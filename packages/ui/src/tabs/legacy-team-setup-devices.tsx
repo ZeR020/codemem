@@ -1,12 +1,15 @@
-import { useEffect, useState } from "preact/hooks";
+import { useEffect, useId, useState } from "preact/hooks";
 import type { LegacyTeamSetupDetailResponseV1, LegacyTeamSetupDeviceV1 } from "../lib/api";
+import { setupItemErrorId } from "./legacy-team-setup-dom";
+import { orderedSetupDevices } from "./legacy-team-setup-order";
 
 type DeviceDecision = "included" | "excluded" | "removed";
 
 export interface LegacyTeamSetupDevicesProps {
 	blocked: boolean;
+	blockedDeviceRefs?: ReadonlySet<string>;
 	blockedDescriptionId?: string;
-	busyDeviceRef: string | null;
+	busyDeviceRefs: ReadonlySet<string>;
 	detail: LegacyTeamSetupDetailResponseV1;
 	onAssign: (device: LegacyTeamSetupDeviceV1, identityRef: string) => void;
 	onClear: (device: LegacyTeamSetupDeviceV1) => void;
@@ -39,6 +42,7 @@ function initialIdentityRef(device: LegacyTeamSetupDeviceV1): string {
 function DeviceRow({
 	blocked,
 	blockedDescriptionId,
+	blockedDeviceRefs,
 	busy,
 	detail,
 	device,
@@ -51,9 +55,10 @@ function DeviceRow({
 	device: LegacyTeamSetupDeviceV1;
 	index: number;
 }) {
-	const controlId = `legacy-team-device-identity-${index}`;
-	const evidenceId = `legacy-team-device-evidence-${index}`;
-	const assignmentHelpId = `legacy-team-device-assignment-help-${index}`;
+	const generatedId = useId();
+	const controlId = `${generatedId}-identity`;
+	const evidenceId = `${generatedId}-evidence`;
+	const assignmentHelpId = `${generatedId}-assignment-help`;
 	const initialIdentity = initialIdentityRef(device);
 	const savedIdentity = device.targetIdentityRef ?? "";
 	const [draftIdentityRef, setDraftIdentityRef] = useState(initialIdentity);
@@ -63,12 +68,14 @@ function DeviceRow({
 	);
 	const existingName = identityName(detail, device.existingIdentityRef);
 	const suggestedName = identityName(detail, device.suggestedIdentityRef);
-	const controlsBlocked = blocked || busy;
-	const assignmentControlsBlocked = controlsBlocked || !device.enabled;
+	const itemBlocked = blockedDeviceRefs?.has(device.deviceRef) ?? false;
+	const controlsBlocked = blocked || itemBlocked || busy;
+	const assignmentControlsBlocked = controlsBlocked || !device.actions.assignIdentity.enabled;
 	const assignmentEvidenceInactive =
-		device.expectation.kind === "existing" && device.verifiedEvidenceKind !== "active_assignment";
+		device.actions.assignIdentity.blockedReason === "assignment_evidence_inactive";
 	const assignmentIdentityUnavailable = Boolean(draftIdentityRef) && !selectedChoiceExists;
 	const includeNeedsHelp =
+		!device.actions.include.enabled ||
 		assignmentEvidenceInactive ||
 		assignmentIdentityUnavailable ||
 		!savedIdentity ||
@@ -81,7 +88,11 @@ function DeviceRow({
 		assignmentIdentityUnavailable ||
 		draftIdentityRef === savedIdentity;
 	const assignmentNeedsHelp = !device.enabled || includeNeedsHelp;
-	const globalBlockedDescription = blocked ? blockedDescriptionId : undefined;
+	const globalBlockedDescription = blocked
+		? blockedDescriptionId
+		: itemBlocked
+			? setupItemErrorId("device", device.deviceRef)
+			: undefined;
 	const assignmentDescription = [
 		evidenceId,
 		assignmentNeedsHelp ? assignmentHelpId : undefined,
@@ -90,15 +101,17 @@ function DeviceRow({
 		.filter(Boolean)
 		.join(" ");
 	const actionDescription = [evidenceId, globalBlockedDescription].filter(Boolean).join(" ");
+	const needsAttention = device.decision === "unresolved";
 
 	return (
 		<fieldset
 			aria-busy={busy ? "true" : "false"}
-			className="legacy-team-device-row"
+			className={`legacy-team-device-row${needsAttention ? " legacy-team-setup-row-needs-attention" : ""}`}
 			id={`legacy-team-device-row-${index}`}
-			tabIndex={device.decision === "unresolved" ? -1 : undefined}
+			tabIndex={needsAttention ? -1 : undefined}
 		>
 			<legend>{device.displayName}</legend>
+			{needsAttention ? <span className="legacy-team-setup-status">Needs attention</span> : null}
 			<div className="small legacy-team-device-evidence" id={evidenceId}>
 				<span>
 					{device.enabled ? "Current Team device" : "Device no longer active on this Team"}
@@ -181,10 +194,14 @@ function DeviceRow({
 						</button>
 						<button
 							aria-describedby={actionDescription}
-							aria-disabled={controlsBlocked ? "true" : undefined}
+							aria-disabled={
+								controlsBlocked || !device.actions.exclude.enabled ? "true" : undefined
+							}
 							className="settings-button legacy-team-setup-target"
 							onClick={() => {
-								if (!controlsBlocked) onDecision(device, "excluded");
+								if (!controlsBlocked && device.actions.exclude.enabled) {
+									onDecision(device, "excluded");
+								}
 							}}
 							type="button"
 						>
@@ -194,10 +211,10 @@ function DeviceRow({
 				) : (
 					<button
 						aria-describedby={actionDescription}
-						aria-disabled={controlsBlocked ? "true" : undefined}
+						aria-disabled={controlsBlocked || !device.actions.remove.enabled ? "true" : undefined}
 						className="settings-button legacy-team-setup-target"
 						onClick={() => {
-							if (!controlsBlocked) onDecision(device, "removed");
+							if (!controlsBlocked && device.actions.remove.enabled) onDecision(device, "removed");
 						}}
 						type="button"
 					>
@@ -207,10 +224,12 @@ function DeviceRow({
 				{device.decision !== "unresolved" ? (
 					<button
 						aria-describedby={actionDescription}
-						aria-disabled={controlsBlocked ? "true" : undefined}
+						aria-disabled={
+							controlsBlocked || !device.actions.clearDecision.enabled ? "true" : undefined
+						}
 						className="settings-button legacy-team-setup-target"
 						onClick={() => {
-							if (!controlsBlocked) onClear(device);
+							if (!controlsBlocked && device.actions.clearDecision.enabled) onClear(device);
 						}}
 						type="button"
 					>
@@ -223,6 +242,7 @@ function DeviceRow({
 }
 
 export function LegacyTeamSetupDevices(props: LegacyTeamSetupDevicesProps) {
+	const devices = orderedSetupDevices(props.detail.devices);
 	return (
 		<section aria-labelledby="legacy-team-setup-step-devices">
 			<h3 id="legacy-team-setup-step-devices" tabIndex={-1}>
@@ -233,10 +253,10 @@ export function LegacyTeamSetupDevices(props: LegacyTeamSetupDevicesProps) {
 				{props.detail.candidate.deviceCount.toLocaleString()} Team devices still need a decision.
 			</p>
 			<div className="legacy-team-device-list">
-				{props.detail.devices.map((device, index) => (
+				{devices.map((device, index) => (
 					<DeviceRow
 						{...props}
-						busy={props.busyDeviceRef === device.deviceRef}
+						busy={props.busyDeviceRefs.has(device.deviceRef)}
 						device={device}
 						index={index}
 						key={device.deviceRef}
