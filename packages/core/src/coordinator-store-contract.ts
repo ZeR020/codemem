@@ -1,3 +1,8 @@
+import type {
+	CoordinatorLegacyTeamCompletionManifestV1,
+	CoordinatorLegacyTeamCompletionRecord,
+	CoordinatorLegacyTeamCompletionWriteResult,
+} from "./coordinator-legacy-team-completion.js";
 import type { RecipientReviewedIntentV1 } from "./recipient-reviewed-intent.js";
 
 /**
@@ -514,6 +519,16 @@ export interface CoordinatorStore {
 		scopeId: string,
 		includeRevoked?: boolean,
 	): Promise<CoordinatorScopeMembership[]>;
+	/**
+	 * List one device's memberships across every scope, ordered by scope_id.
+	 *
+	 * Answers "which scopes is this device in" with a single indexed lookup,
+	 * rather than reading every member of every scope one scope at a time.
+	 */
+	listDeviceScopeMemberships(
+		deviceId: string,
+		includeRevoked?: boolean,
+	): Promise<CoordinatorScopeMembership[]>;
 	listScopeMembershipAuditEvents(
 		opts: CoordinatorListScopeMembershipAuditInput,
 	): Promise<CoordinatorScopeMembershipAuditEvent[]>;
@@ -523,6 +538,15 @@ export interface CoordinatorStore {
 	listReciprocalApprovals(
 		opts: CoordinatorListReciprocalApprovalsInput,
 	): Promise<CoordinatorReciprocalApproval[]>;
+	createLegacyTeamCompletion(
+		groupId: string,
+		manifest: CoordinatorLegacyTeamCompletionManifestV1,
+	): Promise<CoordinatorLegacyTeamCompletionWriteResult>;
+	getLegacyTeamCompletion(
+		groupId: string,
+		candidateRef: string,
+	): Promise<CoordinatorLegacyTeamCompletionManifestV1 | null>;
+	listLegacyTeamCompletions(groupIds: string[]): Promise<CoordinatorLegacyTeamCompletionRecord[]>;
 	upsertPresence(opts: CoordinatorUpsertPresenceInput): Promise<CoordinatorPresenceRecord>;
 	listGroupPeers(groupId: string, requestingDeviceId: string): Promise<CoordinatorPeerRecord[]>;
 }
