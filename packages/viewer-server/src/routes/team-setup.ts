@@ -1351,7 +1351,7 @@ export function teamSetupRoutes(options: TeamSetupRoutesOptions): Hono {
 	 * authorizes. Returns null when completion I/O is not configured or current
 	 * authorization cannot be proven.
 	 */
-	function currentCompletionAuthorization(store: MemoryStore): CompletionAuthorization | null {
+	function currentCompletionAuthorization(): CompletionAuthorization | null {
 		const config = (
 			options.readCoordinatorConfig ??
 			options.snapshotLoaderDependencies?.readConfig ??
@@ -1363,11 +1363,7 @@ export function teamSetupRoutes(options: TeamSetupRoutesOptions): Hono {
 		if (!configuredCoordinatorId) return null;
 		let currentGroupIds: Set<string>;
 		try {
-			currentGroupIds = new Set(
-				legacyTeamCandidateGroupDescriptors(store, remoteUrl, config.syncCoordinatorGroups).map(
-					(group) => group.groupId,
-				),
-			);
+			currentGroupIds = new Set(configuredGroupIds(config.syncCoordinatorGroups));
 		} catch {
 			return null;
 		}
@@ -1392,19 +1388,20 @@ export function teamSetupRoutes(options: TeamSetupRoutesOptions): Hono {
 	 * before applying canonical policy, as the finish publication path does.
 	 */
 	function stillAuthorizesGroup(
-		store: MemoryStore,
 		initial: CompletionAuthorization,
 		group: LegacyTeamCandidateGroupDescriptor,
 	): boolean {
 		let current: CompletionAuthorization | null;
 		try {
-			current = currentCompletionAuthorization(store);
+			current = currentCompletionAuthorization();
 		} catch {
 			return false;
 		}
 		return (
 			current !== null &&
 			current.configuredCoordinatorId === initial.configuredCoordinatorId &&
+			current.remoteUrl === initial.remoteUrl &&
+			current.config.syncCoordinatorAdminSecret === initial.config.syncCoordinatorAdminSecret &&
 			authorizesGroup(current, group)
 		);
 	}
@@ -1492,7 +1489,7 @@ export function teamSetupRoutes(options: TeamSetupRoutesOptions): Hono {
 				serializeRecipientPolicyPublicationMutation(store.db, () =>
 					serializeRecipientPolicyTeamMutation(store.db, manifest.team_id, () =>
 						serializeRecipientPolicyCoordinatorGroupMutation(store.db, group.groupId, async () => {
-							if (!stillAuthorizesGroup(store, authorization, group)) return;
+							if (!stillAuthorizesGroup(authorization, group)) return;
 							await applyLegacyTeamSetupCompletionManifest(store.db, {
 								coordinatorId: group.coordinatorId,
 								groupId: group.groupId,
@@ -1516,7 +1513,7 @@ export function teamSetupRoutes(options: TeamSetupRoutesOptions): Hono {
 		if (!completionDependencies || groups.length === 0) return;
 		let authorization: CompletionAuthorization | null;
 		try {
-			authorization = currentCompletionAuthorization(store);
+			authorization = currentCompletionAuthorization();
 		} catch (error) {
 			throw new Error(completionApiError(error));
 		}
@@ -1766,7 +1763,7 @@ export function teamSetupRoutes(options: TeamSetupRoutesOptions): Hono {
 									}
 									// Publication sends identity and policy data to the coordinator;
 									// re-prove the destination is still the configured one.
-									if (!stillAuthorizesGroup(store, authorization, group)) {
+									if (!stillAuthorizesGroup(authorization, group)) {
 										reconstructionFailed = true;
 										return;
 									}
@@ -2454,7 +2451,6 @@ export function teamSetupRoutes(options: TeamSetupRoutesOptions): Hono {
 			if (matchingGroups.length !== 1) throw safeCoordinatorError();
 			const group = matchingGroups[0];
 			if (!group) throw safeCoordinatorError();
-			const freshRoster = group.devices;
 			releaseMutation = claimCandidateMutation(store.db, candidateRef) ?? undefined;
 			if (!releaseMutation) {
 				// An identical request may be committing right now. Wait for it and
@@ -2502,6 +2498,28 @@ export function teamSetupRoutes(options: TeamSetupRoutesOptions): Hono {
 				deterministicPolicyTeamId(candidateRef),
 				() =>
 					serializeRecipientPolicyCoordinatorGroupMutation(store.db, group.groupId, async () => {
+						let authorization: CompletionAuthorization | null;
+						try {
+							authorization = currentCompletionAuthorization();
+						} catch (error) {
+							throw new Error(completionApiError(error));
+						}
+						if (!completionDependencies || !authorization) {
+							throw new Error("team_setup_completion_unavailable");
+						}
+						if (!authorizesGroup(authorization, group)) {
+							throw new Error("team_setup_completion_invalid");
+						}
+						const { config, remoteUrl } = authorization;
+						const freshGroup = await loadFreshGroupSnapshot(
+							group,
+							remoteUrl,
+							publicationDeadlineMs,
+						);
+						if (!freshGroup) throw new Error("team_setup_roster_unavailable");
+						if (!stillAuthorizesGroup(authorization, group)) {
+							throw new Error("team_setup_completion_invalid");
+						}
 						const projectInventory = legacyTeamCandidateProjectInventory(
 							store.db,
 							projectionOptions(store),
@@ -2510,7 +2528,7 @@ export function teamSetupRoutes(options: TeamSetupRoutesOptions): Hono {
 						const freshPreview = inspectFreshLegacyTeamSetupActivation(store.db, {
 							candidateRef,
 							attemptId,
-							freshRoster,
+							freshRoster: freshGroup.devices,
 							projectInventory,
 						});
 						if (
@@ -2540,40 +2558,6 @@ export function teamSetupRoutes(options: TeamSetupRoutesOptions): Hono {
 							attemptId,
 							completedAt,
 						});
-						let config: ReturnType<typeof readCoordinatorSyncConfig>;
-						try {
-							config = (
-								options.readCoordinatorConfig ??
-								options.snapshotLoaderDependencies?.readConfig ??
-								readCoordinatorSyncConfig
-							)();
-						} catch (error) {
-							throw new Error(completionApiError(error));
-						}
-						const remoteUrl = buildBaseUrl(config.syncCoordinatorUrl);
-						if (!completionDependencies || !remoteUrl || !config.syncCoordinatorAdminSecret) {
-							throw new Error("team_setup_completion_unavailable");
-						}
-						const configuredCoordinatorId = normalizedCoordinatorId(remoteUrl);
-						let currentGroupIds: Set<string>;
-						try {
-							currentGroupIds = new Set(
-								legacyTeamCandidateGroupDescriptors(
-									store,
-									remoteUrl,
-									config.syncCoordinatorGroups,
-								).map((currentGroup) => currentGroup.groupId),
-							);
-						} catch {
-							throw new Error("team_setup_completion_invalid");
-						}
-						if (
-							!configuredCoordinatorId ||
-							!currentGroupIds.has(group.groupId) ||
-							normalizedCoordinatorId(group.coordinatorId) !== configuredCoordinatorId
-						) {
-							throw new Error("team_setup_completion_invalid");
-						}
 						const timeoutS = Math.max(1, config.syncCoordinatorTimeoutS);
 						const publicationTimeoutS = remainingCoordinatorTimeoutS(
 							timeoutS,
@@ -2639,24 +2623,26 @@ export function teamSetupRoutes(options: TeamSetupRoutesOptions): Hono {
 						// Publication is the commit point. Apply its immutable winner after binding
 						// each included device to the current coordinator roster evidence.
 						// If this reload fails, reconciliation can apply the published winner later.
-						const postPublicationGroups = await loadedCandidateSnapshots(candidateRef, {
-							deadlineMs: publicationDeadlineMs,
-						});
-						const postPublicationMatches = postPublicationGroups.filter(
-							(candidate) =>
-								candidate.coordinatorId === group.coordinatorId &&
-								candidate.groupId === group.groupId &&
-								legacyTeamCandidateId(candidate.coordinatorId, candidate.groupId) === candidateRef,
-						);
-						if (postPublicationMatches.length !== 1) {
-							throw new Error("team_setup_roster_unavailable");
+						let postPublicationGroup: LegacyTeamConfiguredGroupSnapshot | undefined;
+						try {
+							postPublicationGroup = await loadFreshGroupSnapshot(
+								group,
+								remoteUrl,
+								publicationDeadlineMs,
+							);
+						} catch (error) {
+							if (legacyTeamSetupApiErrorCode(error) === "team_setup_completion_invalid") {
+								throw new Error("team_setup_roster_unavailable");
+							}
+							throw error;
 						}
+						if (!postPublicationGroup) throw new Error("team_setup_roster_unavailable");
 						const result = await applyLegacyTeamSetupCompletionManifestAndReturnActivation(
 							store.db,
 							{
 								coordinatorId: group.coordinatorId,
 								groupId: group.groupId,
-								freshRoster: postPublicationMatches[0]?.devices ?? [],
+								freshRoster: postPublicationGroup.devices,
 								manifest: canonicalManifest,
 								expectedDraftManifest: proposedManifest,
 								recipientPolicyLocksHeld: {
