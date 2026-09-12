@@ -813,6 +813,6 @@ describe("message_end payload feeds core adapter", () => {
 		const adapter = mapPiEventPayload(payload);
 		expect(adapter?.source).toBe("pi");
 		expect(adapter?.event_type).toBe("prompt");
-		expect(adapter?.event_id).toBe("pi:s1:e1");
+		expect(adapter?.event_id).toMatch(/^pi_evt_[0-9a-f]{24}$/);
 	});
 });
