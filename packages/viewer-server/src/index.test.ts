@@ -26,6 +26,7 @@ import {
 	VERSION,
 } from "@codemem/core";
 import { serve } from "@hono/node-server";
+import type { Database as SqliteDatabase } from "better-sqlite3";
 import Database from "better-sqlite3";
 import { describe, expect, it, vi } from "vitest";
 import { type AppOptions, createApp, createSyncApp } from "./index.js";
@@ -246,7 +247,7 @@ function promptPackAttemptId(sequence: number): string {
 	return `018f2db4-f9d3-7a22-8d18-${sequence.toString(16).padStart(12, "0")}`;
 }
 
-function postViewerJson(
+async function postViewerJson(
 	app: ReturnType<typeof createApp>,
 	path: string,
 	body: unknown,
@@ -6234,6 +6235,7 @@ describe("viewer-server", () => {
 					assembly: {
 						deduped_ids: [],
 						collapsed_groups: [],
+						compressed_clusters: [],
 						trimmed_ids: [],
 						trim_reasons: [],
 						sections: {
@@ -9005,7 +9007,7 @@ describe("viewer-server", () => {
 		it("returns retryable busy when sync auth cannot record a nonce", async () => {
 			const { syncApp, ensureStore, cleanup } = createTestApp();
 			const peers: ReturnType<typeof createAuthenticatedSyncPeer>[] = [];
-			let blocker: Database | null = null;
+			let blocker: SqliteDatabase | null = null;
 			let lockReleased = false;
 			try {
 				const store = ensureStore();
@@ -9039,7 +9041,7 @@ describe("viewer-server", () => {
 					const res = await syncApp.request(request.url, {
 						method: request.method,
 						headers: request.headers,
-						body: request.bodyBytes,
+						body: request.bodyBytes === undefined ? undefined : new Uint8Array(request.bodyBytes),
 					});
 
 					expect(res.status).toBe(503);
@@ -10386,6 +10388,7 @@ describe("viewer-server", () => {
 				grantSyncScopeToDevices(store, "acme-work", ["test-device-001", peer.peerDeviceId]);
 
 				const now = "2026-01-01T00:00:00Z";
+				const activePeer = peer;
 				const makeOp = (opId: string, project: string) => ({
 					op_id: opId,
 					entity_type: "memory_item",
@@ -10403,8 +10406,8 @@ describe("viewer-server", () => {
 					}),
 					clock_rev: 1,
 					clock_updated_at: now,
-					clock_device_id: peer.peerDeviceId,
-					device_id: peer.peerDeviceId,
+					clock_device_id: activePeer.peerDeviceId,
+					device_id: activePeer.peerDeviceId,
 					created_at: now,
 					scope_id: "acme-work",
 				});
@@ -12355,7 +12358,7 @@ describe("viewer-server", () => {
 				await app.request("/api/stats");
 				const store = getStore();
 				if (!store) throw new Error("store not initialized");
-				const requestBehindPublication = async (request: () => Promise<Response>) => {
+				const requestBehindPublication = async (request: () => Response | Promise<Response>) => {
 					let releasePublication: () => void = () => undefined;
 					const publicationGate = new Promise<void>((resolve) => {
 						releasePublication = resolve;
@@ -12373,7 +12376,7 @@ describe("viewer-server", () => {
 					);
 					await publicationStarted;
 					let requestSettled = false;
-					const pendingRequest = request().then((response) => {
+					const pendingRequest = Promise.resolve(request()).then((response) => {
 						requestSettled = true;
 						return response;
 					});
@@ -13537,8 +13540,8 @@ describe("viewer-server", () => {
 				await teamMutationStarted;
 
 				let commitSettled = false;
-				const commit = app
-					.request("/api/sync/recipient-policy/v1/edges/commit", {
+				const commit = Promise.resolve(
+					app.request("/api/sync/recipient-policy/v1/edges/commit", {
 						method: "POST",
 						headers: { "content-type": "application/json" },
 						body: JSON.stringify({
@@ -13552,11 +13555,11 @@ describe("viewer-server", () => {
 							],
 							reviewedPolicyDigest: `edge-preview-v1:${"0".repeat(64)}`,
 						}),
-					})
-					.then((response) => {
-						commitSettled = true;
-						return response;
-					});
+					}),
+				).then((response) => {
+					commitSettled = true;
+					return response;
+				});
 				await new Promise((resolve) => setTimeout(resolve, 0));
 				expect(commitSettled).toBe(false);
 
@@ -13595,8 +13598,8 @@ describe("viewer-server", () => {
 				await teamMutationStarted;
 
 				let commitSettled = false;
-				const commit = app
-					.request("/api/sync/recipient-policy/v1/edges/commit", {
+				const commit = Promise.resolve(
+					app.request("/api/sync/recipient-policy/v1/edges/commit", {
 						method: "POST",
 						headers: { "content-type": "application/json" },
 						body: JSON.stringify({
@@ -13610,11 +13613,11 @@ describe("viewer-server", () => {
 							],
 							reviewedPolicyDigest: `edge-preview-v1:${"0".repeat(64)}`,
 						}),
-					})
-					.then((response) => {
-						commitSettled = true;
-						return response;
-					});
+					}),
+				).then((response) => {
+					commitSettled = true;
+					return response;
+				});
 				await new Promise((resolve) => setTimeout(resolve, 0));
 
 				expect(commitSettled).toBe(true);
@@ -15055,19 +15058,19 @@ describe("viewer-server", () => {
 				);
 				await new Promise((resolve) => setTimeout(resolve, 0));
 				let mergeSettled = false;
-				const merge = app
-					.request("/api/sync/actors/merge", {
+				const merge = Promise.resolve(
+					app.request("/api/sync/actors/merge", {
 						method: "POST",
 						headers: { "content-type": "application/json" },
 						body: JSON.stringify({
 							primary_actor_id: primaryActorId,
 							secondary_actor_id: secondaryActorId,
 						}),
-					})
-					.then((response) => {
-						mergeSettled = true;
-						return response;
-					});
+					}),
+				).then((response) => {
+					mergeSettled = true;
+					return response;
+				});
 				await new Promise((resolve) => setTimeout(resolve, 0));
 				expect(mergeSettled).toBe(false);
 				releaseMergeLock();
@@ -15086,16 +15089,16 @@ describe("viewer-server", () => {
 				);
 				await new Promise((resolve) => setTimeout(resolve, 0));
 				let deactivateSettled = false;
-				const deactivate = app
-					.request("/api/sync/actors/deactivate", {
+				const deactivate = Promise.resolve(
+					app.request("/api/sync/actors/deactivate", {
 						method: "POST",
 						headers: { "content-type": "application/json" },
 						body: JSON.stringify({ actor_id: deactivatedActorId }),
-					})
-					.then((response) => {
-						deactivateSettled = true;
-						return response;
-					});
+					}),
+				).then((response) => {
+					deactivateSettled = true;
+					return response;
+				});
 				await new Promise((resolve) => setTimeout(resolve, 0));
 				expect(deactivateSettled).toBe(false);
 				releaseDeactivateLock();
@@ -15236,7 +15239,7 @@ describe("viewer-server", () => {
 			const keysDir = mkdtempSync(join(tmpdir(), "codemem-keys-test-"));
 			const prevConfig = process.env.CODEMEM_CONFIG;
 			const prevKeysDir = process.env.CODEMEM_KEYS_DIR;
-			const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+			const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
 				const url = String(input);
 				if (url.endsWith("/v1/presence")) {
 					return new Response(JSON.stringify({ ok: true, addresses: ["http://local:7337"] }), {
@@ -19423,7 +19426,7 @@ describe("viewer-server", () => {
 				if (typeof body === "string") return JSON.parse(body) as Record<string, unknown>;
 				return {};
 			};
-			const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+			const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
 				const url = String(input);
 				if (url.includes("/v1/admin/groups/team-a/scopes?include_inactive=1")) {
 					return new Response(
@@ -19539,7 +19542,7 @@ describe("viewer-server", () => {
 				if (typeof body === "string") return JSON.parse(body) as Record<string, unknown>;
 				return {};
 			};
-			const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+			const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
 				const url = String(input);
 				if (url.includes("/v1/admin/groups/team-a/scopes/scope-a/members?include_revoked=1")) {
 					return new Response(
