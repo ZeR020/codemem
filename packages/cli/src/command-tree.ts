@@ -30,6 +30,8 @@ import {
 	showMemoryCommand,
 } from "./commands/memory.js";
 import { packCommand, promptPackLedgerCommand } from "./commands/pack.js";
+import { piHookIngestCommand } from "./commands/pi-hook-ingest.js";
+import { piHookInjectCommand } from "./commands/pi-hook-inject.js";
 import { recentCommand } from "./commands/recent.js";
 import { searchCommand } from "./commands/search.js";
 import { serveCommand } from "./commands/serve.js";
@@ -168,6 +170,8 @@ export function registerRootCommands(program: Command): Command {
 	program.addCommand(claudeHookFileContextCommand, { hidden: true });
 	program.addCommand(codexHookInjectCommand, { hidden: true });
 	program.addCommand(codexHookIngestCommand, { hidden: true });
+	program.addCommand(piHookInjectCommand, { hidden: true });
+	program.addCommand(piHookIngestCommand, { hidden: true });
 	program.addCommand(dbCommand);
 	program.addCommand(distillCommand);
 	// Warned compatibility aliases — visible for their first warned release;
