@@ -31,7 +31,7 @@ describe("pi-extension payloads ↔ core adapter", () => {
 		expect(adapter).not.toBeNull();
 		expect(adapter?.source).toBe("pi");
 		expect(adapter?.event_type).toBe("session_start");
-		expect(adapter?.event_id).toBe(`pi:${sessionId}:session_start`);
+		expect(adapter?.event_id).toMatch(/^pi_evt_[0-9a-f]{24}$/);
 
 		const envelope = buildRawEventEnvelopeFromPiEvent(payload);
 		expect(envelope?.source).toBe("pi");
@@ -58,7 +58,7 @@ describe("pi-extension payloads ↔ core adapter", () => {
 		const adapter = mapPiEventPayload(payload);
 		expect(adapter?.event_type).toBe("prompt");
 		expect(adapter?.payload).toMatchObject({ text: "fix the auth bug" });
-		expect(adapter?.event_id).toBe(`pi:${sessionId}:entry-u1`);
+		expect(adapter?.event_id).toMatch(/^pi_evt_[0-9a-f]{24}$/);
 	});
 
 	it("assistant message_end maps to assistant", () => {
@@ -85,7 +85,7 @@ describe("pi-extension payloads ↔ core adapter", () => {
 		});
 		const callAdapter = mapPiEventPayload(call);
 		expect(callAdapter?.event_type).toBe("tool_call");
-		expect(callAdapter?.event_id).toBe(`pi:${sessionId}:tc-1`);
+		expect(callAdapter?.event_id).toMatch(/^pi_evt_[0-9a-f]{24}$/);
 		expect(callAdapter?.payload).toMatchObject({
 			tool_name: "read",
 			tool_input: { path: "src/a.ts" },
@@ -102,7 +102,7 @@ describe("pi-extension payloads ↔ core adapter", () => {
 		});
 		const resultAdapter = mapPiEventPayload(result);
 		expect(resultAdapter?.event_type).toBe("tool_result");
-		expect(resultAdapter?.event_id).toBe(`pi:${sessionId}:tc-1:result`);
+		expect(resultAdapter?.event_id).toMatch(/^pi_evt_[0-9a-f]{24}$/);
 		expect(resultAdapter?.payload).toMatchObject({ status: "ok" });
 	});
 
