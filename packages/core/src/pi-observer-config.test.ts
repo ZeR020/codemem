@@ -166,8 +166,8 @@ describe("resolvePiObserverConfig — api-key happy path", () => {
 		}
 	});
 
-	it("maps anthropic-messages wire API", () => {
-		const piDir = makePiDir("anthropic");
+	it("rejects anthropic-messages for custom provider names", () => {
+		const piDir = makePiDir("anthropic-custom");
 		try {
 			writeJson(join(piDir, "settings.json"), {});
 			writeJson(join(piDir, "models.json"), {
@@ -184,8 +184,36 @@ describe("resolvePiObserverConfig — api-key happy path", () => {
 			});
 
 			const result = resolvePiObserverConfig({ piDir });
+			expect(result.ok).toBe(false);
+			if (result.ok) return;
+			expect(result.reason).toBe("unsupported-api");
+			assertNoSecretLeak(result, FIXTURE_KEY);
+		} finally {
+			rmSync(piDir, { recursive: true, force: true });
+		}
+	});
+
+	it("maps anthropic-messages for the anthropic provider", () => {
+		const piDir = makePiDir("anthropic-builtin");
+		try {
+			writeJson(join(piDir, "settings.json"), {});
+			writeJson(join(piDir, "models.json"), {
+				providers: {
+					anthropic: {
+						baseUrl: "https://api.anthropic.test",
+						api: "anthropic-messages",
+						models: [{ id: "claude-haiku-4-5" }],
+					},
+				},
+			});
+			writeJson(join(piDir, "auth.json"), {
+				anthropic: { type: "api_key", key: FIXTURE_KEY },
+			});
+
+			const result = resolvePiObserverConfig({ piDir });
 			expect(result.ok).toBe(true);
 			if (!result.ok) return;
+			expect(result.provider).toBe("anthropic");
 			expect(result.wireApi).toBe("anthropic-messages");
 			expect(result.openAIUseResponses).toBe(false);
 			expect(result.model).toBe("claude-haiku-4-5");
@@ -217,6 +245,65 @@ describe("resolvePiObserverConfig — api-key happy path", () => {
 			expect(result.apiKey).toBe(FIXTURE_KEY);
 			assertNoSecretLeak(result, FIXTURE_KEY);
 		} finally {
+			rmSync(piDir, { recursive: true, force: true });
+		}
+	});
+
+	it("resolves models.json apiKey $VAR from the environment", () => {
+		const envName = "CODEMEM_PI_OBS_KEY";
+		const prev = process.env[envName];
+		process.env[envName] = FIXTURE_KEY;
+		const piDir = makePiDir("embedded-env-key");
+		try {
+			writeJson(join(piDir, "settings.json"), {});
+			writeJson(join(piDir, "models.json"), {
+				providers: {
+					local: {
+						baseUrl: "http://127.0.0.1:11434/v1",
+						api: "openai-completions",
+						apiKey: `$${envName}`,
+						models: [{ id: "llama3.1:8b" }],
+					},
+				},
+			});
+
+			const result = resolvePiObserverConfig({ piDir });
+			expect(result.ok).toBe(true);
+			if (!result.ok) return;
+			expect(result.apiKey).toBe(FIXTURE_KEY);
+			assertNoSecretLeak(result, FIXTURE_KEY);
+		} finally {
+			if (prev === undefined) delete process.env[envName];
+			else process.env[envName] = prev;
+			rmSync(piDir, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects unresolved models.json apiKey $VAR", () => {
+		const envName = "CODEMEM_PI_OBS_UNSET_KEY";
+		const prev = process.env[envName];
+		delete process.env[envName];
+		const piDir = makePiDir("embedded-unset-key");
+		try {
+			writeJson(join(piDir, "settings.json"), {});
+			writeJson(join(piDir, "models.json"), {
+				providers: {
+					local: {
+						baseUrl: "http://127.0.0.1:11434/v1",
+						api: "openai-completions",
+						apiKey: `$${envName}`,
+						models: [{ id: "llama3.1:8b" }],
+					},
+				},
+			});
+
+			const result = resolvePiObserverConfig({ piDir });
+			expect(result.ok).toBe(false);
+			if (result.ok) return;
+			expect(result.reason).toBe("no-api-key-provider");
+		} finally {
+			if (prev === undefined) delete process.env[envName];
+			else process.env[envName] = prev;
 			rmSync(piDir, { recursive: true, force: true });
 		}
 	});
@@ -271,13 +358,13 @@ describe("resolvePiObserverConfig — cheap-first model selection", () => {
 		const piDir = makePiDir("cheap");
 		try {
 			writeJson(join(piDir, "settings.json"), {
-				defaultProvider: "acme",
-				defaultModel: "acme/claude-opus-4",
+				defaultProvider: "anthropic",
+				defaultModel: "anthropic/claude-opus-4",
 			});
 			writeJson(join(piDir, "models.json"), {
 				providers: {
-					acme: {
-						baseUrl: "https://api.acme.test",
+					anthropic: {
+						baseUrl: "https://api.anthropic.test",
 						api: "anthropic-messages",
 						models: [
 							{ id: "claude-opus-4" },
@@ -288,7 +375,7 @@ describe("resolvePiObserverConfig — cheap-first model selection", () => {
 				},
 			});
 			writeJson(join(piDir, "auth.json"), {
-				acme: { type: "api_key", key: FIXTURE_KEY },
+				anthropic: { type: "api_key", key: FIXTURE_KEY },
 			});
 
 			const result = resolvePiObserverConfig({ piDir });

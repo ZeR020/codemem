@@ -18,7 +18,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
-import { stripJsonComments, stripTrailingCommas } from "./observer-config.js";
+import { resolvePlaceholder, stripJsonComments, stripTrailingCommas } from "./observer-config.js";
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -150,6 +150,18 @@ function asString(value: unknown): string | null {
 	return typeof value === "string" && value.trim() ? value.trim() : null;
 }
 
+function resolveModelsJsonApiKey(raw: string | null): string | null {
+	if (!raw) return null;
+	const resolved = resolvePlaceholder(raw);
+	if (
+		/^\$[A-Za-z_][A-Za-z0-9_]*$/.test(resolved) ||
+		/^\$\{[A-Za-z_][A-Za-z0-9_]*\}$/.test(resolved)
+	) {
+		return null;
+	}
+	return resolved;
+}
+
 // ---------------------------------------------------------------------------
 // Explicit observer_* env override detection (caller short-circuit)
 // ---------------------------------------------------------------------------
@@ -274,7 +286,7 @@ function loadModelsJsonProviders(piDir: string): Map<
 		out.set(name, {
 			baseUrl: asString(prov.baseUrl),
 			api: asString(prov.api),
-			apiKey: asString(prov.apiKey),
+			apiKey: resolveModelsJsonApiKey(asString(prov.apiKey)),
 			models,
 		});
 	}
@@ -379,7 +391,10 @@ function buildCandidates(
 			const wireApi = asString(model.api) ?? providerApi;
 			if (!wireApi) continue;
 			sawAnyModelApi = true;
-			if (!SUPPORTED_WIRE_APIS.has(wireApi)) {
+			if (
+				!SUPPORTED_WIRE_APIS.has(wireApi) ||
+				(wireApi === "anthropic-messages" && provider.toLowerCase() !== "anthropic")
+			) {
 				sawUnsupportedApi = true;
 				continue;
 			}

@@ -2636,6 +2636,18 @@ describe("ObserverClient — pi-derived auth (D8)", () => {
 		expect(client.openaiUseResponses).toBe(true);
 	});
 
+	it("honors pi openai-completions on the no-arg ObserverClient path", () => {
+		writePiApiKeyFixture({
+			provider: "openai",
+			model: "gpt-mini",
+			baseUrl: "https://api.acme.test/v1",
+			api: "openai-completions",
+		});
+		const client = new ObserverClient();
+		expect(client.provider).toBe("openai");
+		expect(client.openaiUseResponses).toBe(false);
+	});
+
 	it("explicit CODEMEM_OBSERVER_API_KEY wins over pi", () => {
 		writePiApiKeyFixture();
 		process.env.CODEMEM_OBSERVER_API_KEY = "tok-explicit-env";
@@ -2798,6 +2810,10 @@ describe("ObserverClient — pi-derived auth (D8)", () => {
 		expect(cfg.observerRuntime).toBe("claude_sidecar");
 		// Key stays off the config object (api_http-only, resolved in-memory).
 		expect(cfg.observerApiKey).toBeNull();
+		expect(cfg.observerModel).toBeNull();
+		expect(cfg.observerProvider).toBeNull();
+		const client = new ObserverClient(cfg);
+		expect(client.model).toBe("claude-haiku-4-5");
 	});
 
 	it("still suppresses claude_sidecar auto-select when an explicit env API key is set", () => {
@@ -2823,5 +2839,67 @@ describe("ObserverClient — pi-derived auth (D8)", () => {
 		const cfg = loadObserverConfig();
 		expect(cfg.observerRuntime).toBe("codex_sidecar");
 		expect(cfg.observerApiKey).toBeNull();
+		expect(cfg.observerModel).toBeNull();
+		expect(cfg.observerProvider).toBeNull();
+		const client = new ObserverClient(cfg);
+		expect(client.model).toBe("gpt-5.1-codex-mini");
+	});
+
+	it("does not send a gateway-scoped pi openai key to api.openai.com", () => {
+		writePiApiKeyFixture({
+			provider: "openai",
+			model: "gpt-mini",
+			baseUrl: "https://gateway.example.test/v1",
+			api: "openai-completions",
+		});
+		const client = apiHttpClient("openai");
+		expect(client.getStatus().auth.source).not.toBe("pi");
+		expect(client.auth.token).not.toBe(PI_FIXTURE_KEY);
+	});
+
+	it("sends zero-config anthropic requests to the pi endpoint", async () => {
+		writePiApiKeyFixture({
+			provider: "anthropic",
+			model: "claude-haiku-4-5",
+			baseUrl: "https://proxy.anthropic.test/v1",
+			api: "anthropic-messages",
+		});
+		const previousFetch = globalThis.fetch;
+		let capturedUrl: string | undefined;
+		globalThis.fetch = (async (input: string | URL | Request) => {
+			capturedUrl = String(input);
+			return new Response(JSON.stringify({ content: [{ type: "text", text: "ok" }] }), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			});
+		}) as typeof globalThis.fetch;
+		try {
+			const client = new ObserverClient();
+			await client.observe("system", "user");
+			expect(capturedUrl).toContain("proxy.anthropic.test");
+			expect(capturedUrl).not.toContain("api.anthropic.com");
+		} finally {
+			globalThis.fetch = previousFetch;
+		}
+	});
+
+	it("does not send unauthenticated prompts on a pi-derived base URL", async () => {
+		writePiApiKeyFixture();
+		const previousFetch = globalThis.fetch;
+		let fetched = false;
+		globalThis.fetch = (async () => {
+			fetched = true;
+			return new Response("{}", { status: 200 });
+		}) as typeof globalThis.fetch;
+		try {
+			const cfg = loadObserverConfig();
+			cfg.observerAuthSource = "none";
+			const client = new ObserverClient(cfg);
+			await client.observe("system", "user");
+			expect(fetched).toBe(false);
+			expect(client.getStatus().lastError?.code).toBe("auth_missing");
+		} finally {
+			globalThis.fetch = previousFetch;
+		}
 	});
 });

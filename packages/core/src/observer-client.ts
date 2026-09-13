@@ -475,15 +475,22 @@ function applyPiDerivedObserverFields(cfg: ObserverConfig): void {
 /**
  * Resolve a pi API-key credential in memory for the observer auth cascade.
  * Returns a key only when the pi provider matches the effective observer
- * provider (case-insensitive). Null when unconfigured, oauth-only, no key,
- * or provider mismatch. NEVER log or persist the returned value.
+ * provider (case-insensitive) and the pi endpoint matches the URL we will
+ * actually call. Null when unconfigured, oauth-only, no key, provider
+ * mismatch, or endpoint mismatch. NEVER log or persist the returned value.
  */
-function resolvePiApiKeyForObserver(observerProvider: string): string | null {
+function resolvePiApiKeyForObserver(
+	observerProvider: string,
+	effectiveEndpoint: string | null,
+): string | null {
 	try {
 		const pi = resolvePiObserverConfig();
 		if (!pi.ok || !pi.apiKey) return null;
 		if (!observerProvider) return null;
 		if (pi.provider.toLowerCase() !== observerProvider.toLowerCase()) return null;
+		const piEndpoint = pi.baseUrl ?? officialObserverEndpoint(observerProvider);
+		const sendEndpoint = effectiveEndpoint ?? officialObserverEndpoint(observerProvider);
+		if (!observerEndpointsMatch(piEndpoint, sendEndpoint)) return null;
 		return pi.apiKey;
 	} catch {
 		return null;
@@ -730,13 +737,6 @@ export function loadObserverConfig(): ObserverConfig {
 	const envCodexCmd = coerceObserverCommand(process.env.CODEMEM_CODEX_COMMAND);
 	if (envCodexCmd) cfg.codexCommand = envCodexCmd;
 
-	// D8: fill unset observer provider/model/baseUrl/wire from pi. Credential is
-	// NOT copied onto cfg — resolved in-memory at ObserverClient auth time.
-	// Pi API keys must NOT participate in sidecar auto-select gates below: a
-	// dual-install user (Claude Code / Codex CLI + pi auth.json) should still
-	// get claude_sidecar / codex_sidecar. The pi key only feeds api_http auth.
-	applyPiDerivedObserverFields(cfg);
-
 	// Auto-detect Claude environment for runtime default.
 	// If running inside Claude Code (CLAUDE_CODE_ENTRYPOINT or CLAUDE_CODE_SESSION set),
 	// no explicit runtime configured, and no API key available from any provider,
@@ -788,8 +788,23 @@ export function loadObserverConfig(): ObserverConfig {
 		}
 	}
 
-	cfg.observerExplicitConfigKeys = collectExplicitObserverConfigKeys(data, process.env);
+	// D8: fill unset observer provider/model/baseUrl/wire from pi after sidecar
+	// auto-select. Sidecar runtimes must not inherit pi models. Credential is
+	// NOT copied onto cfg — resolved in-memory at ObserverClient auth time.
+	if (cfg.observerRuntime !== "claude_sidecar" && cfg.observerRuntime !== "codex_sidecar") {
+		applyPiDerivedObserverFields(cfg);
+	}
 
+	cfg.observerExplicitConfigKeys = collectExplicitObserverConfigKeys(data, process.env);
+	if (
+		cfg.observerOpenAIUseResponses !== undefined &&
+		!cfg.observerExplicitConfigKeys.includes("observerOpenAIUseResponses")
+	) {
+		cfg.observerExplicitConfigKeys = [
+			...cfg.observerExplicitConfigKeys,
+			"observerOpenAIUseResponses",
+		];
+	}
 	return cfg;
 }
 
@@ -923,7 +938,48 @@ function normalizeAnthropicModel(model: string): string {
 	return ANTHROPIC_MODEL_ALIASES[normalized.toLowerCase()] ?? normalized;
 }
 
-function resolveAnthropicEndpoint(): string {
+function stripKnownApiSuffix(url: string): string {
+	let normalized = stripTrailingSlashes(url.trim()).toLowerCase();
+	for (const suffix of ["/v1/messages", "/messages", "/chat/completions", "/responses", "/v1"]) {
+		if (normalized.endsWith(suffix)) {
+			normalized = normalized.slice(0, -suffix.length);
+			break;
+		}
+	}
+	return stripTrailingSlashes(normalized);
+}
+
+function observerEndpointsMatch(
+	a: string | null | undefined,
+	b: string | null | undefined,
+): boolean {
+	if (!a?.trim() || !b?.trim()) return false;
+	return stripKnownApiSuffix(a) === stripKnownApiSuffix(b);
+}
+
+function officialObserverEndpoint(provider: string): string {
+	if (provider === "anthropic") return ANTHROPIC_MESSAGES_ENDPOINT;
+	if (provider === "openai") return "https://api.openai.com/v1";
+	return "";
+}
+
+function isPiDerivedObserverBaseUrl(url: string): boolean {
+	try {
+		const pi = resolvePiObserverConfig();
+		if (!pi.ok || !pi.baseUrl) return false;
+		return observerEndpointsMatch(pi.baseUrl, url);
+	} catch {
+		return false;
+	}
+}
+
+function resolveAnthropicEndpoint(customBaseUrl?: string | null): string {
+	if (customBaseUrl?.trim()) {
+		const base = stripTrailingSlashes(customBaseUrl.trim());
+		if (/\/messages$/i.test(base)) return base;
+		if (/\/v1$/i.test(base)) return `${base}/messages`;
+		return `${base}/v1/messages`;
+	}
 	return process.env.CODEMEM_ANTHROPIC_ENDPOINT ?? ANTHROPIC_MESSAGES_ENDPOINT;
 }
 
@@ -1651,7 +1707,26 @@ export class ObserverClient {
 
 		const baseUrl = cfg.observerBaseUrl;
 		this._customBaseUrl = typeof baseUrl === "string" && baseUrl.trim() ? baseUrl.trim() : null;
-		this._customBaseUrlAllowsNoAuth = this._customBaseUrl != null;
+
+		// Custom pi providers need a baseUrl. Only fill for non-builtin providers
+		// that match pi — never redirect official openai/anthropic endpoints.
+		if (
+			!this._customBaseUrl &&
+			this.provider !== "openai" &&
+			this.provider !== "anthropic" &&
+			this.provider !== "opencode"
+		) {
+			try {
+				const pi = resolvePiObserverConfig();
+				if (pi.ok && pi.baseUrl && pi.provider.toLowerCase() === this.provider.toLowerCase()) {
+					this._customBaseUrl = pi.baseUrl;
+				}
+			} catch {
+				/* ignore */
+			}
+		}
+		this._customBaseUrlAllowsNoAuth =
+			this._customBaseUrl != null && !isPiDerivedObserverBaseUrl(this._customBaseUrl);
 
 		// Set up auth adapter
 		this.authAdapter = new ObserverAuthAdapter({
@@ -1667,25 +1742,11 @@ export class ObserverClient {
 		// cfg.observerApiKey (that would look "explicit" and could be persisted
 		// by callers of toConfig()). Only used as a lower-priority cascade source.
 		if (!this._apiKey) {
-			this._piApiKey = resolvePiApiKeyForObserver(this.provider);
-		}
-		// Custom pi providers need a baseUrl. Only fill for non-builtin providers
-		// that match pi — never redirect official openai/anthropic endpoints.
-		if (
-			!this._customBaseUrl &&
-			this.provider !== "openai" &&
-			this.provider !== "anthropic" &&
-			this.provider !== "opencode"
-		) {
-			try {
-				const pi = resolvePiObserverConfig();
-				if (pi.ok && pi.baseUrl && pi.provider.toLowerCase() === this.provider.toLowerCase()) {
-					this._customBaseUrl = pi.baseUrl;
-					this._customBaseUrlAllowsNoAuth = false;
-				}
-			} catch {
-				/* ignore */
-			}
+			const effectiveEndpoint =
+				this.provider === "anthropic"
+					? resolveAnthropicEndpoint(this._customBaseUrl)
+					: (this._customBaseUrl ?? officialObserverEndpoint(this.provider));
+			this._piApiKey = resolvePiApiKeyForObserver(this.provider, effectiveEndpoint);
 		}
 
 		// Initialize provider client state — skip for sidecar runtimes (no API
@@ -1967,11 +2028,16 @@ export class ObserverClient {
 							headers,
 							renderObserverHeaders(this._observerHeaders, this.auth),
 						);
-						return this._fetchJSON(resolveAnthropicEndpoint(), mergedHeaders, payload, {
-							parseResponse: parseAnthropicResponse,
-							providerLabel: "Anthropic",
-							classifyStructuredFailure: classifyAnthropicStructuredFailure,
-						});
+						return this._fetchJSON(
+							resolveAnthropicEndpoint(this._customBaseUrl),
+							mergedHeaders,
+							payload,
+							{
+								parseResponse: parseAnthropicResponse,
+								providerLabel: "Anthropic",
+								classifyStructuredFailure: classifyAnthropicStructuredFailure,
+							},
+						);
 					});
 					if (call.raw && !call.failureReason && !call.transportFailureCode) {
 						this._clearLastError();
@@ -2159,7 +2225,7 @@ export class ObserverClient {
 		systemPrompt: string,
 		userPrompt: string,
 	): Promise<ObserverCallResult> {
-		const url = resolveAnthropicEndpoint();
+		const url = resolveAnthropicEndpoint(this._customBaseUrl);
 		const token = this.auth.token ?? "";
 		const headers = buildAnthropicHeaders(token, false);
 		const mergedHeaders = mergeHeadersCaseInsensitive(
@@ -2277,7 +2343,7 @@ export class ObserverClient {
 		}
 
 		// Append ?beta=true to the endpoint
-		const baseEndpoint = resolveAnthropicEndpoint();
+		const baseEndpoint = resolveAnthropicEndpoint(this._customBaseUrl);
 		const endpointUrl = new URL(baseEndpoint);
 		endpointUrl.searchParams.set("beta", "true");
 		const url = endpointUrl.toString();
