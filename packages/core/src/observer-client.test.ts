@@ -2902,4 +2902,26 @@ describe("ObserverClient — pi-derived auth (D8)", () => {
 			globalThis.fetch = previousFetch;
 		}
 	});
+
+	it("does not send unauthenticated prompts when a pi-derived URL outlives the pi credential", async () => {
+		writePiApiKeyFixture();
+		const cfg = loadObserverConfig();
+		expect(cfg.observerBaseUrl).toBeTruthy();
+		if (!piDir) throw new Error("piDir unset");
+		rmSync(piDir, { recursive: true, force: true });
+		const previousFetch = globalThis.fetch;
+		let fetched = false;
+		globalThis.fetch = (async () => {
+			fetched = true;
+			return new Response("{}", { status: 200 });
+		}) as typeof globalThis.fetch;
+		try {
+			const client = new ObserverClient(cfg);
+			await client.observe("system", "user");
+			expect(fetched).toBe(false);
+			expect(client.getStatus().lastError?.code).toBe("auth_missing");
+		} finally {
+			globalThis.fetch = previousFetch;
+		}
+	});
 });

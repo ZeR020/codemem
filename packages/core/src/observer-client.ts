@@ -197,6 +197,11 @@ const OBSERVER_CONFIG_KEY_MAPPINGS: ObserverConfigKeyMapping[] = [
 	},
 	{ fileKey: "observer_model", envKey: "CODEMEM_OBSERVER_MODEL", normalizedKey: "observerModel" },
 	{
+		fileKey: "observer_base_url",
+		envKey: "CODEMEM_OBSERVER_BASE_URL",
+		normalizedKey: "observerBaseUrl",
+	},
+	{
 		fileKey: "observer_runtime",
 		envKey: "CODEMEM_OBSERVER_RUNTIME",
 		normalizedKey: "observerRuntime",
@@ -963,16 +968,6 @@ function officialObserverEndpoint(provider: string): string {
 	return "";
 }
 
-function isPiDerivedObserverBaseUrl(url: string): boolean {
-	try {
-		const pi = resolvePiObserverConfig();
-		if (!pi.ok || !pi.baseUrl) return false;
-		return observerEndpointsMatch(pi.baseUrl, url);
-	} catch {
-		return false;
-	}
-}
-
 function resolveAnthropicEndpoint(customBaseUrl?: string | null): string {
 	if (customBaseUrl?.trim()) {
 		const base = stripTrailingSlashes(customBaseUrl.trim());
@@ -1726,7 +1721,7 @@ export class ObserverClient {
 			}
 		}
 		this._customBaseUrlAllowsNoAuth =
-			this._customBaseUrl != null && !isPiDerivedObserverBaseUrl(this._customBaseUrl);
+			this._customBaseUrl != null && explicitConfigKeys.has("observerBaseUrl");
 
 		// Set up auth adapter
 		this.authAdapter = new ObserverAuthAdapter({
