@@ -2924,4 +2924,114 @@ describe("ObserverClient — pi-derived auth (D8)", () => {
 			globalThis.fetch = previousFetch;
 		}
 	});
+
+	it("withholds vendor env keys from a pi-derived openai endpoint", () => {
+		// Reverse direction of the gateway-key test: a zero-config pi provider
+		// literally named "openai" must not attract the official OPENAI_API_KEY.
+		writePiApiKeyFixture({
+			provider: "openai",
+			model: "gpt-mini",
+			baseUrl: "https://gateway.example.test/v1",
+			api: "openai-completions",
+		});
+		process.env.OPENAI_API_KEY = "sk-official-openai";
+		const cfg = loadObserverConfig();
+		expect(cfg.observerProvider).toBe("openai");
+		expect(cfg.observerBaseUrl).toBe("https://gateway.example.test/v1");
+		const client = new ObserverClient(cfg);
+		expect(client.getStatus().auth.source).toBe("pi");
+		expect(client.auth.token).toBe(PI_FIXTURE_KEY);
+		expect(client.auth.token).not.toBe("sk-official-openai");
+	});
+
+	it("withholds vendor env keys from a pi-derived anthropic endpoint", () => {
+		writePiApiKeyFixture({
+			provider: "anthropic",
+			model: "claude-haiku-4-5",
+			baseUrl: "https://proxy.anthropic.test/v1",
+			api: "anthropic-messages",
+		});
+		process.env.ANTHROPIC_API_KEY = "sk-official-anthropic";
+		const cfg = loadObserverConfig();
+		expect(cfg.observerProvider).toBe("anthropic");
+		expect(cfg.observerBaseUrl).toBe("https://proxy.anthropic.test/v1");
+		const client = new ObserverClient(cfg);
+		expect(client.getStatus().auth.source).toBe("pi");
+		expect(client.auth.token).toBe(PI_FIXTURE_KEY);
+		expect(client.auth.token).not.toBe("sk-official-anthropic");
+	});
+
+	it("still uses vendor env keys on the official provider endpoint", () => {
+		writePiApiKeyFixture({
+			provider: "openai",
+			model: "gpt-mini",
+			baseUrl: "https://api.openai.com/v1",
+			api: "openai-completions",
+		});
+		process.env.OPENAI_API_KEY = "sk-official-openai";
+		const client = new ObserverClient(loadObserverConfig());
+		expect(client.getStatus().auth.source).toBe("env");
+		expect(client.auth.token).toBe("sk-official-openai");
+	});
+
+	it("prefers the OpenCode provider block over a pi URL for the same provider", async () => {
+		// pi and OpenCode both configure provider "acme" with different URLs and
+		// keys. Endpoint and credential must come from the same source: the
+		// OpenCode block wins outright, so its key is never sent to the pi host.
+		writePiApiKeyFixture({
+			provider: "acme",
+			model: "gpt-mini",
+			baseUrl: "https://pi-acme.test/v1",
+		});
+		if (!tmpHome) throw new Error("tmpHome unset");
+		const configDir = join(tmpHome, ".config", "opencode");
+		mkdirSync(configDir, { recursive: true });
+		writeFileSync(
+			join(configDir, "opencode.jsonc"),
+			JSON.stringify({
+				provider: {
+					acme: {
+						options: { baseURL: "https://opencode-acme.test/v1", apiKey: "sk-opencode-acme" },
+						models: { "gpt-mini": { id: "gpt-mini" } },
+					},
+				},
+			}),
+		);
+
+		const previousFetch = globalThis.fetch;
+		let capturedUrl: string | undefined;
+		let capturedAuth: string | undefined;
+		globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+			capturedUrl = String(input);
+			capturedAuth = (init?.headers as Record<string, string> | undefined)?.authorization;
+			return new Response(JSON.stringify({ choices: [{ message: { content: "ok" } }] }), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			});
+		}) as typeof globalThis.fetch;
+		try {
+			const client = new ObserverClient({
+				observerProvider: "acme",
+				observerModel: "acme/gpt-mini",
+				observerRuntime: "api_http",
+				observerApiKey: null,
+				observerBaseUrl: null,
+				observerMaxChars: 12_000,
+				observerMaxTokens: 4_000,
+				observerHeaders: {},
+				observerAuthSource: "auto",
+				observerAuthFile: null,
+				observerAuthCommand: [],
+				observerAuthTimeoutMs: 1500,
+				observerAuthCacheTtlS: 300,
+			});
+			expect(client.auth.token).toBe("sk-opencode-acme");
+			await client.observe("system", "user");
+			expect(capturedUrl).toContain("opencode-acme.test");
+			expect(capturedUrl).not.toContain("pi-acme.test");
+			expect(capturedAuth).toBe("Bearer sk-opencode-acme");
+		} finally {
+			globalThis.fetch = previousFetch;
+		}
+	});
 });

@@ -968,6 +968,23 @@ function officialObserverEndpoint(provider: string): string {
 	return "";
 }
 
+/**
+ * Endpoint provenance rule for provider/model overrides. A non-explicit
+ * observerBaseUrl is pi-derived and belongs to the provider that produced it;
+ * when an override changes the effective provider, the stale URL must be
+ * cleared so vendor credentials and memory content never reach the pi
+ * endpoint. Explicit (file/env) URLs survive — the user owns those.
+ */
+export function observerBaseUrlForProviderOverride(
+	base: ObserverConfig,
+	nextProvider: string,
+): string | null {
+	const explicit = (base.observerExplicitConfigKeys ?? []).includes("observerBaseUrl");
+	const producedBy = (base.observerProvider ?? "").trim().toLowerCase();
+	if (!explicit && producedBy !== nextProvider.trim().toLowerCase()) return null;
+	return base.observerBaseUrl ?? null;
+}
+
 function resolveAnthropicEndpoint(customBaseUrl?: string | null): string {
 	if (customBaseUrl?.trim()) {
 		const base = stripTrailingSlashes(customBaseUrl.trim());
@@ -1705,6 +1722,9 @@ export class ObserverClient {
 
 		// Custom pi providers need a baseUrl. Only fill for non-builtin providers
 		// that match pi — never redirect official openai/anthropic endpoints.
+		// Skip the pi fill when an OpenCode provider block exists: its credential
+		// (highest-priority token in _initProvider) must never be sent to the pi
+		// endpoint — endpoint and key must come from the same source.
 		if (
 			!this._customBaseUrl &&
 			this.provider !== "openai" &&
@@ -1713,7 +1733,12 @@ export class ObserverClient {
 		) {
 			try {
 				const pi = resolvePiObserverConfig();
-				if (pi.ok && pi.baseUrl && pi.provider.toLowerCase() === this.provider.toLowerCase()) {
+				if (
+					pi.ok &&
+					pi.baseUrl &&
+					pi.provider.toLowerCase() === this.provider.toLowerCase() &&
+					Object.keys(getOpenCodeProviderConfig(this.provider)).length === 0
+				) {
 					this._customBaseUrl = pi.baseUrl;
 				}
 			} catch {
@@ -2107,6 +2132,19 @@ export class ObserverClient {
 			}
 		}
 
+		// Vendor-scoped env/OAuth credentials (OPENAI_API_KEY, ANTHROPIC_API_KEY,
+		// OPENCODE_API_KEY, CODEX_API_KEY, Anthropic OAuth) only flow to the official
+		// provider endpoint. A custom base URL (e.g. a pi-derived gateway literally
+		// named "openai") gets the generic CODEMEM_OBSERVER_API_KEY override or the
+		// endpoint-checked pi key instead — never a vendor credential.
+		const vendorCredentialsAllowed =
+			!this._customBaseUrl ||
+			observerEndpointsMatch(
+				this.provider === "anthropic"
+					? resolveAnthropicEndpoint(this._customBaseUrl)
+					: this._customBaseUrl,
+				officialObserverEndpoint(this.provider),
+			);
 		if (this.provider !== "openai" && this.provider !== "anthropic") {
 			// Custom provider — resolve base URL, model ID, and headers from OpenCode config
 			const providerConfig = getOpenCodeProviderConfig(this.provider);
@@ -2141,8 +2179,8 @@ export class ObserverClient {
 		} else if (this.provider === "anthropic") {
 			this.auth = this.authAdapter.resolve({
 				explicitToken: this._apiKey,
-				envTokens: [process.env.ANTHROPIC_API_KEY ?? ""],
-				oauthToken: oauthAccess,
+				envTokens: vendorCredentialsAllowed ? [process.env.ANTHROPIC_API_KEY ?? ""] : [],
+				oauthToken: vendorCredentialsAllowed ? oauthAccess : null,
 				piToken: this._piApiKey,
 				forceRefresh,
 			});
@@ -2153,12 +2191,14 @@ export class ObserverClient {
 			// OpenAI
 			this.auth = this.authAdapter.resolve({
 				explicitToken: this._apiKey,
-				envTokens: [
-					process.env.OPENCODE_API_KEY ?? "",
-					process.env.OPENAI_API_KEY ?? "",
-					process.env.CODEX_API_KEY ?? "",
-				],
-				oauthToken: oauthAccess,
+				envTokens: vendorCredentialsAllowed
+					? [
+							process.env.OPENCODE_API_KEY ?? "",
+							process.env.OPENAI_API_KEY ?? "",
+							process.env.CODEX_API_KEY ?? "",
+						]
+					: [],
+				oauthToken: vendorCredentialsAllowed ? oauthAccess : null,
 				piToken: this._piApiKey,
 				forceRefresh,
 			});
