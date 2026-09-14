@@ -2558,6 +2558,22 @@ describe("ObserverClient — pi-derived auth (D8)", () => {
 		);
 	}
 
+	function writeOpenCodeAcmeFixture() {
+		if (!tmpHome) throw new Error("tmpHome unset");
+		const configDir = join(tmpHome, ".config", "opencode");
+		mkdirSync(configDir, { recursive: true });
+		writeFileSync(
+			join(configDir, "opencode.jsonc"),
+			JSON.stringify({
+				provider: {
+					acme: {
+						options: { baseURL: "https://opencode-acme.test/v1", apiKey: "sk-opencode-acme" },
+						models: { "gpt-mini": { id: "gpt-mini" } },
+					},
+				},
+			}),
+		);
+	}
 	it("uses pi auth.json api key when no explicit observer key/env is set", () => {
 		writePiApiKeyFixture();
 		// Simulate setup having written provider/model/baseUrl but NEVER the key.
@@ -2944,6 +2960,34 @@ describe("ObserverClient — pi-derived auth (D8)", () => {
 		expect(client.auth.token).not.toBe("sk-official-openai");
 	});
 
+	it("withholds codex OAuth from a pi-derived openai endpoint", () => {
+		writePiApiKeyFixture({
+			provider: "openai",
+			model: "gpt-mini",
+			baseUrl: "https://gateway.example.test/v1",
+			api: "openai-completions",
+		});
+		if (!tmpHome) throw new Error("tmpHome unset");
+		const oauthDir = join(tmpHome, ".local", "share", "opencode");
+		mkdirSync(oauthDir, { recursive: true });
+		writeFileSync(
+			join(oauthDir, "auth.json"),
+			JSON.stringify({
+				openai: {
+					type: "oauth",
+					access: "codex-oauth-access-token",
+					refresh: "codex-oauth-refresh",
+					expires: Date.now() + 3_600_000,
+				},
+			}),
+		);
+
+		const client = new ObserverClient(loadObserverConfig());
+		expect(client.getStatus().auth.source).toBe("pi");
+		expect(client.auth.token).toBe(PI_FIXTURE_KEY);
+		expect(JSON.stringify(client.getStatus())).not.toContain("codex-oauth-access-token");
+	});
+
 	it("withholds vendor env keys from a pi-derived anthropic endpoint", () => {
 		writePiApiKeyFixture({
 			provider: "anthropic",
@@ -2983,20 +3027,7 @@ describe("ObserverClient — pi-derived auth (D8)", () => {
 			model: "gpt-mini",
 			baseUrl: "https://pi-acme.test/v1",
 		});
-		if (!tmpHome) throw new Error("tmpHome unset");
-		const configDir = join(tmpHome, ".config", "opencode");
-		mkdirSync(configDir, { recursive: true });
-		writeFileSync(
-			join(configDir, "opencode.jsonc"),
-			JSON.stringify({
-				provider: {
-					acme: {
-						options: { baseURL: "https://opencode-acme.test/v1", apiKey: "sk-opencode-acme" },
-						models: { "gpt-mini": { id: "gpt-mini" } },
-					},
-				},
-			}),
-		);
+		writeOpenCodeAcmeFixture();
 
 		const previousFetch = globalThis.fetch;
 		let capturedUrl: string | undefined;
@@ -3044,20 +3075,7 @@ describe("ObserverClient — pi-derived auth (D8)", () => {
 			model: "gpt-mini",
 			baseUrl: "https://pi-acme.test/v1",
 		});
-		if (!tmpHome) throw new Error("tmpHome unset");
-		const configDir = join(tmpHome, ".config", "opencode");
-		mkdirSync(configDir, { recursive: true });
-		writeFileSync(
-			join(configDir, "opencode.jsonc"),
-			JSON.stringify({
-				provider: {
-					acme: {
-						options: { baseURL: "https://opencode-acme.test/v1", apiKey: "sk-opencode-acme" },
-						models: { "gpt-mini": { id: "gpt-mini" } },
-					},
-				},
-			}),
-		);
+		writeOpenCodeAcmeFixture();
 
 		const cfg = loadObserverConfig();
 		expect(cfg.observerProvider).toBe("acme");

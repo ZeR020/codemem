@@ -33,6 +33,7 @@ import {
 	coerceObserverCommand,
 	getOpenCodeProviderConfig,
 	getProviderApiKey,
+	hasOpenCodeProviderConfig,
 	listConfiguredOpenCodeProviders,
 	resolveBuiltInProviderDefaultModel,
 	resolveBuiltInProviderFromModel,
@@ -468,11 +469,7 @@ function applyPiDerivedObserverFields(cfg: ObserverConfig): void {
 		// Never combine the pi URL with an OpenCode provider block's credential:
 		// when a block exists for this provider, _initProvider resolves endpoint
 		// and key from OpenCode instead.
-		if (
-			!cfg.observerBaseUrl &&
-			pi.baseUrl &&
-			Object.keys(getOpenCodeProviderConfig(pi.provider)).length === 0
-		) {
+		if (!cfg.observerBaseUrl && pi.baseUrl && !hasOpenCodeProviderConfig(pi.provider)) {
 			cfg.observerBaseUrl = pi.baseUrl;
 		}
 		if (cfg.observerOpenAIUseResponses === undefined) {
@@ -1750,7 +1747,7 @@ export class ObserverClient {
 					pi.ok &&
 					pi.baseUrl &&
 					pi.provider.toLowerCase() === this.provider.toLowerCase() &&
-					Object.keys(getOpenCodeProviderConfig(this.provider)).length === 0
+					!hasOpenCodeProviderConfig(this.provider)
 				) {
 					this._customBaseUrl = pi.baseUrl;
 				}
@@ -1775,10 +1772,7 @@ export class ObserverClient {
 		// cfg.observerApiKey (that would look "explicit" and could be persisted
 		// by callers of toConfig()). Only used as a lower-priority cascade source.
 		if (!this._apiKey) {
-			const effectiveEndpoint =
-				this.provider === "anthropic"
-					? resolveAnthropicEndpoint(this._customBaseUrl)
-					: (this._customBaseUrl ?? officialObserverEndpoint(this.provider));
+			const effectiveEndpoint = effectiveObserverEndpoint(this.provider, this._customBaseUrl);
 			this._piApiKey = resolvePiApiKeyForObserver(this.provider, effectiveEndpoint);
 		}
 
@@ -2153,9 +2147,7 @@ export class ObserverClient {
 		const vendorCredentialsAllowed =
 			!this._customBaseUrl ||
 			observerEndpointsMatch(
-				this.provider === "anthropic"
-					? resolveAnthropicEndpoint(this._customBaseUrl)
-					: this._customBaseUrl,
+				effectiveObserverEndpoint(this.provider, this._customBaseUrl),
 				officialObserverEndpoint(this.provider),
 			);
 		if (this.provider !== "openai" && this.provider !== "anthropic") {
@@ -3037,4 +3029,15 @@ function tryParseJSON(text: string): Record<string, unknown> | null {
 	} catch {
 		return null;
 	}
+}
+
+/**
+ * The endpoint we will actually call for a provider, given a custom base URL.
+ * Used by every endpoint-identity check (pi-key adoption, vendor-credential
+ * gate) so the checks can never drift apart.
+ */
+function effectiveObserverEndpoint(provider: string, customBaseUrl: string | null): string {
+	return provider === "anthropic"
+		? resolveAnthropicEndpoint(customBaseUrl)
+		: (customBaseUrl ?? officialObserverEndpoint(provider));
 }
