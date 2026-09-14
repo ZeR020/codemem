@@ -465,7 +465,16 @@ function applyPiDerivedObserverFields(cfg: ObserverConfig): void {
 		if (cfg.observerModel) return;
 		cfg.observerProvider = pi.provider;
 		cfg.observerModel = pi.model;
-		if (!cfg.observerBaseUrl && pi.baseUrl) cfg.observerBaseUrl = pi.baseUrl;
+		// Never combine the pi URL with an OpenCode provider block's credential:
+		// when a block exists for this provider, _initProvider resolves endpoint
+		// and key from OpenCode instead.
+		if (
+			!cfg.observerBaseUrl &&
+			pi.baseUrl &&
+			Object.keys(getOpenCodeProviderConfig(pi.provider)).length === 0
+		) {
+			cfg.observerBaseUrl = pi.baseUrl;
+		}
 		if (cfg.observerOpenAIUseResponses === undefined) {
 			cfg.observerOpenAIUseResponses = pi.openAIUseResponses;
 		}
@@ -945,13 +954,17 @@ function normalizeAnthropicModel(model: string): string {
 
 function stripKnownApiSuffix(url: string): string {
 	let normalized = stripTrailingSlashes(url.trim()).toLowerCase();
-	for (const suffix of ["/v1/messages", "/messages", "/chat/completions", "/responses", "/v1"]) {
-		if (normalized.endsWith(suffix)) {
-			normalized = normalized.slice(0, -suffix.length);
-			break;
+	// Strip repeatedly: an explicit official endpoint may be written as far as
+	// ".../v1/chat/completions" and must still converge on the bare host.
+	for (;;) {
+		const before = normalized;
+		for (const suffix of ["/v1/messages", "/messages", "/chat/completions", "/responses", "/v1"]) {
+			if (normalized.endsWith(suffix)) {
+				normalized = stripTrailingSlashes(normalized.slice(0, -suffix.length));
+			}
 		}
+		if (normalized === before) return normalized;
 	}
-	return stripTrailingSlashes(normalized);
 }
 
 function observerEndpointsMatch(

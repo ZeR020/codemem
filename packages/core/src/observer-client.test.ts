@@ -3034,4 +3034,44 @@ describe("ObserverClient — pi-derived auth (D8)", () => {
 			globalThis.fetch = previousFetch;
 		}
 	});
+
+	it("does not fill the pi base URL in loadObserverConfig when an OpenCode provider block exists", () => {
+		// The production zero-config path: applyPiDerivedObserverFields must not
+		// stamp the pi URL onto cfg when OpenCode owns the provider — otherwise the
+		// constructor guard never engages and the OpenCode key leaks to the pi host.
+		writePiApiKeyFixture({
+			provider: "acme",
+			model: "gpt-mini",
+			baseUrl: "https://pi-acme.test/v1",
+		});
+		if (!tmpHome) throw new Error("tmpHome unset");
+		const configDir = join(tmpHome, ".config", "opencode");
+		mkdirSync(configDir, { recursive: true });
+		writeFileSync(
+			join(configDir, "opencode.jsonc"),
+			JSON.stringify({
+				provider: {
+					acme: {
+						options: { baseURL: "https://opencode-acme.test/v1", apiKey: "sk-opencode-acme" },
+						models: { "gpt-mini": { id: "gpt-mini" } },
+					},
+				},
+			}),
+		);
+
+		const cfg = loadObserverConfig();
+		expect(cfg.observerProvider).toBe("acme");
+		expect(cfg.observerBaseUrl).toBeNull();
+		const client = new ObserverClient(cfg);
+		expect(client.auth.token).toBe("sk-opencode-acme");
+	});
+
+	it("keeps vendor env keys when the official endpoint is written with a full API path", () => {
+		process.env.CODEMEM_OBSERVER_BASE_URL = "https://api.openai.com/v1/chat/completions";
+		process.env.OPENAI_API_KEY = "sk-official-openai";
+		const client = new ObserverClient(loadObserverConfig());
+		expect(client.provider).toBe("openai");
+		expect(client.getStatus().auth.source).toBe("env");
+		expect(client.auth.token).toBe("sk-official-openai");
+	});
 });

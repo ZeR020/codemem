@@ -622,7 +622,12 @@ export type {
 	ObserverStatus,
 	ObserverTokenUsage,
 } from "./observer-client.js";
-export { loadObserverConfig, ObserverAuthError, ObserverClient } from "./observer-client.js";
+export {
+	loadObserverConfig,
+	ObserverAuthError,
+	ObserverClient,
+	observerBaseUrlForProviderOverride,
+} from "./observer-client.js";
 export * from "./observer-concepts.js";
 export type {
 	ConfigPathResolution,
