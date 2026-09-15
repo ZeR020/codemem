@@ -987,17 +987,57 @@ describe("Biome indirect policy controls", () => {
 });
 
 describe("Biome policy fail-closed controls", () => {
-	it("fails closed when lint overrides change or linting is disabled", () => {
+	it("allows appended error-only overrides", () => {
 		const base = JSON.parse(config());
-		const overridden = {
+		base.overrides = [{ includes: ["src/**"], formatter: { enabled: false } }];
+		const head = {
 			...base,
-			overrides: [{ includes: ["src/**"], linter: { enabled: false } }],
+			overrides: [
+				...base.overrides,
+				{
+					includes: ["packages/opencode-plugin/**"],
+					linter: { rules: { style: { noNestedTernary: "error" } } },
+				},
+			],
 		};
+
+		expect(compareBiomePolicy(JSON.stringify(base), JSON.stringify(head), [])).toEqual([]);
+	});
+
+	it("requires review when an existing override changes", () => {
+		const base = JSON.parse(config());
+		base.overrides = [
+			{
+				includes: ["src/**"],
+				linter: { rules: { style: { noNestedTernary: "error" } } },
+			},
+		];
+		const head = structuredClone(base);
+		head.overrides[0].includes = ["packages/**"];
+
+		expect(compareBiomePolicy(JSON.stringify(base), JSON.stringify(head), [])).toContainEqual({
+			kind: "rule-level",
+			message: "Biome lint overrides changed; explicit policy review required",
+		});
+	});
+
+	it("fails closed when lint overrides weaken policy or linting is disabled", () => {
+		const base = JSON.parse(config());
 		const disabled = { ...base, linter: { ...base.linter, enabled: false } };
 
-		expect(compareBiomePolicy(JSON.stringify(base), JSON.stringify(overridden), [])).toMatchObject([
-			{ kind: "rule-level" },
-		]);
+		for (const override of [
+			{ includes: ["src/**"], linter: { enabled: false } },
+			{ includes: ["src/**"], linter: { rules: { style: { noNestedTernary: "warn" } } } },
+			{ includes: ["!src/**"], linter: { rules: { style: { noNestedTernary: "error" } } } },
+		]) {
+			expect(
+				compareBiomePolicy(
+					JSON.stringify(base),
+					JSON.stringify({ ...base, overrides: [override] }),
+					[],
+				),
+			).toMatchObject([{ kind: "rule-level" }]);
+		}
 		expect(compareBiomePolicy(JSON.stringify(base), JSON.stringify(disabled), [])).toMatchObject([
 			{ kind: "rule-level", message: "Biome linter disabled" },
 		]);

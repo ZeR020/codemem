@@ -1112,8 +1112,52 @@ function lintOverrides(config: UnknownRecord): unknown[] {
 	});
 }
 
+function hasOnlyKeys(record: UnknownRecord, expected: string[]): boolean {
+	const keys = Object.keys(record).sort();
+	return JSON.stringify(keys) === JSON.stringify([...expected].sort());
+}
+
+function isErrorOnlyRuleTree(value: unknown): boolean {
+	if (!isRecord(value)) return false;
+	const settings = Object.values(value);
+	return (
+		settings.length > 0 &&
+		settings.every((setting) => setting === "error" || isErrorOnlyRuleTree(setting))
+	);
+}
+
+function isStrictOverrideAddition(value: unknown): boolean {
+	if (!isRecord(value) || !hasOnlyKeys(value, ["includes", "linter"])) return false;
+	const includes = stringArray(value.includes);
+	if (
+		!Array.isArray(value.includes) ||
+		includes.length !== value.includes.length ||
+		includes.length === 0 ||
+		includes.some((include) => include.startsWith("!"))
+	) {
+		return false;
+	}
+	if (!isRecord(value.linter) || !hasOnlyKeys(value.linter, ["rules"])) return false;
+	return isErrorOnlyRuleTree(value.linter.rules);
+}
+
+function addsOnlyStrictOverrides(base: unknown[], head: unknown[]): boolean {
+	if (head.length <= base.length) return false;
+	if (base.some((override, index) => JSON.stringify(override) !== JSON.stringify(head[index]))) {
+		return false;
+	}
+	return head.slice(base.length).every(isStrictOverrideAddition);
+}
+
 function overrideViolations(base: UnknownRecord, head: UnknownRecord): PolicyViolation[] {
-	if (JSON.stringify(lintOverrides(base)) === JSON.stringify(lintOverrides(head))) return [];
+	const baseOverrides = lintOverrides(base);
+	const headOverrides = lintOverrides(head);
+	if (
+		JSON.stringify(baseOverrides) === JSON.stringify(headOverrides) ||
+		addsOnlyStrictOverrides(baseOverrides, headOverrides)
+	) {
+		return [];
+	}
 	return [
 		{
 			kind: "rule-level",

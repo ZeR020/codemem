@@ -917,11 +917,11 @@ const classifyPromptTransportFailure = ({ kind, compatibleProfile = false }) => 
 };
 
 const isViewerPolicyOrAuthFailurePayload = (payload) => {
-  const code = isRecord(payload) && isRecord(payload.error)
-    ? payload.error.code
-    : isRecord(payload)
-    ? payload.error
-    : null;
+  let code = null;
+  if (isRecord(payload)) {
+    if (isRecord(payload.error)) code = payload.error.code;
+    else code = payload.error;
+  }
   return typeof code === "string" && [
     "authorization_failed",
     "forbidden",

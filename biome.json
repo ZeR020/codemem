@@ -121,6 +121,16 @@
 					}
 				}
 			}
+		},
+		{
+			"includes": ["packages/opencode-plugin/**"],
+			"linter": {
+				"rules": {
+					"style": {
+						"noNestedTernary": "error"
+					}
+				}
+			}
 		}
 	]
 }
