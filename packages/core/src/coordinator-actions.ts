@@ -49,9 +49,10 @@ import {
 import { connect, resolveDbPath } from "./db.js";
 import { initDatabase } from "./maintenance.js";
 import {
+	deleteCodememConfigFile,
+	mutateCodememConfigFile,
 	readCodememConfigFile,
 	readCodememConfigFileAtPath,
-	writeCodememConfigFile,
 } from "./observer-config.js";
 import {
 	PROJECT_INVITE_PENDING_STATUS,
@@ -118,6 +119,110 @@ function enableInviteSync(config: Record<string, unknown>): Record<string, unkno
 	};
 }
 
+function configuredCoordinatorGroups(config: Record<string, unknown>): string[] {
+	const plural = config.sync_coordinator_groups;
+	if (Array.isArray(plural)) return plural.map((group) => String(group).trim()).filter(Boolean);
+	if (typeof plural === "string") {
+		return plural
+			.split(",")
+			.map((group) => group.trim())
+			.filter(Boolean);
+	}
+	const singular = config.sync_coordinator_group;
+	return typeof singular === "string" && singular.trim() ? [singular.trim()] : [];
+}
+
+function normalizeCoordinatorUrl(value: string): string {
+	return stripTrailingSlashes(value.trim());
+}
+
+function assertInviteConfigCompatibility(
+	config: Record<string, unknown>,
+	constraint: {
+		coordinatorUrl: string;
+		identity?: { actorId: string; compatibleExistingActorIds: readonly string[] };
+	},
+): void {
+	const existingCoordinator = normalizeCoordinatorUrl(String(config.sync_coordinator_url ?? ""));
+	const incomingCoordinator = normalizeCoordinatorUrl(constraint.coordinatorUrl);
+	if (existingCoordinator && existingCoordinator !== incomingCoordinator) {
+		throw new Error(
+			`This device is already enrolled with coordinator ${existingCoordinator}. Multi-team joining is only supported across groups on the same coordinator.`,
+		);
+	}
+	if (!constraint.identity) return;
+	const existingActorId = String(config.actor_id ?? "").trim();
+	if (
+		!existingActorId ||
+		existingActorId === constraint.identity.actorId ||
+		constraint.identity.compatibleExistingActorIds.includes(existingActorId)
+	) {
+		return;
+	}
+	throw new Error("invite_identity_conflict");
+}
+
+function inviteIdentityConstraint(
+	identity: { actorId: string } | undefined,
+	config: Record<string, unknown>,
+	payload: InvitePayload,
+	deviceId: string,
+) {
+	if (!identity) return undefined;
+	const compatibleExistingActorIds = [
+		String(config.actor_id ?? "").trim(),
+		payload.kind === "team_member" || payload.kind === "add_device" ? `local:${deviceId}` : "",
+	].filter(Boolean);
+	return { actorId: identity.actorId, compatibleExistingActorIds };
+}
+
+function updateInviteConfig(opts: {
+	configPath?: string | null;
+	coordinatorUrl: string;
+	groupId: string;
+	enableSync: boolean;
+	identity?: { actorId: string; actorName: string; deviceName: string };
+	identityConstraint?: { actorId: string; compatibleExistingActorIds: readonly string[] };
+}): {
+	path: string;
+	mutationPath: string;
+	previous: Record<string, unknown>;
+	revision: string;
+	groups: string[];
+	created: boolean;
+} {
+	let previous: Record<string, unknown> = {};
+	let created = false;
+	let groups: string[] = [];
+	const result = mutateCodememConfigFile((current, outcome) => {
+		assertInviteConfigCompatibility(current, {
+			coordinatorUrl: opts.coordinatorUrl,
+			identity: opts.identityConstraint,
+		});
+		previous = { ...current };
+		created = outcome.status === "missing";
+		const next = opts.enableSync ? enableInviteSync({ ...current }) : { ...current };
+		next.sync_coordinator_url = opts.coordinatorUrl;
+		if (opts.identity) {
+			next.actor_id = opts.identity.actorId;
+			next.actor_display_name = opts.identity.actorName;
+			next.sync_device_name = opts.identity.deviceName;
+		}
+		groups = Array.from(new Set([...configuredCoordinatorGroups(next), opts.groupId]));
+		next.sync_coordinator_groups = groups;
+		next.sync_coordinator_group = groups[0] ?? opts.groupId;
+		return next;
+	}, opts.configPath ?? undefined);
+	return {
+		path: result.path,
+		mutationPath: result.mutationPath,
+		previous,
+		revision: result.revision,
+		groups,
+		created,
+	};
+}
+
 function coordinatorRemoteTarget(config = readCodememConfigFile()): {
 	remoteUrl: string | null;
 	adminSecret: string | null;
@@ -140,6 +245,34 @@ export class RemoteCoordinatorRequestError extends Error {
 		super(`Remote coordinator request failed (${status}): ${code}`);
 		this.name = "RemoteCoordinatorRequestError";
 	}
+}
+
+function isAlreadyArchivedRemoteError(error: unknown): boolean {
+	return (
+		error instanceof RemoteCoordinatorRequestError &&
+		error.status === 404 &&
+		error.code === "group_not_found_or_already_archived"
+	);
+}
+
+function archivedGroupFromPayload(
+	payload: Record<string, unknown> | null,
+	groupId: string,
+): CoordinatorGroup {
+	const group = payload?.group;
+	const archivedAt =
+		group && typeof group === "object" && "archived_at" in group ? group.archived_at : null;
+	const archivedGroupId =
+		group && typeof group === "object" && "group_id" in group ? group.group_id : null;
+	if (
+		archivedGroupId !== groupId ||
+		typeof archivedAt !== "string" ||
+		!archivedAt.trim() ||
+		!Number.isFinite(Date.parse(archivedAt))
+	) {
+		throw new Error("Coordinator archive response missing group.");
+	}
+	return group as CoordinatorGroup;
 }
 
 async function remoteRequest(
@@ -382,12 +515,10 @@ export async function coordinatorArchiveGroupAction(opts: {
 				{ group_id: groupId },
 			);
 		} catch (error) {
-			if (error instanceof Error && error.message.includes("group_not_found_or_already_archived"))
-				return null;
+			if (isAlreadyArchivedRemoteError(error)) return null;
 			throw error;
 		}
-		const group = payload?.group;
-		return group && typeof group === "object" ? (group as CoordinatorGroup) : null;
+		return archivedGroupFromPayload(payload, groupId);
 	}
 	const store = new BetterSqliteCoordinatorStore(opts.dbPath ?? DEFAULT_COORDINATOR_DB_PATH);
 	try {
@@ -2342,14 +2473,6 @@ export async function coordinatorImportInviteAction(opts: {
 					"device_display_name",
 				)
 			: recipientDisplayName;
-	// V1 of multi-team assumes one coordinator hosting multiple groups.
-	// If this device is already enrolled in a different coordinator, surface
-	// that as a hard error instead of silently overwriting the existing
-	// coordinator URL and orphaning the prior group memberships. Normalize
-	// trailing slashes before comparing so harmless formatting differences
-	// (e.g. `https://coord.example.com` vs. `…/`) don't reject valid same-
-	// coordinator invites.
-	const normalizeCoordinatorUrl = (value: string): string => stripTrailingSlashes(value.trim());
 	const existingCoordinator = normalizeCoordinatorUrl(String(config.sync_coordinator_url ?? ""));
 	const incomingCoordinator = normalizeCoordinatorUrl(coordinatorUrl);
 	if (existingCoordinator && existingCoordinator !== incomingCoordinator) {
@@ -2520,40 +2643,25 @@ export async function coordinatorImportInviteAction(opts: {
 			reviewedOnboardingDigest,
 		};
 	}
-	const previousConfig = opts.configPath
-		? readCodememConfigFileAtPath(opts.configPath)
-		: readCodememConfigFile();
-	let nextConfig = { ...previousConfig };
-	if (projectInvite || recipientInvite) nextConfig = enableInviteSync(nextConfig);
-	nextConfig.sync_coordinator_url = coordinatorUrl;
-	if (projectInvite || recipientInvite) {
-		nextConfig.actor_id = recipientActorId;
-		nextConfig.actor_display_name = persistedRecipientDisplayName;
-		nextConfig.sync_device_name = displayName;
-	}
-	// Append the new group to sync_coordinator_groups (dedup) instead of
-	// overwriting sync_coordinator_group. The runtime reads both the plural
-	// and singular forms; we keep singular pointing at the first group for
-	// legacy compatibility.
 	const newGroupId = String(payload.group_id);
-	const existingGroups = (() => {
-		const plural = nextConfig.sync_coordinator_groups;
-		if (Array.isArray(plural)) return plural.map((g) => String(g).trim()).filter(Boolean);
-		if (typeof plural === "string") {
-			return plural
-				.split(",")
-				.map((g) => g.trim())
-				.filter(Boolean);
-		}
-		const singular = nextConfig.sync_coordinator_group;
-		return typeof singular === "string" && singular.trim() ? [singular.trim()] : [];
-	})();
-	const mergedGroups = Array.from(new Set([...existingGroups, newGroupId]));
-	nextConfig.sync_coordinator_groups = mergedGroups;
-	nextConfig.sync_coordinator_group = mergedGroups[0] ?? newGroupId;
-	let configPath: string;
+	const configIdentity =
+		projectInvite || recipientInvite
+			? {
+					actorId: recipientActorId,
+					actorName: persistedRecipientDisplayName,
+					deviceName: displayName,
+				}
+			: undefined;
+	let configMutation: ReturnType<typeof updateInviteConfig>;
 	try {
-		configPath = writeCodememConfigFile(nextConfig, opts.configPath ?? undefined);
+		configMutation = updateInviteConfig({
+			configPath: opts.configPath,
+			coordinatorUrl,
+			groupId: newGroupId,
+			enableSync: projectInvite || recipientInvite,
+			identity: configIdentity,
+			identityConstraint: inviteIdentityConstraint(configIdentity, config, payload, deviceId),
+		});
 	} catch (error) {
 		if (projectInvite) {
 			throw new ProjectSyncEnablementError({ cause: error });
@@ -2565,7 +2673,18 @@ export async function coordinatorImportInviteAction(opts: {
 			persistRecipientInviteOnboarding(recipientOnboarding);
 		} catch (error) {
 			try {
-				writeCodememConfigFile(previousConfig, opts.configPath ?? undefined);
+				if (configMutation.created) {
+					deleteCodememConfigFile(
+						configMutation.path,
+						configMutation.revision,
+						configMutation.mutationPath,
+					);
+				} else {
+					mutateCodememConfigFile(() => configMutation.previous, configMutation.mutationPath, {
+						expectedMutationPath: configMutation.mutationPath,
+						expectedRevision: configMutation.revision,
+					});
+				}
 			} catch (restoreError) {
 				throw new AggregateError([error, restoreError], "recipient_invite_config_restore_failed");
 			}
@@ -2613,8 +2732,8 @@ export async function coordinatorImportInviteAction(opts: {
 		trust_state: response?.trust_state ?? null,
 		bootstrap_grant_id: response?.bootstrap_grant_id ?? null,
 		inviter_device: response?.inviter_device ?? null,
-		config_path: configPath,
-		groups: mergedGroups,
+		config_path: configMutation.path,
+		groups: configMutation.groups,
 	};
 }
 
