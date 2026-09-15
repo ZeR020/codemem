@@ -138,6 +138,7 @@ async function startProvider(projectDir) {
 	let attempts = 0;
 	let primaryAttempts = 0;
 	let heldPrimary;
+	let lintTarget;
 	const observations = [];
 	const server = createServer(async (request, response) => {
 		const chunks = [];
@@ -153,6 +154,7 @@ async function startProvider(projectDir) {
 			hasContextMarker: JSON.stringify(body.messages).includes(contextMarker),
 			messages: body.messages?.map((message) => ({
 				role: message.role,
+				mentionsLintFeedback: JSON.stringify(message.content).includes("[lint-feedback]"),
 				mentionsFailure: JSON.stringify(message.content).includes("failure"),
 				mentionsSystemContract: JSON.stringify(message.content).includes(
 					"codemem-v2-system-part-contract",
@@ -193,9 +195,14 @@ async function startProvider(projectDir) {
 		const messagesAfterPrompt = messages.slice(latestUserIndex + 1);
 		const hasToolResult = messagesAfterPrompt.some((message) => message.role === "tool");
 		const requestFailure = JSON.stringify(messages.at(latestUserIndex)).includes("failure");
+		const requestLintFeedback = JSON.stringify(messages.at(latestUserIndex)).includes(
+			"lint feedback checkout probe",
+		);
 		const selectedTool =
 			requestKind === "primary"
-				? body.tools?.find((tool) => tool.function?.name === "read")?.function?.name
+				? body.tools?.find((tool) =>
+						tool.function?.name === (requestLintFeedback ? "edit" : "read"),
+					)?.function?.name
 				: undefined;
 		if (!hasToolResult && selectedTool) {
 			response.write(
@@ -216,11 +223,19 @@ async function startProvider(projectDir) {
 										type: "function",
 										function: {
 											name: selectedTool,
-											arguments: JSON.stringify({
-												path: requestFailure
-													? join(projectDir, "missing-contract-file")
-													: join(projectDir, "package.json"),
-											}),
+										arguments: JSON.stringify(
+											requestLintFeedback
+												? {
+													filePath: lintTarget,
+													oldString: "export const lintFeedbackHostSmoke = 1;",
+													newString: "export const lintFeedbackHostSmoke: any = 1;",
+												}
+												: {
+													path: requestFailure
+														? join(projectDir, "missing-contract-file")
+														: join(projectDir, "package.json"),
+												},
+										),
 										},
 									},
 								],
@@ -310,6 +325,9 @@ async function startProvider(projectDir) {
 		},
 		observations: () => observations,
 		primaryAttempts: () => primaryAttempts,
+		setLintTarget: (target) => {
+			lintTarget = target;
+		},
 		server,
 	};
 }
@@ -515,16 +533,23 @@ try {
 	mkdirSync(installDir, { recursive: true });
 	writeFileSync(join(installDir, "package.json"), JSON.stringify({ private: true }), "utf8");
 	run("npm", ["install", tarball, `@opencode/plugin@${hostVersion}`], { cwd: installDir });
+	const installedSource = join(installDir, "node_modules", "@codemem", "opencode-plugin", "src");
 
 	const installedFixture = join(
-		installDir,
-		"node_modules",
-		"@codemem",
-		"opencode-plugin",
-		"src",
+		installedSource,
 		"opencode-v2-contract-fixture.ts",
 	);
 	assert(existsSync(installedFixture), "Packed plugin is missing the OpenCode 2 contract fixture");
+	for (const excludedSource of [
+		"lint-feedback.ts",
+		"lint-feedback-core.ts",
+		"lint-feedback-v2.ts",
+	]) {
+		assert(
+			!existsSync(join(installedSource, excludedSource)),
+			`Packed plugin includes repository-only ${excludedSource}`,
+		);
+	}
 
 	const projectDir = installDir;
 	const homeDir = join(tempDir, "home");
@@ -589,16 +614,47 @@ try {
 		`Pinned host reported ${JSON.stringify(version)}, expected opencode v${hostVersion}`,
 	);
 	const checkoutHomeDir = join(tempDir, "checkout-home");
+	const checkoutLintFixture = join(
+		workspaceRoot,
+		`packages/opencode-plugin/src/lint-feedback-host-smoke-${randomBytes(8).toString("hex")}.ts`,
+	);
 	mkdirSync(checkoutHomeDir, { recursive: true });
 	const checkoutEnv = {
 		...env,
 		HOME: checkoutHomeDir,
 		XDG_CONFIG_HOME: join(checkoutHomeDir, ".config"),
 		CODEMEM_OPENCODE_V2_CONTRACT_REPORT: join(tempDir, "checkout-contract-report.jsonl"),
-		OPENCODE_CONFIG_CONTENT: JSON.stringify({ plugin: [packageRoot] }),
+		OPENCODE_CONFIG_CONTENT: JSON.stringify({
+			model: { providerID: "contract", model: "contract-model" },
+			plugin: [packageRoot],
+			providers: {
+				contract: {
+					package: "@opencode/ai/providers/openai-compatible",
+					settings: {
+						apiKey: provider.baseURL,
+						baseURL: provider.baseURL,
+						provider: "contract",
+					},
+					models: {
+						"contract-model": {
+							modelID: "contract-model",
+							limit: { context: 200000, output: 8192 },
+						},
+					},
+				},
+			},
+		}),
 	};
-	const checkoutHost = await startHost(opencode2, workspaceRoot, checkoutEnv);
+	let checkoutHost;
+	let checkoutLintFixtureCreated = false;
 	try {
+		writeFileSync(checkoutLintFixture, "export const lintFeedbackHostSmoke = 1;\n", {
+			encoding: "utf8",
+			flag: "wx",
+		});
+		checkoutLintFixtureCreated = true;
+		provider.setLintTarget(checkoutLintFixture);
+		checkoutHost = await startHost(opencode2, workspaceRoot, checkoutEnv);
 		run(opencode2, [
 			"api",
 			"--server",
@@ -643,9 +699,50 @@ try {
 			!entries.some((entry) => entry.state?.status === "failed"),
 			"Pinned host reported a failed plugin during checkout activation",
 		);
+		const checkoutSessionResult = run(opencode2, [
+			"api",
+			"--server",
+			checkoutHost.baseURL,
+			"POST",
+			"/api/session",
+			"--param",
+			`location=${workspaceRoot}`,
+			"--data",
+			JSON.stringify({
+				agent: "build",
+				model: { providerID: "contract", id: "contract-model" },
+				location: { directory: workspaceRoot },
+			}),
+		], {
+			cwd: workspaceRoot,
+			env: checkoutEnv,
+		});
+		const checkoutSessionResponse = JSON.parse(checkoutSessionResult.stdout);
+		const checkoutSessionID = checkoutSessionResponse.id ?? checkoutSessionResponse.data?.id;
+		assert(typeof checkoutSessionID === "string", "Pinned host did not create a checkout session");
+		const observationsBeforeLint = provider.observations().length;
+		await promptHost(
+			opencode2,
+			checkoutHost,
+			checkoutSessionID,
+			"lint feedback checkout probe",
+			{ cwd: workspaceRoot, env: checkoutEnv },
+		);
+		assert(
+			provider
+				.observations()
+				.slice(observationsBeforeLint)
+				.some((observation) =>
+					observation.messages?.some((message) => message.mentionsLintFeedback),
+				),
+			"Pinned host did not make OpenCode 2 lint feedback visible to the agent",
+		);
 	} finally {
-		await stopHost(checkoutHost.child);
-		hostProcess = undefined;
+		if (checkoutLintFixtureCreated) rmSync(checkoutLintFixture);
+		if (checkoutHost) {
+			await stopHost(checkoutHost.child);
+			hostProcess = undefined;
+		}
 	}
 	const repositoryDir = join(installDir, "repository");
 	const worktreeDir = join(installDir, "worktree");

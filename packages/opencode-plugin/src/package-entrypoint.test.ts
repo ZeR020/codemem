@@ -41,6 +41,9 @@ it("keeps the OpenCode 1 SDK manifests aligned with the supported host floor", a
 	expect(cliRuntimeManifest.dependencies["@opencode-ai/plugin"]).toBe(minimumOpenCodeVersion);
 	expect(packageManifest.dependencies["@opencode/plugin"]).toBe(pinnedOpenCodeV2Version);
 	expect(packageManifest.devDependencies["@opencode/plugin"]).toBeUndefined();
+	expect(packageManifest.files).not.toContain("src/lint-feedback.ts");
+	expect(packageManifest.files).not.toContain("src/lint-feedback-core.ts");
+	expect(packageManifest.files).not.toContain("src/lint-feedback-v2.ts");
 	expect(packageManifest.exports["./rpc"]).toEqual({
 		types: "./rpc.d.ts",
 		import: "./rpc.js",
@@ -64,8 +67,9 @@ it("keeps repository dogfooding on V1 without activating a second V2 plugin", as
 	expect(await repositoryWrapper.default.setup({})).toBeUndefined();
 });
 
-it("keeps repository lint feedback on V1 and makes it an explicit V2 no-op", async () => {
+it("uses host-specific repository lint feedback adapters", async () => {
 	const lintFeedbackEntrypoint = await import("./lint-feedback.js");
+	const lintFeedbackV2Entrypoint = await import("./lint-feedback-v2.js");
 	const repositoryWrapperUrl = pathToFileURL(
 		path.join(repositoryRoot, ".opencode/plugins/lint-feedback.js"),
 	).href;
@@ -74,5 +78,5 @@ it("keeps repository lint feedback on V1 and makes it an explicit V2 no-op", asy
 	expect(Object.keys(repositoryWrapper)).toEqual(["default"]);
 	expect(repositoryWrapper.default.id).toBe("codemem-lint-feedback");
 	expect(repositoryWrapper.default.server).toBe(lintFeedbackEntrypoint.default);
-	expect(await repositoryWrapper.default.setup({})).toBeUndefined();
+	expect(repositoryWrapper.default.setup).toBe(lintFeedbackV2Entrypoint.default.setup);
 });

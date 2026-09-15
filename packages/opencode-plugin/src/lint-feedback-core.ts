@@ -88,12 +88,27 @@ interface AfterOutput {
 	output: string;
 }
 
+export interface LintFeedbackInvocation {
+	tool: string;
+	sessionID: string;
+	callID: string;
+	args?: unknown;
+}
+
+export interface LintFeedbackController {
+	before(input: LintFeedbackInvocation): Promise<void>;
+	after(input: LintFeedbackInvocation): Promise<string | undefined>;
+	discard(input: Pick<LintFeedbackInvocation, "sessionID" | "callID">): void;
+	dispose(): Promise<void>;
+}
+
 interface HookDependencies {
 	worktree: string;
 	command: [string, ...string[]];
 	timeoutMs: number;
-	runDiagnostics: (relativePath: string) => Promise<LintDiagnostic[]>;
+	runDiagnostics: (relativePath: string, signal?: AbortSignal) => Promise<LintDiagnostic[]>;
 	fileExists: (relativePath: string) => Promise<boolean>;
+	disposeDiagnostics?: () => void;
 }
 
 type UnknownRecord = Record<string, unknown>;
@@ -176,7 +191,7 @@ function getApplyPatchTouchedFiles(args: UnknownRecord, worktree: string): Touch
 }
 
 function getTouchedFiles(tool: string, args: UnknownRecord, worktree: string): TouchedFile[] {
-	if (tool === "apply_patch") return getApplyPatchTouchedFiles(args, worktree);
+	if (tool === "apply_patch" || tool === "patch") return getApplyPatchTouchedFiles(args, worktree);
 	if (tool !== "edit" && tool !== "write") return [];
 	const candidate = getPathArgument(args);
 	const resolved = candidate ? resolveWorktreePath(worktree, candidate) : undefined;
@@ -195,73 +210,127 @@ function callKey(input: Pick<HookInput, "sessionID" | "callID">): string {
 	return `${input.sessionID}\u0000${input.callID}`;
 }
 
-export function createLintFeedbackHooks(dependencies: HookDependencies) {
+async function captureSnapshot(
+	input: LintFeedbackInvocation,
+	dependencies: HookDependencies,
+	signal: AbortSignal,
+): Promise<Snapshot | undefined> {
+	if (signal.aborted) return undefined;
+	const args = isRecord(input.args) ? input.args : {};
+	const files = getTouchedFiles(input.tool, args, dependencies.worktree);
+	if (files.length === 0) return undefined;
+	const diagnosticsByPath = new Map<string, LintDiagnostic[]>();
+	let failed = false;
+	await Promise.all(
+		files.map(async ({ beforePath, afterPath }) => {
+			try {
+				if (signal.aborted) return;
+				if (!beforePath) {
+					diagnosticsByPath.set(afterPath, []);
+					return;
+				}
+				const exists = await dependencies.fileExists(beforePath);
+				if (signal.aborted) return;
+				diagnosticsByPath.set(
+					afterPath,
+					exists ? await dependencies.runDiagnostics(beforePath, signal) : [],
+				);
+			} catch {
+				failed = true;
+			}
+		}),
+	);
+	return { diagnosticsByPath, failed };
+}
+
+async function inspectAfter(
+	snapshot: Snapshot,
+	dependencies: HookDependencies,
+	signal: AbortSignal,
+): Promise<{ regressions: LintDiagnostic[]; failed: boolean }> {
+	const regressions: LintDiagnostic[] = [];
+	let failed = snapshot.failed;
+	await Promise.all(
+		Array.from(snapshot.diagnosticsByPath, async ([relativePath, before]) => {
+			try {
+				if (signal.aborted) return;
+				if (!(await dependencies.fileExists(relativePath))) return;
+				if (signal.aborted) return;
+				const after = await dependencies.runDiagnostics(relativePath, signal);
+				regressions.push(...compareDiagnostics(before, after));
+			} catch {
+				failed = true;
+			}
+		}),
+	);
+	return { regressions, failed };
+}
+
+export function createLintFeedbackController(
+	dependencies: HookDependencies,
+): LintFeedbackController {
 	const snapshots = new Map<string, Snapshot>();
 	const warnedSessions = new Set<string>();
+	const cancellation = new AbortController();
+	let active = true;
 
 	return {
-		"tool.execute.before": async (input: HookInput, output: BeforeOutput): Promise<void> => {
-			const args = isRecord(output.args) ? output.args : {};
-			const files = getTouchedFiles(input.tool, args, dependencies.worktree);
-			if (files.length === 0) return;
-
-			const diagnosticsByPath = new Map<string, LintDiagnostic[]>();
-			let failed = false;
-			await Promise.all(
-				files.map(async ({ beforePath, afterPath }) => {
-					try {
-						if (!beforePath) {
-							diagnosticsByPath.set(afterPath, []);
-							return;
-						}
-						const exists = await dependencies.fileExists(beforePath);
-						diagnosticsByPath.set(
-							afterPath,
-							exists ? await dependencies.runDiagnostics(beforePath) : [],
-						);
-					} catch {
-						failed = true;
-					}
-				}),
-			);
+		before: async (input): Promise<void> => {
+			if (!active) return;
+			const snapshot = await captureSnapshot(input, dependencies, cancellation.signal);
+			if (!active || !snapshot) return;
 			if (snapshots.size >= SNAPSHOT_LIMIT) {
 				const oldest = snapshots.keys().next().value;
 				if (oldest) snapshots.delete(oldest);
 			}
-			snapshots.set(callKey(input), { diagnosticsByPath, failed });
+			snapshots.set(callKey(input), snapshot);
 		},
 
-		"tool.execute.after": async (input: HookInput, output: AfterOutput): Promise<void> => {
+		after: async (input): Promise<string | undefined> => {
+			if (!active) return undefined;
 			const key = callKey(input);
 			const snapshot = snapshots.get(key);
 			snapshots.delete(key);
-			if (!snapshot) return;
+			if (!snapshot) return undefined;
 
-			const regressions: LintDiagnostic[] = [];
-			let failed = snapshot.failed;
-			await Promise.all(
-				Array.from(snapshot.diagnosticsByPath, async ([relativePath, before]) => {
-					try {
-						if (!(await dependencies.fileExists(relativePath))) return;
-						const after = await dependencies.runDiagnostics(relativePath);
-						regressions.push(...compareDiagnostics(before, after));
-					} catch {
-						failed = true;
-					}
-				}),
+			const { regressions, failed } = await inspectAfter(
+				snapshot,
+				dependencies,
+				cancellation.signal,
 			);
-
-			if (regressions.length > 0) appendOutput(output, formatFeedback(regressions));
+			if (!active) return undefined;
+			const messages: string[] = [];
+			if (regressions.length > 0) messages.push(formatFeedback(regressions));
 			if (failed && !warnedSessions.has(input.sessionID)) {
 				warnedSessions.add(input.sessionID);
-				appendOutput(output, WARNING);
+				messages.push(WARNING);
 			}
+			return messages.length > 0 ? messages.join("\n\n") : undefined;
+		},
+		discard: (input): void => {
+			snapshots.delete(callKey(input));
 		},
 		dispose: async (): Promise<void> => {
+			active = false;
+			cancellation.abort();
 			snapshots.clear();
 			warnedSessions.clear();
-			killLiveChildren();
+			dependencies.disposeDiagnostics?.();
 		},
+	};
+}
+
+export function createLintFeedbackHooks(dependencies: HookDependencies) {
+	const controller = createLintFeedbackController(dependencies);
+	return {
+		"tool.execute.before": async (input: HookInput, output: BeforeOutput): Promise<void> => {
+			await controller.before({ ...input, args: output.args });
+		},
+		"tool.execute.after": async (input: HookInput, output: AfterOutput): Promise<void> => {
+			const message = await controller.after(input);
+			if (message) appendOutput(output, message);
+		},
+		dispose: controller.dispose,
 	};
 }
 
@@ -270,7 +339,10 @@ async function runCommand(
 	relativePath: string,
 	worktree: string,
 	timeoutMs: number,
+	ownerChildren: Set<ChildProcess>,
+	signal?: AbortSignal,
 ): Promise<string> {
+	if (signal?.aborted) throw new Error("Lint command cancelled");
 	const [executable, ...args] = command;
 	const child = spawn(executable, [...args, "--", relativePath], {
 		cwd: worktree,
@@ -279,6 +351,7 @@ async function runCommand(
 		stdio: ["ignore", "pipe", "pipe"],
 	});
 	liveChildren.add(child);
+	ownerChildren.add(child);
 	const stdout: Buffer[] = [];
 	const stderr: Buffer[] = [];
 	child.stdout.on("data", (chunk) => stdout.push(Buffer.from(chunk)));
@@ -286,18 +359,28 @@ async function runCommand(
 
 	return await new Promise<string>((resolve, reject) => {
 		let forceKillTimer: ReturnType<typeof setTimeout> | undefined;
+		const abort = () => {
+			killProcessTree(child, "SIGKILL");
+			reject(new Error("Lint command cancelled"));
+		};
+		signal?.addEventListener("abort", abort, { once: true });
 		const timer = setTimeout(() => {
 			killProcessTree(child, "SIGTERM");
 			forceKillTimer = setTimeout(() => killProcessTree(child, "SIGKILL"), 250);
 			reject(new Error(`Lint command timed out after ${timeoutMs}ms`));
 		}, timeoutMs);
 		child.once("error", (error) => {
+			liveChildren.delete(child);
+			ownerChildren.delete(child);
+			signal?.removeEventListener("abort", abort);
 			clearTimeout(timer);
 			if (forceKillTimer) clearTimeout(forceKillTimer);
 			reject(error);
 		});
 		child.once("close", (code) => {
 			liveChildren.delete(child);
+			ownerChildren.delete(child);
+			signal?.removeEventListener("abort", abort);
 			clearTimeout(timer);
 			if (forceKillTimer) clearTimeout(forceKillTimer);
 			const text = Buffer.concat(stdout).toString("utf8");
@@ -333,9 +416,12 @@ async function isInsideWorktree(worktree: string, relativePath: string): Promise
 	}
 }
 
-export const LintFeedbackPlugin: Plugin = async ({ worktree }, options?: PluginOptions) => {
+export function createWorktreeLintFeedbackController(
+	worktree: string,
+	options?: PluginOptions,
+): LintFeedbackController | undefined {
 	const settings = options as LintFeedbackOptions | undefined;
-	if (!validCommand(settings?.command)) return {};
+	if (!validCommand(settings?.command)) return undefined;
 	const [executable, ...args] = settings.command;
 	const command: [string, ...string[]] = [executable, ...args];
 	const timeoutMs =
@@ -344,20 +430,40 @@ export const LintFeedbackPlugin: Plugin = async ({ worktree }, options?: PluginO
 		settings.timeoutMs > 0
 			? settings.timeoutMs
 			: 10_000;
+	const ownerChildren = new Set<ChildProcess>();
 
-	return createLintFeedbackHooks({
+	return createLintFeedbackController({
 		worktree,
 		command,
 		timeoutMs,
 		fileExists: async (relativePath) => isInsideWorktree(worktree, relativePath),
-		runDiagnostics: async (relativePath) => {
+		runDiagnostics: async (relativePath, signal) => {
 			const [output, sourceCode] = await Promise.all([
-				runCommand(command, relativePath, worktree, timeoutMs),
+				runCommand(command, relativePath, worktree, timeoutMs, ownerChildren, signal),
 				readFile(path.join(worktree, relativePath), "utf8"),
 			]);
 			return parseBiomeDiagnostics(output, sourceCode);
 		},
+		disposeDiagnostics: () => {
+			for (const child of ownerChildren) killProcessTree(child, "SIGKILL");
+			ownerChildren.clear();
+		},
 	});
+}
+
+export const LintFeedbackPlugin: Plugin = async ({ worktree }, options?: PluginOptions) => {
+	const controller = createWorktreeLintFeedbackController(worktree, options);
+	if (!controller) return {};
+	return {
+		"tool.execute.before": async (input: HookInput, output: BeforeOutput) => {
+			await controller.before({ ...input, args: output.args });
+		},
+		"tool.execute.after": async (input: HookInput, output: AfterOutput) => {
+			const message = await controller.after(input);
+			if (message) appendOutput(output, message);
+		},
+		dispose: controller.dispose,
+	};
 };
 
 export default LintFeedbackPlugin;
