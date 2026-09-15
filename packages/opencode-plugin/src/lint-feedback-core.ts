@@ -2,13 +2,22 @@ import { type ChildProcess, spawn, spawnSync } from "node:child_process";
 import { readFile, realpath } from "node:fs/promises";
 import path from "node:path";
 import type { Plugin, PluginOptions } from "@opencode-ai/plugin";
+import {
+	compareDiagnostics,
+	formatFeedback,
+	type LintDiagnostic,
+	parseBiomeDiagnostics,
+} from "./lint-diagnostics.js";
+
+export {
+	compareDiagnostics,
+	formatFeedback,
+	type LintDiagnostic,
+	parseBiomeDiagnostics,
+	parseMeasuredValue,
+} from "./lint-diagnostics.js";
 
 const SOURCE_EXTENSIONS = new Set([".cjs", ".cts", ".js", ".jsx", ".mjs", ".mts", ".ts", ".tsx"]);
-const MEASURED_CATEGORIES = new Set([
-	"lint/complexity/noExcessiveCognitiveComplexity",
-	"lint/complexity/noExcessiveLinesPerFunction",
-]);
-const DIAGNOSTIC_LIMIT = 10;
 const SNAPSHOT_LIMIT = 100;
 const WARNING = "[lint-feedback] Lint check failed; the edit was preserved.";
 const liveChildren = new Set<ChildProcess>();
@@ -46,17 +55,6 @@ process.once("exit", killLiveChildren);
 export interface LintFeedbackOptions extends PluginOptions {
 	command?: string[];
 	timeoutMs?: number;
-}
-
-export interface LintDiagnostic {
-	category: string;
-	description: string;
-	path?: string;
-	line?: number;
-	column?: number;
-	offset?: number;
-	sourceText?: string;
-	measuredValue?: number;
 }
 
 interface ApplyPatchPath {
@@ -102,263 +100,6 @@ type UnknownRecord = Record<string, unknown>;
 
 function isRecord(value: unknown): value is UnknownRecord {
 	return typeof value === "object" && value !== null;
-}
-
-function getText(value: unknown): string {
-	if (typeof value === "string") return value;
-	if (Array.isArray(value)) return value.map(getText).join(" ");
-	if (!isRecord(value)) return "";
-	if (typeof value.content === "string") return value.content;
-	if (typeof value.text === "string") return value.text;
-	return Object.values(value).map(getText).join(" ");
-}
-
-function getSpanStart(location: UnknownRecord): number | undefined {
-	if (Array.isArray(location.span) && typeof location.span[0] === "number") return location.span[0];
-	if (!isRecord(location.span)) return undefined;
-	if (typeof location.span.start === "number") return location.span.start;
-	return typeof location.span.offset === "number" ? location.span.offset : undefined;
-}
-
-function getSpanEnd(location: UnknownRecord): number | undefined {
-	if (Array.isArray(location.span) && typeof location.span[1] === "number") return location.span[1];
-	if (!isRecord(location.span)) return undefined;
-	if (typeof location.span.end === "number") return location.span.end;
-	return typeof location.span.length === "number" && typeof location.span.offset === "number"
-		? location.span.offset + location.span.length
-		: undefined;
-}
-
-function getSourceText(location: UnknownRecord): string | undefined {
-	if (typeof location.sourceCode !== "string") return undefined;
-	const start = getSpanStart(location);
-	const end = getSpanEnd(location);
-	if (start === undefined || end === undefined) return undefined;
-	return Buffer.from(location.sourceCode).subarray(start, end).toString("utf8");
-}
-
-function getPositionIndex(sourceCode: string, line: number, column: number): number | undefined {
-	let index = 0;
-	for (let currentLine = 1; currentLine < line; currentLine += 1) {
-		const newline = sourceCode.indexOf("\n", index);
-		if (newline === -1) return undefined;
-		index = newline + 1;
-	}
-	return index + Math.max(column - 1, 0);
-}
-
-function getSourceTextFromPositions(
-	location: UnknownRecord,
-	sourceCode?: string,
-): string | undefined {
-	if (!sourceCode) return undefined;
-	const start = isRecord(location.start) ? location.start : undefined;
-	const end = isRecord(location.end) ? location.end : undefined;
-	if (typeof start?.line !== "number" || typeof start.column !== "number") return undefined;
-	const startIndex = getPositionIndex(sourceCode, start.line, start.column);
-	if (startIndex === undefined) return undefined;
-	const endIndex =
-		typeof end?.line === "number" && typeof end.column === "number"
-			? getPositionIndex(sourceCode, end.line, end.column)
-			: sourceCode.indexOf("\n", startIndex);
-	return sourceCode.slice(
-		startIndex,
-		endIndex === -1 || endIndex === undefined ? sourceCode.length : endIndex,
-	);
-}
-
-function positionFromByteOffset(
-	sourceCode: string,
-	offset: number,
-): { line: number; column: number } {
-	const prefix = Buffer.from(sourceCode).subarray(0, offset).toString("utf8");
-	const lines = prefix.split("\n");
-	return {
-		line: lines.length,
-		column: Array.from(lines.at(-1) ?? "").length + 1,
-	};
-}
-
-function getPosition(location: UnknownRecord): { line?: number; column?: number; offset?: number } {
-	const start = isRecord(location.start) ? location.start : undefined;
-	const offset = getSpanStart(location);
-	if (
-		typeof start?.line !== "number" &&
-		offset !== undefined &&
-		typeof location.sourceCode === "string"
-	) {
-		return { ...positionFromByteOffset(location.sourceCode, offset), offset };
-	}
-	return {
-		line: typeof start?.line === "number" ? start.line : undefined,
-		column: typeof start?.column === "number" ? start.column : undefined,
-		offset,
-	};
-}
-
-function getDiagnosticPath(location: UnknownRecord): string | undefined {
-	if (typeof location.path === "string") return location.path;
-	return isRecord(location.path) && typeof location.path.file === "string"
-		? location.path.file
-		: undefined;
-}
-
-export function parseMeasuredValue(category: string, text: string): number | undefined {
-	if (category.endsWith("noExcessiveCognitiveComplexity")) {
-		const match = text.match(/complexity(?:\s+score)?(?:\s+(?:of|is|from)|:)?\s+(\d+)/i);
-		return match ? Number(match[1]) : undefined;
-	}
-	if (category.endsWith("noExcessiveLinesPerFunction")) {
-		const match = text.match(
-			/(?:has|contains)\s+(\d+)\s+lines?|lines?\s*\((\d+)\)|(\d+)\s+lines?/i,
-		);
-		const value = match?.slice(1).find((item) => item !== undefined);
-		return value ? Number(value) : undefined;
-	}
-	return undefined;
-}
-
-export function parseBiomeDiagnostics(output: string, sourceCode?: string): LintDiagnostic[] {
-	const parsed: unknown = JSON.parse(output);
-	if (!isRecord(parsed) || !Array.isArray(parsed.diagnostics)) {
-		throw new Error("Biome output has no diagnostics array");
-	}
-
-	return parsed.diagnostics.flatMap((raw): LintDiagnostic[] => {
-		if (!isRecord(raw) || typeof raw.category !== "string" || !raw.category.startsWith("lint/"))
-			return [];
-		const location = isRecord(raw.location) ? raw.location : {};
-		const description =
-			typeof raw.description === "string" ? raw.description : getText(raw.message);
-		const position = getPosition(location);
-		const diagnosticPath = getDiagnosticPath(location);
-		const measuredValue =
-			parseMeasuredValue(raw.category, getText([description, raw.message])) ??
-			parseMeasuredValue(raw.category, getText([raw.advices, raw.advice]));
-		return [
-			{
-				category: raw.category,
-				description,
-				path: diagnosticPath,
-				line: position.line,
-				column: position.column,
-				offset: position.offset,
-				sourceText: getSourceText(location) ?? getSourceTextFromPositions(location, sourceCode),
-				measuredValue,
-			},
-		];
-	});
-}
-
-function groupDiagnostics(diagnostics: LintDiagnostic[]): Map<string, LintDiagnostic[]> {
-	const groups = new Map<string, LintDiagnostic[]>();
-	for (const diagnostic of diagnostics) {
-		const group = groups.get(diagnostic.category) ?? [];
-		group.push(diagnostic);
-		groups.set(diagnostic.category, group);
-	}
-	return groups;
-}
-
-function measuredCandidateIndexes(
-	previous: LintDiagnostic,
-	diagnostics: LintDiagnostic[],
-): number[] {
-	const allIndexes = diagnostics.map((_, index) => index);
-	if (!previous.sourceText) return allIndexes;
-	const sameSource = diagnostics.flatMap((diagnostic, index) =>
-		diagnostic.sourceText === previous.sourceText ? [index] : [],
-	);
-	return sameSource.length > 0 ? sameSource : allIndexes;
-}
-
-function compareMeasured(before: LintDiagnostic[], after: LintDiagnostic[]): LintDiagnostic[] {
-	const unmatched = [...after];
-	const regressions: LintDiagnostic[] = [];
-	for (const previous of before) {
-		if (unmatched.length === 0) break;
-		const candidateIndexes = measuredCandidateIndexes(previous, unmatched);
-		let nearestIndex = candidateIndexes[0] ?? 0;
-		for (const index of candidateIndexes.slice(1)) {
-			const candidate = unmatched[index];
-			const nearest = unmatched[nearestIndex];
-			if (
-				candidate &&
-				nearest &&
-				diagnosticDistance(previous, candidate) < diagnosticDistance(previous, nearest)
-			) {
-				nearestIndex = index;
-			}
-		}
-		const current = unmatched.splice(nearestIndex, 1)[0];
-		if (current && (current.measuredValue ?? 0) > (previous.measuredValue ?? 0))
-			regressions.push(current);
-	}
-	return [...regressions, ...unmatched];
-}
-
-function diagnosticDistance(before: LintDiagnostic, after: LintDiagnostic): number {
-	if (before.offset !== undefined && after.offset !== undefined) {
-		return Math.abs(before.offset - after.offset);
-	}
-	if (before.line === undefined || after.line === undefined) return 0;
-	const lineDistance = Math.abs(before.line - after.line);
-	const columnDistance =
-		before.column === undefined || after.column === undefined
-			? 0
-			: Math.abs(before.column - after.column);
-	return lineDistance * 1_000 + columnDistance;
-}
-
-function compareCountOnly(before: LintDiagnostic[], after: LintDiagnostic[]): LintDiagnostic[] {
-	const unmatched = [...after];
-	for (const previous of before) {
-		const sameDescription = unmatched
-			.map((diagnostic, index) => ({ diagnostic, index }))
-			.filter(({ diagnostic }) => diagnostic.description === previous.description)
-			.filter(
-				({ diagnostic }) =>
-					!previous.sourceText ||
-					!diagnostic.sourceText ||
-					diagnostic.sourceText === previous.sourceText,
-			);
-		const candidateIndexes = sameDescription.map(({ index }) => index);
-		const firstCandidate = candidateIndexes[0];
-		if (firstCandidate === undefined) continue;
-		let nearestIndex = firstCandidate;
-		for (const index of candidateIndexes.slice(1)) {
-			const candidate = unmatched[index];
-			const nearest = unmatched[nearestIndex];
-			if (
-				candidate &&
-				nearest &&
-				diagnosticDistance(previous, candidate) < diagnosticDistance(previous, nearest)
-			) {
-				nearestIndex = index;
-			}
-		}
-		unmatched.splice(nearestIndex, 1);
-	}
-	return unmatched;
-}
-
-export function compareDiagnostics(
-	before: LintDiagnostic[],
-	after: LintDiagnostic[],
-): LintDiagnostic[] {
-	const beforeByCategory = groupDiagnostics(before);
-	const afterByCategory = groupDiagnostics(after);
-	const regressions: LintDiagnostic[] = [];
-
-	for (const [category, current] of afterByCategory) {
-		const previous = beforeByCategory.get(category) ?? [];
-		if (MEASURED_CATEGORIES.has(category)) {
-			regressions.push(...compareMeasured(previous, current));
-			continue;
-		}
-		regressions.push(...compareCountOnly(previous, current));
-	}
-	return regressions;
 }
 
 export function parseApplyPatchPaths(patchText: string): ApplyPatchPath[] {
@@ -444,26 +185,6 @@ function getTouchedFiles(tool: string, args: UnknownRecord, worktree: string): T
 
 export function getTouchedPaths(tool: string, args: UnknownRecord, worktree: string): string[] {
 	return getTouchedFiles(tool, args, worktree).map((item) => item.afterPath);
-}
-
-function formatDiagnostic(diagnostic: LintDiagnostic): string {
-	const value = diagnostic.measuredValue === undefined ? "" : ` (${diagnostic.measuredValue})`;
-	let position = "";
-	if (diagnostic.line) {
-		position = `:${diagnostic.line}${diagnostic.column ? `:${diagnostic.column}` : ""}`;
-	} else if (diagnostic.offset !== undefined) {
-		position = `@byte ${diagnostic.offset}`;
-	}
-	const location = diagnostic.path ? `${diagnostic.path}${position} — ` : "";
-	return `- ${location}${diagnostic.category}${value}: ${diagnostic.description}`;
-}
-
-export function formatFeedback(diagnostics: LintDiagnostic[], limit = DIAGNOSTIC_LIMIT): string {
-	const visible = diagnostics.slice(0, limit);
-	const remaining = diagnostics.length - visible.length;
-	const suffix =
-		remaining > 0 ? `\n- …and ${remaining} more regression${remaining === 1 ? "" : "s"}.` : "";
-	return `[lint-feedback] New or worsened diagnostics:\n${visible.map(formatDiagnostic).join("\n")}${suffix}\nFix local regressions now. Do not broadly refactor legacy code.`;
 }
 
 function appendOutput(output: AfterOutput, message: string): void {

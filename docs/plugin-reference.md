@@ -97,6 +97,16 @@ Expanding coverage leaves the existing 1,592 warnings unchanged and exposes 63 w
 | `packages/opencode-plugin/.opencode/lib/compat.js` | 2 |
 | `packages/opencode-plugin/.opencode/lib/raw-event-spool.js` | 1 |
 
+Run the same diagnostic comparison outside the editor with:
+
+```text
+pnpm lint:delta -- --base <git-ref> [--head <git-ref>] [--json]
+```
+
+`--base` is required. Pass `--head` for a committed ref-to-ref comparison; omit it to freeze the current working tree, including untracked files that are not ignored. The command materializes detached temporary worktrees and never stashes, resets, or checks out over the active worktree. It runs the pinned Biome binary with the head snapshot's policy against both sides, then compares diagnostics only for added, modified, renamed, or deleted paths.
+
+Exit code `0` means no new diagnostics or policy weakening, `1` means regressions were found, and `2` means the comparison could not be trusted. JSON output includes every regression; human output shows the first ten. Missing refs, tool failures, malformed or incomplete Biome reports, removed includes, changed Git ignore policy, new exclusions or suppressions, disabled linting, changed lint overrides, weaker rule levels, and increased thresholds fail closed.
+
 OpenCode prompt-time pack construction and prompt-pack ledger transitions use the
 long-lived local viewer first. Retryable connection, timeout, endpoint-version,
 server, or malformed-response failures fall back to the compatible CLI path.

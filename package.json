@@ -26,6 +26,7 @@
     "test:release-version": "node --test scripts/release-version.test.mjs",
     "test:release-tag-preflight": "node --test scripts/release-tag-preflight.test.mjs",
     "lint": "pnpm exec biome check .",
+    "lint:delta": "pnpm exec tsx packages/opencode-plugin/src/biome-ratchet-cli.ts",
     "format": "pnpm exec biome check --write packages/",
     "tsc": "pnpm exec tsc --build",
     "typecheck": "pnpm run tsc",
