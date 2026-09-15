@@ -209,8 +209,8 @@ describe("Biome diagnostic ambiguity handling", () => {
 			{ ...diagnostic("src/a.ts", 30, 20, "same body"), scopeIdentity: ":binding:handler" },
 		];
 		const after = [
-			{ ...diagnostic("src/a.ts", 10, 20, "same body"), scopeIdentity: ":binding:handler" },
-			{ ...diagnostic("src/a.ts", 30, 29, "same body"), scopeIdentity: ":binding:handler" },
+			{ ...diagnostic("src/a.ts", 10, 31, "same body"), scopeIdentity: ":binding:handler" },
+			{ ...diagnostic("src/a.ts", 30, 20, "same body"), scopeIdentity: ":binding:handler" },
 		];
 
 		expect(() =>
@@ -218,6 +218,113 @@ describe("Biome diagnostic ambiguity handling", () => {
 				{ status: "modified", beforePath: "src/a.ts", afterPath: "src/a.ts" },
 			]),
 		).toThrow("Ambiguous");
+	});
+
+	it("allows repeated measured scopes when their sorted values do not increase", () => {
+		const before = [
+			{ ...diagnostic("src/a.ts", 10, 30, "same body"), scopeIdentity: ":binding:handler" },
+			{ ...diagnostic("src/a.ts", 30, 20, "same body"), scopeIdentity: ":binding:handler" },
+		];
+		const after = [
+			{ ...diagnostic("src/a.ts", 20, 20, "same body"), scopeIdentity: ":binding:handler" },
+			{ ...diagnostic("src/a.ts", 40, 29, "same body"), scopeIdentity: ":binding:handler" },
+		];
+
+		expect(
+			compareChangedDiagnostics(before, after, [
+				{ status: "modified", beforePath: "src/a.ts", afterPath: "src/a.ts" },
+			]),
+		).toEqual([]);
+	});
+
+	it("retains uniquely paired regressions beside safe ambiguous diagnostics", () => {
+		const before = [
+			{ ...diagnostic("src/a.ts", 10, 100, "duplicate"), scopeIdentity: ":binding:handler" },
+			{ ...diagnostic("src/a.ts", 30, 10, "duplicate"), scopeIdentity: ":binding:handler" },
+			{ ...diagnostic("src/a.ts", 50, 20, "unique"), scopeIdentity: ":function:unique" },
+		];
+		const regression = {
+			...diagnostic("src/a.ts", 50, 90, "unique changed"),
+			scopeIdentity: ":function:unique",
+		};
+		const after = [
+			{ ...diagnostic("src/a.ts", 10, 10, "duplicate"), scopeIdentity: ":binding:handler" },
+			{ ...diagnostic("src/a.ts", 30, 10, "duplicate"), scopeIdentity: ":binding:handler" },
+			regression,
+		];
+
+		expect(
+			compareChangedDiagnostics(before, after, [
+				{ status: "modified", beforePath: "src/a.ts", afterPath: "src/a.ts" },
+			]),
+		).toEqual([regression]);
+	});
+
+	it("fails closed when ambiguous measured diagnostic counts shrink", () => {
+		const before = [
+			{ ...diagnostic("src/a.ts", 10, 30, "duplicate"), scopeIdentity: ":binding:handler" },
+			{ ...diagnostic("src/a.ts", 30, 10, "duplicate"), scopeIdentity: ":binding:handler" },
+		];
+		const after = [
+			{ ...diagnostic("src/a.ts", 20, 20, "duplicate"), scopeIdentity: ":binding:handler" },
+		];
+
+		expect(() =>
+			compareChangedDiagnostics(before, after, [
+				{ status: "modified", beforePath: "src/a.ts", afterPath: "src/a.ts" },
+			]),
+		).toThrow("Ambiguous");
+	});
+});
+
+describe("Biome diagnostic source comparison", () => {
+	it("retains source-paired regressions when measured diagnostics have no scope identity", () => {
+		const before = [
+			diagnostic("src/a.ts", 10, 100, "source A"),
+			diagnostic("src/a.ts", 30, 10, "source B"),
+		];
+		const regression = diagnostic("src/a.ts", 30, 90, "source B");
+		const after = [diagnostic("src/a.ts", 10, 10, "source A"), regression];
+
+		expect(
+			compareChangedDiagnostics(before, after, [
+				{ status: "modified", beforePath: "src/a.ts", afterPath: "src/a.ts" },
+			]),
+		).toEqual([regression]);
+	});
+
+	it("does not let source text override a repeated scope identity", () => {
+		const before = [
+			{ ...diagnostic("src/a.ts", 10, 100, "source A"), scopeIdentity: ":binding:item" },
+			{ ...diagnostic("src/a.ts", 30, 10, "source B"), scopeIdentity: ":binding:item" },
+		];
+		const after = [
+			{ ...diagnostic("src/a.ts", 10, 10, "source A"), scopeIdentity: ":binding:item" },
+			{ ...diagnostic("src/a.ts", 30, 90, "source B"), scopeIdentity: ":binding:item" },
+		];
+
+		expect(
+			compareChangedDiagnostics(before, after, [
+				{ status: "modified", beforePath: "src/a.ts", afterPath: "src/a.ts" },
+			]),
+		).toEqual([]);
+	});
+
+	it("does not source-pair diagnostics across conflicting repeated scopes", () => {
+		const before = [
+			{ ...diagnostic("src/a.ts", 10, 100, "source A"), scopeIdentity: ":binding:before" },
+			{ ...diagnostic("src/a.ts", 30, 10, "source B"), scopeIdentity: ":binding:before" },
+		];
+		const after = [
+			{ ...diagnostic("src/a.ts", 10, 10, "source A"), scopeIdentity: ":binding:after" },
+			{ ...diagnostic("src/a.ts", 30, 90, "source B"), scopeIdentity: ":binding:after" },
+		];
+
+		expect(
+			compareChangedDiagnostics(before, after, [
+				{ status: "modified", beforePath: "src/a.ts", afterPath: "src/a.ts" },
+			]),
+		).toEqual([]);
 	});
 });
 

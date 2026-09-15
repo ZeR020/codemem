@@ -339,7 +339,7 @@ function candidateIndexes(
 	);
 	if (exactSource.length > 0 && (!previous.scopeIdentity || exactSource.length === 1))
 		return exactSource;
-	if (!allowRenameFallback && previous.scopeIdentity) return [];
+	if (previous.scopeIdentity && (!allowRenameFallback || diagnostics.length !== 1)) return [];
 	return diagnostics.map((_, index) => index);
 }
 

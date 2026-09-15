@@ -191,32 +191,147 @@ function diagnosticsForPath(
 	return diagnostics.filter((diagnostic) => diagnostic.path === normalized);
 }
 
-function assertUnambiguousMeasuredPairing(
+function scopeIdentityCounts(diagnostics: LintDiagnostic[]): Map<string, number> {
+	const counts = new Map<string, number>();
+	for (const diagnostic of diagnostics) {
+		if (!diagnostic.scopeIdentity) continue;
+		counts.set(diagnostic.scopeIdentity, (counts.get(diagnostic.scopeIdentity) ?? 0) + 1);
+	}
+	return counts;
+}
+
+function uniquelyPairedScopeIdentities(
+	before: LintDiagnostic[],
+	after: LintDiagnostic[],
+): Set<string> {
+	const beforeCounts = scopeIdentityCounts(before);
+	const afterCounts = scopeIdentityCounts(after);
+	return new Set(
+		[...beforeCounts].flatMap(([identity, count]) =>
+			count === 1 && afterCounts.get(identity) === 1 ? [identity] : [],
+		),
+	);
+}
+
+function withoutPairedScopes(
+	diagnostics: LintDiagnostic[],
+	pairedIdentities: Set<string>,
+): LintDiagnostic[] {
+	return diagnostics.filter(
+		(diagnostic) => !diagnostic.scopeIdentity || !pairedIdentities.has(diagnostic.scopeIdentity),
+	);
+}
+
+function sourceTextCounts(diagnostics: LintDiagnostic[]): Map<string, number> {
+	const counts = new Map<string, number>();
+	for (const diagnostic of diagnostics) {
+		if (!diagnostic.sourceText) continue;
+		counts.set(diagnostic.sourceText, (counts.get(diagnostic.sourceText) ?? 0) + 1);
+	}
+	return counts;
+}
+
+function uniquelyPairedSourceTexts(before: LintDiagnostic[], after: LintDiagnostic[]): Set<string> {
+	const beforeCounts = sourceTextCounts(before);
+	const afterCounts = sourceTextCounts(after);
+	return new Set(
+		[...beforeCounts].flatMap(([sourceText, count]) => {
+			if (count !== 1 || afterCounts.get(sourceText) !== 1) return [];
+			const previous = before.find((diagnostic) => diagnostic.sourceText === sourceText);
+			const current = after.find((diagnostic) => diagnostic.sourceText === sourceText);
+			if (!previous || !current) return [];
+			if (
+				previous.scopeIdentity &&
+				after.some((diagnostic) => diagnostic.scopeIdentity === previous.scopeIdentity)
+			) {
+				return [];
+			}
+			if (
+				previous.scopeIdentity &&
+				current.scopeIdentity &&
+				previous.scopeIdentity !== current.scopeIdentity
+			) {
+				return [];
+			}
+			return [sourceText];
+		}),
+	);
+}
+
+function withoutPairedSources(
+	diagnostics: LintDiagnostic[],
+	pairedSourceTexts: Set<string>,
+): LintDiagnostic[] {
+	return diagnostics.filter(
+		(diagnostic) => !diagnostic.sourceText || !pairedSourceTexts.has(diagnostic.sourceText),
+	);
+}
+
+function hasAmbiguousScopeIdentities(before: LintDiagnostic[], after: LintDiagnostic[]): boolean {
+	const beforeIdentities = before.map((diagnostic) => diagnostic.scopeIdentity);
+	const afterIdentities = after.map((diagnostic) => diagnostic.scopeIdentity);
+	return (
+		[...beforeIdentities, ...afterIdentities].some((identity) => !identity) ||
+		new Set(beforeIdentities).size !== beforeIdentities.length ||
+		new Set(afterIdentities).size !== afterIdentities.length
+	);
+}
+
+function ignoreSafeAmbiguousMeasuredResidual(
+	before: LintDiagnostic[],
+	after: LintDiagnostic[],
+	category: string,
+	path: string,
+	ignored: Set<LintDiagnostic>,
+): void {
+	if (after.length === 0) {
+		for (const diagnostic of before) ignored.add(diagnostic);
+		return;
+	}
+	if (before.length <= 1 && after.length <= 1) return;
+	if (!hasAmbiguousScopeIdentities(before, after)) return;
+	if (before.length !== after.length || measuredValuesCouldRegress(before, after)) {
+		throw new Error(`Ambiguous ${category} function identity in ${path}`);
+	}
+	for (const diagnostic of [...before, ...after]) ignored.add(diagnostic);
+}
+
+function ambiguousMeasuredDiagnosticsToIgnore(
 	before: LintDiagnostic[],
 	after: LintDiagnostic[],
 	path: string,
-): void {
+): Set<LintDiagnostic> {
+	const ignored = new Set<LintDiagnostic>();
 	const categories = new Set(
 		[...before, ...after].map((diagnostic) => diagnostic.category).filter(isMeasuredCategory),
 	);
 	for (const category of categories) {
 		const categoryBefore = before.filter((diagnostic) => diagnostic.category === category);
 		const categoryAfter = after.filter((diagnostic) => diagnostic.category === category);
-		if (categoryAfter.length === 0) continue;
-		if (categoryBefore.length <= 1 && categoryAfter.length <= 1) continue;
-		const identities = [...categoryBefore, ...categoryAfter].map(
-			(diagnostic) => diagnostic.scopeIdentity,
+		const pairedIdentities = uniquelyPairedScopeIdentities(categoryBefore, categoryAfter);
+		const unpairedScopeBefore = withoutPairedScopes(categoryBefore, pairedIdentities);
+		const unpairedScopeAfter = withoutPairedScopes(categoryAfter, pairedIdentities);
+		const pairedSourceTexts = uniquelyPairedSourceTexts(unpairedScopeBefore, unpairedScopeAfter);
+		ignoreSafeAmbiguousMeasuredResidual(
+			withoutPairedSources(unpairedScopeBefore, pairedSourceTexts),
+			withoutPairedSources(unpairedScopeAfter, pairedSourceTexts),
+			category,
+			path,
+			ignored,
 		);
-		const beforeIdentities = categoryBefore.map((diagnostic) => diagnostic.scopeIdentity);
-		const afterIdentities = categoryAfter.map((diagnostic) => diagnostic.scopeIdentity);
-		if (
-			identities.some((identity) => !identity) ||
-			new Set(beforeIdentities).size !== beforeIdentities.length ||
-			new Set(afterIdentities).size !== afterIdentities.length
-		) {
-			throw new Error(`Ambiguous ${category} function identity in ${path}`);
-		}
 	}
+	return ignored;
+}
+
+function measuredValuesCouldRegress(before: LintDiagnostic[], after: LintDiagnostic[]): boolean {
+	if (after.length > before.length) return true;
+	const previousValues = before
+		.map((diagnostic) => diagnostic.measuredValue ?? 0)
+		.sort((a, b) => b - a);
+	const currentValues = after
+		.map((diagnostic) => diagnostic.measuredValue ?? 0)
+		.sort((a, b) => b - a);
+	return currentValues.some((value, index) => value > (previousValues[index] ?? 0));
 }
 
 export function compareChangedDiagnostics(
@@ -229,9 +344,16 @@ export function compareChangedDiagnostics(
 		if (!change.afterPath) continue;
 		const before = diagnosticsForPath(baseDiagnostics, change.beforePath);
 		const after = diagnosticsForPath(headDiagnostics, change.afterPath);
-		assertUnambiguousMeasuredPairing(before, after, change.afterPath);
+		const ignoredAmbiguousDiagnostics = ambiguousMeasuredDiagnosticsToIgnore(
+			before,
+			after,
+			change.afterPath,
+		);
 		regressions.push(
-			...compareDiagnostics(before, after).map((diagnostic) => ({
+			...compareDiagnostics(
+				before.filter((diagnostic) => !ignoredAmbiguousDiagnostics.has(diagnostic)),
+				after.filter((diagnostic) => !ignoredAmbiguousDiagnostics.has(diagnostic)),
+			).map((diagnostic) => ({
 				...diagnostic,
 				path: normalizePath(change.afterPath as string),
 			})),
