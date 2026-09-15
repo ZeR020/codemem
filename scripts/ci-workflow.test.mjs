@@ -121,6 +121,28 @@ describe("normal CI workflow source contract", () => {
 			/^ {8}run: pnpm run test:release && pnpm run test:adapter-normalizers && pnpm run test:ci-workflow && pnpm run test$/m,
 		);
 	});
+
+	it("enforces the Biome delta against immutable stacked PR revisions in required lint", () => {
+		const lintJob = getJob(ciWorkflow, "ts-lint");
+
+		assert.match(lintJob, /^ {4}name: TypeScript Lint$/m);
+		assert.match(lintJob, /^ {10}fetch-depth: 0$/m);
+		assert.match(lintJob, /BASE_SHA: \$\{\{ github\.event\.pull_request\.base\.sha \}\}/u);
+		assert.match(lintJob, /MERGE_SHA: \$\{\{ github\.sha \}\}/u);
+		assert.match(
+			lintJob,
+			/pnpm --silent lint:delta -- --base "\$BASE_SHA" --head "\$MERGE_SHA" --json --github-annotations > \.tmp\/biome-delta\/report\.json/u,
+		);
+		assert.match(lintJob, /uses: actions\/upload-artifact@v6/u);
+		assert.match(lintJob, /if-no-files-found: error/u);
+		assert.ok(
+			lintJob.indexOf("- name: Biome delta ratchet") < lintJob.indexOf("- name: Biome check"),
+			"expected the delta report before fail-fast ordinary lint",
+		);
+		assert.doesNotMatch(lintJob, /continue-on-error/u);
+		assert.doesNotMatch(lintJob, /github\.event\.pull_request\.head\.sha/u);
+		assert.doesNotMatch(lintJob, /--base (?:main|origin\/main)/u);
+	});
 });
 
 describe("required OpenCode host workflow contract", () => {

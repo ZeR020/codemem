@@ -8,6 +8,8 @@ import {
 
 type UnknownRecord = Record<string, unknown>;
 
+export const SUPPORTED_BIOME_VERSION = "2.5.11";
+
 export interface ChangedPath {
 	status: "added" | "deleted" | "modified" | "renamed";
 	beforePath?: string;
@@ -27,6 +29,104 @@ export interface RatchetComparison {
 	policyViolations: PolicyViolation[];
 	baseDiagnosticCount: number;
 	headDiagnosticCount: number;
+}
+
+function unquoteYamlScalar(value: string): string {
+	const trimmed = value.trim();
+	if (
+		(trimmed.startsWith("'") && trimmed.endsWith("'")) ||
+		(trimmed.startsWith('"') && trimmed.endsWith('"'))
+	) {
+		return trimmed.slice(1, -1);
+	}
+	return trimmed;
+}
+
+function yamlSections(source: string, key: string, indentation: number): string[] {
+	const lines = source.split("\n");
+	const marker = `${" ".repeat(indentation)}${key}:`;
+	const sections: string[] = [];
+	for (let start = 0; start < lines.length; start += 1) {
+		if (lines[start] !== marker) continue;
+		let end = start + 1;
+		while (end < lines.length) {
+			const line = lines[end] ?? "";
+			const lineIndentation = line.length - line.trimStart().length;
+			if (line.trim() && lineIndentation <= indentation) break;
+			end += 1;
+		}
+		sections.push(lines.slice(start + 1, end).join("\n"));
+		start = end - 1;
+	}
+	return sections;
+}
+
+function versionFromBiomeDependency(source: string): string | undefined {
+	const version = source.split("\n").find((line) => line.startsWith("        version:"));
+	return version ? unquoteYamlScalar(version.trim().slice("version:".length)) : undefined;
+}
+
+function biomeRootVersion(lockfile: string | undefined): string | undefined {
+	if (!lockfile) return undefined;
+	for (const importers of yamlSections(lockfile, "importers", 0)) {
+		const rootImporter = yamlSections(importers, ".", 2)[0];
+		if (!rootImporter) continue;
+		for (const key of ["'@biomejs/biome'", '"@biomejs/biome"']) {
+			const dependency = yamlSections(rootImporter, key, 6)[0];
+			if (!dependency) continue;
+			return versionFromBiomeDependency(dependency);
+		}
+	}
+	return undefined;
+}
+
+export function compareBiomeToolPolicy(
+	baseLockfile: string | undefined,
+	headLockfile: string | undefined,
+	changes: ChangedPath[] = [],
+): PolicyViolation[] {
+	const baseVersion = biomeRootVersion(baseLockfile);
+	const headVersion = biomeRootVersion(headLockfile);
+	const violations: PolicyViolation[] = [];
+	if (headVersion !== SUPPORTED_BIOME_VERSION) {
+		violations.push({
+			kind: "coverage",
+			message: `Pinned Biome tool changed (${baseVersion ?? "missing"} → ${headVersion ?? "missing"}); update SUPPORTED_BIOME_VERSION in the ratchet as an explicit policy migration`,
+			path: "pnpm-lock.yaml",
+		});
+	}
+	for (const change of changes) {
+		const changedPath = normalizePath(change.afterPath ?? change.beforePath ?? "");
+		if (changedPath !== "pnpm-workspace.yaml" && changedPath !== "package.json") continue;
+		const before = biomeDependencyReference(changedPath, change.beforeSource);
+		const after = biomeDependencyReference(changedPath, change.afterSource);
+		if (before === after) continue;
+		violations.push({
+			kind: "coverage",
+			message: `Biome dependency selection changed (${before ?? "missing"} → ${after ?? "missing"}); explicit policy review required`,
+			path: changedPath,
+		});
+	}
+	return violations;
+}
+
+function biomeDependencyReference(
+	pathValue: string,
+	source: string | undefined,
+): string | undefined {
+	if (!source) return undefined;
+	if (pathValue === "pnpm-workspace.yaml") {
+		return source.match(/^\s*["']?@biomejs\/biome["']?\s*:\s*(.+)$/mu)?.[1]?.trim();
+	}
+	const manifest: unknown = JSON.parse(source);
+	if (!isRecord(manifest)) return undefined;
+	for (const field of ["dependencies", "devDependencies"]) {
+		const dependencies = manifest[field];
+		if (isRecord(dependencies) && typeof dependencies["@biomejs/biome"] === "string") {
+			return dependencies["@biomejs/biome"];
+		}
+	}
+	return undefined;
 }
 
 function isRecord(value: unknown): value is UnknownRecord {
@@ -102,6 +202,7 @@ function assertUnambiguousMeasuredPairing(
 	for (const category of categories) {
 		const categoryBefore = before.filter((diagnostic) => diagnostic.category === category);
 		const categoryAfter = after.filter((diagnostic) => diagnostic.category === category);
+		if (categoryAfter.length === 0) continue;
 		if (categoryBefore.length <= 1 && categoryAfter.length <= 1) continue;
 		const identities = [...categoryBefore, ...categoryAfter].map(
 			(diagnostic) => diagnostic.scopeIdentity,
@@ -1061,11 +1162,12 @@ function suppressionViolations(
 
 function ignoreFileViolations(changes: ChangedPath[]): PolicyViolation[] {
 	return changes.flatMap((change) => {
-		const changedPath = change.afterPath ?? change.beforePath;
+		const ignorePath = [change.beforePath, change.afterPath].find(
+			(candidate) => candidate?.endsWith(".gitignore") || candidate?.endsWith(".ignore"),
+		);
 		if (
-			!changedPath ||
-			(!changedPath.endsWith(".gitignore") && !changedPath.endsWith(".ignore")) ||
-			change.beforeSource === change.afterSource
+			!ignorePath ||
+			(change.beforePath === change.afterPath && change.beforeSource === change.afterSource)
 		) {
 			return [];
 		}
@@ -1073,53 +1175,14 @@ function ignoreFileViolations(changes: ChangedPath[]): PolicyViolation[] {
 			{
 				kind: "coverage" as const,
 				message: "Git ignore policy changed; explicit coverage review required",
-				path: changedPath,
+				path: ignorePath,
 			},
 		];
 	});
 }
 
-function unquoteYamlScalar(value: string): string {
-	const trimmed = value.trim();
-	if (
-		(trimmed.startsWith("'") && trimmed.endsWith("'")) ||
-		(trimmed.startsWith('"') && trimmed.endsWith('"'))
-	) {
-		return trimmed.slice(1, -1);
-	}
-	return trimmed;
-}
-
-function yamlSections(source: string, key: string, indentation: number): string[] {
-	const lines = source.split("\n");
-	const marker = `${" ".repeat(indentation)}${key}:`;
-	const sections: string[] = [];
-	for (let start = 0; start < lines.length; start += 1) {
-		if (lines[start] !== marker) continue;
-		let end = start + 1;
-		while (end < lines.length) {
-			const line = lines[end] ?? "";
-			const lineIndentation = line.length - line.trimStart().length;
-			if (line.trim() && lineIndentation <= indentation) break;
-			end += 1;
-		}
-		sections.push(lines.slice(start + 1, end).join("\n"));
-		start = end - 1;
-	}
-	return sections;
-}
-
 function biomeLockfileVersion(source: string): string | undefined {
-	for (const importers of yamlSections(source, "importers", 0)) {
-		const rootImporter = yamlSections(importers, ".", 2)[0];
-		if (!rootImporter) continue;
-		for (const key of ["'@biomejs/biome'", '"@biomejs/biome"']) {
-			const dependency = yamlSections(rootImporter, key, 6)[0];
-			const version = dependency?.split("\n").find((line) => line.startsWith("        version:"));
-			if (version) return unquoteYamlScalar(version.trim().slice("version:".length));
-		}
-	}
-	return undefined;
+	return biomeRootVersion(source);
 }
 
 function biomeDependencySelection(
