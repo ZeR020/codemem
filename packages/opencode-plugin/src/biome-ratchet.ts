@@ -613,7 +613,7 @@ function scanCodeToken(source: string, index: number, comments: SourceComment[])
 	if (current === '"' || current === "'") return skipQuotedString(source, index, current);
 	if (current === "`") return scanTemplate(source, index + 1, comments);
 	if (current === "{") return scanCode(source, index + 1, comments, { stopAtBrace: true });
-	if (current === "<") {
+	if (current === "<" && canStartRegex(source, index)) {
 		const end = jsxNodeEnd(source, index);
 		if (end !== undefined) {
 			scanJsxComments(source, index, end, comments);
@@ -942,27 +942,31 @@ function changedAfterRanges(before: string, after: string): Array<{ start: numbe
 
 function editsCoveredByExistingBroadSuppression(change: ChangedPath): boolean {
 	if (change.beforeSource === undefined || change.afterSource === undefined) return false;
-	const changed = changedAfterRanges(change.beforeSource, change.afterSource);
 	const existing = new Set(
 		broadSuppressionRanges(change.beforeSource).map((suppression) => suppression.identity),
 	);
-	return broadSuppressionRanges(change.afterSource).some(
-		(suppression) =>
-			existing.has(suppression.identity) &&
-			changed.some((range) => range.start < suppression.end && range.end > suppression.start),
+	const retained = broadSuppressionRanges(change.afterSource).filter((suppression) =>
+		existing.has(suppression.identity),
+	);
+	if (retained.length === 0) return false;
+	const changed = changedAfterRanges(change.beforeSource, change.afterSource);
+	return retained.some((suppression) =>
+		changed.some((range) => range.start < suppression.end && range.end > suppression.start),
 	);
 }
 
 function editsCoveredByExistingOrdinarySuppression(change: ChangedPath): boolean {
 	if (change.beforeSource === undefined || change.afterSource === undefined) return false;
-	const changed = changedAfterRanges(change.beforeSource, change.afterSource);
 	const existing = new Set(
 		ordinarySuppressionRanges(change.beforeSource).map((suppression) => suppression.identity),
 	);
-	return ordinarySuppressionRanges(change.afterSource).some(
-		(suppression) =>
-			existing.has(suppression.identity) &&
-			changed.some((range) => range.start < suppression.end && range.end > suppression.start),
+	const retained = ordinarySuppressionRanges(change.afterSource).filter((suppression) =>
+		existing.has(suppression.identity),
+	);
+	if (retained.length === 0) return false;
+	const changed = changedAfterRanges(change.beforeSource, change.afterSource);
+	return retained.some((suppression) =>
+		changed.some((range) => range.start < suppression.end && range.end > suppression.start),
 	);
 }
 
@@ -1288,42 +1292,52 @@ function overrideViolations(base: UnknownRecord, head: UnknownRecord): PolicyVio
 	];
 }
 
+function changeContainsBiomeSuppression(change: ChangedPath): boolean {
+	return [change.beforeSource, change.afterSource].some((source) =>
+		source?.includes("biome-ignore"),
+	);
+}
+
+function suppressionViolationsForChange(change: ChangedPath): PolicyViolation[] {
+	const violations: PolicyViolation[] = [];
+	const remaining = suppressionDirectives(change.afterSource);
+	for (const previous of suppressionDirectives(change.beforeSource)) {
+		const match = remaining.indexOf(previous);
+		if (match !== -1) remaining.splice(match, 1);
+	}
+	if (remaining.length > 0) {
+		violations.push({
+			kind: "suppression",
+			message: `${remaining.length} Biome suppression directive${remaining.length === 1 ? "" : "s"} added or changed`,
+			path: change.afterPath,
+		});
+	}
+	if (editsCoveredByExistingBroadSuppression(change)) {
+		violations.push({
+			kind: "suppression",
+			message: "Code changed under an existing broad Biome suppression",
+			path: change.afterPath,
+		});
+	}
+	if (editsCoveredByExistingOrdinarySuppression(change)) {
+		violations.push({
+			kind: "suppression",
+			message: "Code changed under an existing Biome suppression",
+			path: change.afterPath,
+		});
+	}
+	return violations;
+}
+
 function suppressionViolations(
 	changes: ChangedPath[],
 	base: UnknownRecord,
 	head: UnknownRecord,
 ): PolicyViolation[] {
-	return changes.flatMap((change) => {
-		if (!changeTouchesLintedPath(change, base, head)) return [];
-		const violations: PolicyViolation[] = [];
-		const remaining = suppressionDirectives(change.afterSource);
-		for (const previous of suppressionDirectives(change.beforeSource)) {
-			const match = remaining.indexOf(previous);
-			if (match !== -1) remaining.splice(match, 1);
-		}
-		if (remaining.length > 0) {
-			violations.push({
-				kind: "suppression" as const,
-				message: `${remaining.length} Biome suppression directive${remaining.length === 1 ? "" : "s"} added or changed`,
-				path: change.afterPath,
-			});
-		}
-		if (editsCoveredByExistingBroadSuppression(change)) {
-			violations.push({
-				kind: "suppression",
-				message: "Code changed under an existing broad Biome suppression",
-				path: change.afterPath,
-			});
-		}
-		if (editsCoveredByExistingOrdinarySuppression(change)) {
-			violations.push({
-				kind: "suppression",
-				message: "Code changed under an existing Biome suppression",
-				path: change.afterPath,
-			});
-		}
-		return violations;
-	});
+	return changes
+		.filter((change) => changeTouchesLintedPath(change, base, head))
+		.filter(changeContainsBiomeSuppression)
+		.flatMap(suppressionViolationsForChange);
 }
 
 function ignoreFileViolations(changes: ChangedPath[]): PolicyViolation[] {

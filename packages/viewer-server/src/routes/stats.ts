@@ -188,6 +188,12 @@ type UsageAggregateRow = {
 	tokens_read: number;
 	tokens_written: number;
 	tokens_saved: number;
+	token_unit: "tokens";
+	measured_count: number;
+	estimated_count: number;
+	unavailable_count: number;
+	legacy_text_length_count: number;
+	legacy_unclassified_count: number;
 };
 
 /**
@@ -203,6 +209,12 @@ function mapAggregateEvents(rows: UsageAggregateRow[]): Record<string, unknown>[
 			total_tokens_written: row.tokens_written,
 			total_tokens_saved: row.tokens_saved,
 			count: row.count,
+			token_unit: row.token_unit,
+			measured_count: row.measured_count,
+			estimated_count: row.estimated_count,
+			unavailable_count: row.unavailable_count,
+			legacy_text_length_count: row.legacy_text_length_count,
+			legacy_unclassified_count: row.legacy_unclassified_count,
 		}))
 		.sort((a, b) => a.event.localeCompare(b.event));
 }
@@ -210,21 +222,57 @@ function mapAggregateEvents(rows: UsageAggregateRow[]): Record<string, unknown>[
 /**
  * Sum the neutral core aggregate rows into the ApiUsageTotals wire shape.
  */
-function totalsFromAggregate(rows: UsageAggregateRow[]): {
+type UsageAggregateTotals = {
 	tokens_read: number;
 	tokens_written: number;
 	tokens_saved: number;
 	count: number;
-} {
-	return rows.reduce(
+	token_unit: "tokens";
+	measured_count: number;
+	estimated_count: number;
+	unavailable_count: number;
+	legacy_text_length_count: number;
+	legacy_unclassified_count: number;
+};
+
+function totalsFromAggregate(rows: UsageAggregateRow[]): UsageAggregateTotals {
+	return rows.reduce<UsageAggregateTotals>(
 		(acc, row) => ({
 			tokens_read: acc.tokens_read + row.tokens_read,
 			tokens_written: acc.tokens_written + row.tokens_written,
 			tokens_saved: acc.tokens_saved + row.tokens_saved,
 			count: acc.count + row.count,
+			token_unit: "tokens",
+			measured_count: acc.measured_count + row.measured_count,
+			estimated_count: acc.estimated_count + row.estimated_count,
+			unavailable_count: acc.unavailable_count + row.unavailable_count,
+			legacy_text_length_count: acc.legacy_text_length_count + row.legacy_text_length_count,
+			legacy_unclassified_count: acc.legacy_unclassified_count + row.legacy_unclassified_count,
 		}),
-		{ tokens_read: 0, tokens_written: 0, tokens_saved: 0, count: 0 },
+		{
+			tokens_read: 0,
+			tokens_written: 0,
+			tokens_saved: 0,
+			count: 0,
+			token_unit: "tokens",
+			measured_count: 0,
+			estimated_count: 0,
+			unavailable_count: 0,
+			legacy_text_length_count: 0,
+			legacy_unclassified_count: 0,
+		},
 	);
+}
+
+function usageAggregatePayload(store: MemoryStore, project: string | null) {
+	const globalRows = store.classifiedUsageAggregate();
+	const filteredRows = project ? store.classifiedUsageAggregate(project) : null;
+	return {
+		eventsGlobal: mapAggregateEvents(globalRows),
+		totalsGlobal: totalsFromAggregate(globalRows),
+		eventsFiltered: filteredRows ? mapAggregateEvents(filteredRows) : null,
+		totalsFiltered: filteredRows ? totalsFromAggregate(filteredRows) : null,
+	};
 }
 
 type UsagePayload = Record<string, unknown>;
@@ -407,12 +455,7 @@ export function statsRoutes(getStore: () => MemoryStore) {
 			// store.stats()), so they never load the full usage_events table
 			// into JS. Only the small surfaced recent_packs window below keeps
 			// per-row scope visibility + metadata sanitization.
-			const globalAggregate = store.usageAggregate();
-			const eventsGlobal = mapAggregateEvents(globalAggregate);
-			const totalsGlobal = totalsFromAggregate(globalAggregate);
-			const filteredAggregate = projectFilter ? store.usageAggregate(projectFilter) : null;
-			const eventsFiltered = filteredAggregate ? mapAggregateEvents(filteredAggregate) : null;
-			const totalsFiltered = filteredAggregate ? totalsFromAggregate(filteredAggregate) : null;
+			const aggregates = usageAggregatePayload(store, projectFilter);
 
 			// recent_packs candidate window. Over-fetch the most-recent pack
 			// events (20x the 10 we surface) so that, in the common case where a
@@ -463,12 +506,12 @@ export function statsRoutes(getStore: () => MemoryStore) {
 
 			const payload: UsagePayload = {
 				project: projectFilter,
-				events: projectFilter ? eventsFiltered : eventsGlobal,
-				totals: projectFilter ? totalsFiltered : totalsGlobal,
-				events_global: eventsGlobal,
-				totals_global: totalsGlobal,
-				events_filtered: eventsFiltered,
-				totals_filtered: totalsFiltered,
+				events: projectFilter ? aggregates.eventsFiltered : aggregates.eventsGlobal,
+				totals: projectFilter ? aggregates.totalsFiltered : aggregates.totalsGlobal,
+				events_global: aggregates.eventsGlobal,
+				totals_global: aggregates.totalsGlobal,
+				events_filtered: aggregates.eventsFiltered,
+				totals_filtered: aggregates.totalsFiltered,
 				recent_packs: recentPacks,
 			};
 			const setAtMs = Date.now();

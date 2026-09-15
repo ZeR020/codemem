@@ -57,10 +57,18 @@ import type {
 } from "./ingest-types.js";
 import { hasMeaningfulObservation } from "./ingest-xml-parser.js";
 import { REMEMBER_MEMORY_KINDS } from "./memory-kinds.js";
-import { type ObserverClient, ObserverClient as ObserverClientImpl } from "./observer-client.js";
 import {
+	type ObserverClient,
+	ObserverClient as ObserverClientImpl,
+	type ObserverTokenUsage,
+} from "./observer-client.js";
+import {
+	ObserverOutputError,
+	ObserverOutputTransportError,
 	observeAndNormalizeObserverOutput,
+	observerOutputAttemptCount,
 	observerOutputMetadata,
+	observerOutputTotalUsage,
 	resolveObserverOutputCapability,
 } from "./observer-output.js";
 import { resolveProject } from "./project.js";
@@ -322,12 +330,37 @@ async function observeRawEventOutput(
 	system: string,
 	user: string,
 	capability: ReturnType<typeof resolveObserverOutputCapability>,
+	usageContext: { store: MemoryStore; sessionId: number; project: string | null },
 ): Promise<Awaited<ReturnType<typeof observeAndNormalizeObserverOutput>>> {
 	try {
 		return await observeAndNormalizeObserverOutput(observer, system, user, capability);
 	} catch (error) {
+		const status = observer.getStatus();
 		if ((typeof error === "object" || typeof error === "function") && error !== null) {
-			observerFailureStatuses.set(error, observer.getStatus());
+			observerFailureStatuses.set(error, status);
+		}
+		if (error instanceof ObserverOutputError || error instanceof ObserverOutputTransportError) {
+			const usage = error.telemetry.totalUsage;
+			recordObserverUsage(
+				usageContext.store,
+				usageContext.sessionId,
+				normalizedObserverTokenCounts(usage, status.provider),
+				{
+					project: usageContext.project,
+					token_usage: observerTokenUsageMetadata(
+						usage,
+						observerDiagnosticsAttemptCount(error.diagnostics),
+					),
+					provider: status.provider,
+					model: status.model,
+					runtime: status.runtime,
+					observer_output_failure_reason: error.diagnostics.failureReason,
+					observer_output_retry_attempted: error.diagnostics.retryAttempted,
+					observer_output_repair_attempted: error.diagnostics.repairAttempted,
+					observer_output_total_elapsed_ms: error.telemetry.totalElapsedMs,
+					observer_output_total_usage: usage,
+				},
+			);
 		}
 		throw error;
 	}
@@ -447,6 +480,7 @@ export async function ingest(
 					if (id == null) throw new Error("session insert returned no id");
 					return id;
 				})();
+	let completedObserverUsage: ObserverUsageRecord | null = null;
 
 	try {
 		// ------------------------------------------------------------------
@@ -610,9 +644,31 @@ export async function ingest(
 		// ------------------------------------------------------------------
 		// Call observer LLM
 		// ------------------------------------------------------------------
-		const output = await observeRawEventOutput(selectedObserver, system, user, outputCapability);
+		const output = await observeRawEventOutput(selectedObserver, system, user, outputCapability, {
+			store,
+			sessionId,
+			project,
+		});
 		const response = output.final;
 		const outputMetadata = observerOutputMetadata(output);
+		const observerStatus = selectedObserver.getStatus();
+		const usageTokenTotal = assistantUsageEvents.reduce(
+			(sum, event) => sum + (event.total_tokens ?? 0),
+			0,
+		);
+		completedObserverUsage = createObserverUsageRecord(output, selectedObserver, {
+			project,
+			captureRoutingEnabled,
+			selectedTier,
+			selectedTierReasons,
+			requestedObserverProvider,
+			requestedObserverModel,
+			requestedObserverRuntime,
+			requestedObserverOpenAIResponses,
+			observerFallbackApplied,
+			observerFallbackReason,
+			usageTokenTotal,
+		});
 
 		if (!response.raw) {
 			// Raw-event flushes must be lossless: if the observer returns no output,
@@ -631,14 +687,11 @@ export async function ingest(
 				`[codemem] Observer returned no output (provider=${response.provider}, model=${response.model}` +
 					`${status.lastError ? `, error=${status.lastError}` : ""}). No memories will be created for this session.`,
 			);
+			recordCompletedObserverUsage(store, sessionId, completedObserverUsage);
 			endSession(store, sessionId, events.length, sessionContext);
 			return;
 		}
 
-		// ------------------------------------------------------------------
-		// Parse response
-		// ------------------------------------------------------------------
-		const rawText = response.raw;
 		const parsed = response.parsed;
 		if (
 			sessionContext?.flusher === "raw_events" &&
@@ -653,8 +706,6 @@ export async function ingest(
 				selectedObserver,
 			);
 		}
-		const observerStatus = selectedObserver.getStatus();
-
 		let observationsToStore: CaptureRoutedObservation[] = [];
 		if (storeTyped && hasMeaningfulObservation(parsed.observations)) {
 			for (const obs of parsed.observations) {
@@ -757,6 +808,14 @@ export async function ingest(
 		if (promptOnlyRawEventSummary) {
 			summaryToStore = null;
 		}
+		completedObserverUsage.metadata = {
+			...completedObserverUsage.metadata,
+			observation_count: observationsToStore.length,
+			has_summary: summaryToStore != null,
+			...captureMetadata(captureRoutingEnabled, captureSuppressedCount, captureCandidateCount),
+			session_class: sessionClass,
+			summary_disposition: summaryDisposition,
+		};
 
 		if (sessionContext?.flusher === "raw_events") {
 			const storableCount = observationsToStore.length + (summaryToStore ? 1 : 0);
@@ -792,6 +851,7 @@ export async function ingest(
 					locallySuppressedSummaryOnlyMicro ||
 					captureSuppressedTelemetryOnly
 				) {
+					recordCompletedObserverUsage(store, sessionId, completedObserverUsage);
 					endSession(store, sessionId, events.length, sessionContext, {
 						session_class: sessionClass,
 						summary_disposition: summaryDisposition,
@@ -809,17 +869,14 @@ export async function ingest(
 			}
 		}
 
+		const observerUsageRecord = completedObserverUsage;
 		const vectorWriteInputs: Array<{ memoryId: number; title: string; bodyText: string }> = [];
 		const flushBatchMetadata =
 			sessionContext.flushBatch && typeof sessionContext.flushBatch === "object"
 				? sessionContext.flushBatch
 				: null;
-
 		// Persist all observations, summary, and usage atomically
 		store.db.transaction(() => {
-			// ------------------------------------------------------------------
-			// Filter and persist observations
-			// ------------------------------------------------------------------
 			for (const obs of observationsToStore) {
 				const kind = obs.kind.trim().toLowerCase();
 
@@ -926,53 +983,14 @@ export async function ingest(
 				vectorWriteInputs.push({ memoryId, title: summaryTitle, bodyText: body });
 			}
 
-			// ------------------------------------------------------------------
-			// Record observer usage
-			// ------------------------------------------------------------------
-			const usageTokenTotal = assistantUsageEvents.reduce(
-				(sum, e) => sum + (e.total_tokens ?? 0),
-				0,
+			recordObserverUsage(
+				store,
+				sessionId,
+				observerUsageRecord.tokens,
+				observerUsageRecord.metadata,
 			);
-			d.insert(schema.usageEvents)
-				.values({
-					session_id: sessionId,
-					event: "observer_call",
-					tokens_read: rawText.length,
-					tokens_written: transcript.length,
-					created_at: new Date().toISOString(),
-					metadata_json: toJson({
-						project,
-						observation_count: observationsToStore.length,
-						has_summary: summaryToStore != null,
-						// Only emit capture-routing telemetry when the gate is on, so
-						// default-off output stays byte-identical to pre-feature.
-						...(captureRoutingEnabled
-							? {
-									capture_suppressed_count: captureSuppressedCount,
-									capture_candidate_count: captureCandidateCount,
-									capture_routing_enabled: true,
-								}
-							: {}),
-						session_class: sessionClass,
-						summary_disposition: summaryDisposition,
-						observer_tier: selectedTier,
-						observer_tier_reasons: selectedTierReasons,
-						requested_provider: requestedObserverProvider,
-						requested_model: requestedObserverModel,
-						requested_runtime: requestedObserverRuntime,
-						requested_openai_responses: requestedObserverOpenAIResponses,
-						provider: response.provider,
-						model: response.model,
-						runtime: observerStatus.runtime,
-						openai_responses: selectedObserver.openaiUseResponses,
-						fallback_applied: observerFallbackApplied,
-						fallback_reason: observerFallbackReason,
-						...outputMetadata,
-						session_usage_tokens: usageTokenTotal,
-					}),
-				})
-				.run();
 		})();
+		observerUsageRecord.recorded = true;
 
 		for (const input of vectorWriteInputs) {
 			try {
@@ -1004,6 +1022,7 @@ export async function ingest(
 			...outputMetadata,
 		});
 	} catch (err) {
+		recordCompletedObserverUsage(store, sessionId, completedObserverUsage);
 		// End session even on error
 		try {
 			endSession(store, sessionId, events.length, sessionContext);
@@ -1080,4 +1099,136 @@ export async function main(store: MemoryStore, observer: ObserverClient): Promis
 	}
 
 	await ingest(payload, store, { observer });
+}
+function observerTokenUsageMetadata(
+	usage: ObserverTokenUsage | null,
+	attemptCount: number,
+): Record<string, unknown> {
+	return {
+		unit: "tokens",
+		source: usage ? "provider" : "unavailable",
+		input_direction: "observer_input",
+		output_direction: "observer_output",
+		attempt_count: attemptCount,
+	};
+}
+
+function observerDiagnosticsAttemptCount(diagnostics: {
+	repairAttempted: boolean;
+	retryAttempted: boolean;
+}): number {
+	return diagnostics.repairAttempted || diagnostics.retryAttempted ? 2 : 1;
+}
+
+function normalizedObserverTokenCounts(
+	usage: ObserverTokenUsage | null,
+	provider: string,
+): {
+	inputTokens: number | null;
+	outputTokens: number | null;
+} {
+	if (!usage) return { inputTokens: null, outputTokens: null };
+	if (provider !== "anthropic") return usage;
+	return {
+		inputTokens:
+			usage.inputTokens + (usage.cacheReadInputTokens ?? 0) + (usage.cacheCreationInputTokens ?? 0),
+		outputTokens: usage.outputTokens,
+	};
+}
+
+interface ObserverUsageRecord {
+	recorded: boolean;
+	tokens: { inputTokens: number | null; outputTokens: number | null };
+	metadata: Record<string, unknown>;
+}
+
+interface ObserverUsageRecordContext {
+	project: string | null;
+	captureRoutingEnabled: boolean;
+	selectedTier: string | null;
+	selectedTierReasons: string[];
+	requestedObserverProvider: string | null;
+	requestedObserverModel: string | null;
+	requestedObserverRuntime: string | null;
+	requestedObserverOpenAIResponses: boolean | null;
+	observerFallbackApplied: boolean;
+	observerFallbackReason: string | null;
+	usageTokenTotal: number;
+}
+
+function createObserverUsageRecord(
+	output: Awaited<ReturnType<typeof observeAndNormalizeObserverOutput>>,
+	observer: ObserverClient,
+	context: ObserverUsageRecordContext,
+): ObserverUsageRecord {
+	const usage = observerOutputTotalUsage(output);
+	const response = output.final;
+	return {
+		recorded: false,
+		tokens: normalizedObserverTokenCounts(usage, response.provider),
+		metadata: {
+			project: context.project,
+			token_usage: observerTokenUsageMetadata(usage, observerOutputAttemptCount(output)),
+			observation_count: 0,
+			has_summary: false,
+			...captureMetadata(context.captureRoutingEnabled, 0, 0),
+			observer_tier: context.selectedTier,
+			observer_tier_reasons: context.selectedTierReasons,
+			requested_provider: context.requestedObserverProvider,
+			requested_model: context.requestedObserverModel,
+			requested_runtime: context.requestedObserverRuntime,
+			requested_openai_responses: context.requestedObserverOpenAIResponses,
+			provider: response.provider,
+			model: response.model,
+			runtime: observer.getStatus().runtime,
+			openai_responses: observer.openaiUseResponses,
+			fallback_applied: context.observerFallbackApplied,
+			fallback_reason: context.observerFallbackReason,
+			...observerOutputMetadata(output),
+			session_usage_tokens: context.usageTokenTotal,
+		},
+	};
+}
+
+function recordCompletedObserverUsage(
+	store: MemoryStore,
+	sessionId: number,
+	record: ObserverUsageRecord | null,
+): void {
+	if (!record || record.recorded) return;
+	recordObserverUsage(store, sessionId, record.tokens, record.metadata);
+	record.recorded = true;
+}
+
+function recordObserverUsage(
+	store: MemoryStore,
+	sessionId: number,
+	tokens: { inputTokens: number | null; outputTokens: number | null },
+	metadata: Record<string, unknown>,
+): void {
+	store.db
+		.prepare(
+			`INSERT INTO usage_events(session_id, event, tokens_read, tokens_written, created_at, metadata_json)
+			 VALUES (?, 'observer_call', ?, ?, ?, ?)`,
+		)
+		.run(
+			sessionId,
+			tokens.inputTokens,
+			tokens.outputTokens,
+			new Date().toISOString(),
+			toJson(metadata),
+		);
+}
+
+function captureMetadata(
+	enabled: boolean,
+	suppressedCount: number,
+	candidateCount: number,
+): Record<string, unknown> {
+	if (!enabled) return {};
+	return {
+		capture_suppressed_count: suppressedCount,
+		capture_candidate_count: candidateCount,
+		capture_routing_enabled: true,
+	};
 }

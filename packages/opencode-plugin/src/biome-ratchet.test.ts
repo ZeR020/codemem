@@ -866,6 +866,42 @@ describe("Biome policy bypass prevention", () => {
 });
 
 describe("Biome suppressed-edit policy", () => {
+	it("skips line diffing for large rewrites without retained suppressions", () => {
+		const beforeSource = Array.from(
+			{ length: 4_000 },
+			(_, index) => `const before${index} = 1;`,
+		).join("\n");
+		const afterSource = Array.from(
+			{ length: 4_000 },
+			(_, index) => `const after${index} = 2;`,
+		).join("\n");
+
+		expect(
+			compareBiomePolicy(config(), config(), [
+				{ status: "modified", afterPath: "src/a.ts", beforeSource, afterSource },
+			]),
+		).toEqual([]);
+	});
+
+	it("scans TypeScript generics without treating them as JSX", () => {
+		const genericTypes = Array.from(
+			{ length: 2_000 },
+			(_, index) => `type Value${index} = Map<string, number>;`,
+		).join("\n");
+		const beforeSource = `${genericTypes}\n// biome-ignore lint/a: legacy\nconst hidden = 1;\nconst outside = 1;`;
+		const afterSource = beforeSource.replace("const outside = 1;", "const outside = 2;");
+
+		expect(
+			compareBiomePolicy(config(), config(), [
+				{ status: "modified", afterPath: "src/a.ts", beforeSource, afterSource },
+			]),
+		).not.toContainEqual({
+			kind: "suppression",
+			message: "Code changed under an existing Biome suppression",
+			path: "src/a.ts",
+		});
+	});
+
 	it("rejects edits covered by existing broad suppressions", () => {
 		const fileWide = "// biome-ignore-all lint/a: legacy\nconst first = 1;";
 		const range = [

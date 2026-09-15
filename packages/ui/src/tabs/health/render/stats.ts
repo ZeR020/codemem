@@ -14,6 +14,27 @@ import {
 import { state } from "../../../lib/state";
 import { renderIcons, renderStatBlocks, renderText } from "../components";
 import type { StatItem } from "../types";
+import { selectPackUsage } from "../usage";
+
+function appendRawEventStats(items: StatItem[], pending: number, sessions: number): void {
+	if (pending > 0) {
+		items.push({
+			label: "Raw events pending",
+			value: pending,
+			tooltip: "Pending raw events waiting to be flushed",
+			icon: "activity",
+		});
+		return;
+	}
+	if (sessions > 0) {
+		items.push({
+			label: "Raw sessions",
+			value: sessions,
+			tooltip: "Sessions with pending raw events",
+			icon: "inbox",
+		});
+	}
+}
 
 export function renderStats() {
 	const statsGrid = document.getElementById("statsGrid");
@@ -33,6 +54,8 @@ export function renderStats() {
 	const totalsFiltered = usagePayload?.totals_filtered || null;
 	const isFiltered = !!(project && totalsFiltered);
 	const usage = isFiltered ? totalsFiltered : totalsGlobal;
+	const globalPackUsage = selectPackUsage(usagePayload, false);
+	const packUsage = selectPackUsage(usagePayload, isFiltered);
 	const rawSessions = Number(raw.sessions || 0);
 	const rawPending = Number(raw.pending || 0);
 
@@ -40,30 +63,30 @@ export function renderStats() {
 		? `\nGlobal: ${Number(totalsGlobal.work_investment_tokens || 0).toLocaleString()} invested`
 		: "";
 	const globalLineRead = isFiltered
-		? `\nGlobal: ${Number(totalsGlobal.tokens_read || 0).toLocaleString()} read`
+		? `\nGlobal: ${Number(globalPackUsage?.total_tokens_read || 0).toLocaleString()} estimated injected`
 		: "";
 	const globalLineSaved = isFiltered
-		? `\nGlobal: ${Number(totalsGlobal.tokens_saved || 0).toLocaleString()} saved`
+		? `\nGlobal: ${Number(globalPackUsage?.total_tokens_saved || 0).toLocaleString()} estimated saved`
 		: "";
 
 	const items: StatItem[] = [
 		{
 			label: isFiltered ? "Savings (project)" : "Savings",
-			value: formatTokenCount(usage.tokens_saved || 0),
-			tooltip: `Tokens saved by reusing compressed memories. Exact: ${Number(usage.tokens_saved || 0).toLocaleString()} saved${globalLineSaved}`,
+			value: formatTokenCount(packUsage.total_tokens_saved || 0),
+			tooltip: `Estimated tokens saved by reusing compressed memories: ${Number(packUsage.total_tokens_saved || 0).toLocaleString()}${globalLineSaved}`,
 			icon: "trending-up",
 		},
 		{
 			label: isFiltered ? "Injected (project)" : "Injected",
-			value: formatTokenCount(usage.tokens_read || 0),
-			tooltip: `Tokens injected into context (pack size). Exact: ${Number(usage.tokens_read || 0).toLocaleString()} injected${globalLineRead}`,
+			value: formatTokenCount(packUsage.total_tokens_read || 0),
+			tooltip: `Estimated tokens injected into context (pack size): ${Number(packUsage.total_tokens_read || 0).toLocaleString()}${globalLineRead}`,
 			icon: "book-open",
 		},
 		{
 			label: isFiltered ? "Reduction (project)" : "Reduction",
-			value: formatReductionPercent(usage.tokens_saved, usage.tokens_read),
+			value: formatReductionPercent(packUsage.total_tokens_saved, packUsage.total_tokens_read),
 			tooltip:
-				`Percent reduction from reuse. Factor: ${formatMultiplier(usage.tokens_saved, usage.tokens_read)}.` +
+				`Estimated percent reduction from reuse. Factor: ${formatMultiplier(packUsage.total_tokens_saved, packUsage.total_tokens_read)}.` +
 				globalLineRead +
 				globalLineSaved,
 			icon: "percent",
@@ -88,20 +111,7 @@ export function renderStats() {
 			icon: "tag",
 		},
 	];
-	if (rawPending > 0)
-		items.push({
-			label: "Raw events pending",
-			value: rawPending,
-			tooltip: "Pending raw events waiting to be flushed",
-			icon: "activity",
-		});
-	else if (rawSessions > 0)
-		items.push({
-			label: "Raw sessions",
-			value: rawSessions,
-			tooltip: "Sessions with pending raw events",
-			icon: "inbox",
-		});
+	appendRawEventStats(items, rawPending, rawSessions);
 
 	renderStatBlocks(statsGrid, items);
 
