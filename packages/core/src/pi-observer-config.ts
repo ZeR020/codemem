@@ -313,6 +313,95 @@ function loadModelsStoreProviders(
 	}
 	return out;
 }
+function jsonHasEmbeddedApiKey(piDir: string): boolean {
+	for (const provider of loadModelsJsonProviders(piDir).values()) {
+		if (provider.apiKey) return true;
+	}
+	return false;
+}
+
+function providerApiKey(
+	authEntry: { kind: string; key?: string } | undefined,
+	jsonApiKey: string | null | undefined,
+): string | null {
+	if (authEntry?.kind === "api_key" && authEntry.key) return authEntry.key;
+	return jsonApiKey ?? null;
+}
+
+function mergeProviderModels(
+	jsonProv:
+		| {
+				baseUrl: string | null;
+				api: string | null;
+				models: Array<Record<string, unknown>>;
+		  }
+		| undefined,
+	storeProv: { models: Array<Record<string, unknown>> } | undefined,
+) {
+	const seenIds = new Set<string>();
+	const merged: Array<{
+		model: Record<string, unknown>;
+		providerBaseUrl: string | null;
+		providerApi: string | null;
+	}> = [];
+	for (const model of jsonProv?.models ?? []) {
+		const id = asString(model.id);
+		if (!id || seenIds.has(id)) continue;
+		seenIds.add(id);
+		merged.push({
+			model,
+			providerBaseUrl: jsonProv?.baseUrl ?? null,
+			providerApi: jsonProv?.api ?? null,
+		});
+	}
+	for (const model of storeProv?.models ?? []) {
+		const id = asString(model.id);
+		if (!id || seenIds.has(id)) continue;
+		seenIds.add(id);
+		merged.push({
+			model,
+			providerBaseUrl: jsonProv?.baseUrl ?? asString(model.baseUrl),
+			providerApi: jsonProv?.api ?? null,
+		});
+	}
+	return merged;
+}
+
+function considerModel(
+	provider: string,
+	apiKey: string,
+	model: Record<string, unknown>,
+	providerBaseUrl: string | null,
+	providerApi: string | null,
+	settings: { enabledModels: Set<string>; defaultModel: string | null },
+	flags: { sawAnyModelApi: boolean; sawUnsupportedApi: boolean; sawSupportedApi: boolean },
+) {
+	const modelId = asString(model.id);
+	if (!modelId) return null;
+	const wireApi = asString(model.api) ?? providerApi;
+	if (!wireApi) return null;
+	flags.sawAnyModelApi = true;
+	if (
+		!SUPPORTED_WIRE_APIS.has(wireApi) ||
+		(wireApi === "anthropic-messages" && provider.toLowerCase() !== "anthropic")
+	) {
+		flags.sawUnsupportedApi = true;
+		return null;
+	}
+	flags.sawSupportedApi = true;
+	const ref = `${provider}/${modelId}`;
+	return {
+		provider,
+		modelId,
+		baseUrl: asString(model.baseUrl) ?? providerBaseUrl,
+		wireApi,
+		apiKey,
+		declaredCost: declaredCostOf(model),
+		nameTier: nameCostTier(modelId),
+		enabled: settings.enabledModels.size === 0 || settings.enabledModels.has(ref),
+		isDefault: settings.defaultModel === ref || settings.defaultModel === modelId,
+	} satisfies PiModelCandidate;
+}
 
 function buildCandidates(
 	piDir: string,
@@ -338,85 +427,30 @@ function buildCandidates(
 	for (const provider of providerNames) {
 		const jsonProv = fromJson.get(provider);
 		const storeProv = fromStore.get(provider);
-		const authEntry = auth.byProvider.get(provider);
-
-		// Credential: auth.json api_key wins, else models.json apiKey.
-		// OAuth-only providers are skipped entirely.
-		let apiKey: string | null = null;
-		if (authEntry?.kind === "api_key") {
-			apiKey = authEntry.key;
-		} else if (jsonProv?.apiKey) {
-			apiKey = jsonProv.apiKey;
-		} else if (authEntry?.kind === "oauth") {
-			// Tracked for oauth-only diagnosis; skip models.
-			continue;
-		} else {
-			// No credential for this provider — skip.
-			continue;
-		}
-
-		// Merge models: models.json first (user-defined), then store catalog ids not already present.
-		const seenIds = new Set<string>();
-		const mergedModels: Array<{
-			model: Record<string, unknown>;
-			providerBaseUrl: string | null;
-			providerApi: string | null;
-		}> = [];
-
-		for (const model of jsonProv?.models ?? []) {
-			const id = asString(model.id);
-			if (!id || seenIds.has(id)) continue;
-			seenIds.add(id);
-			mergedModels.push({
-				model,
-				providerBaseUrl: jsonProv?.baseUrl ?? null,
-				providerApi: jsonProv?.api ?? null,
-			});
-		}
-		for (const model of storeProv?.models ?? []) {
-			const id = asString(model.id);
-			if (!id || seenIds.has(id)) continue;
-			seenIds.add(id);
-			mergedModels.push({
-				model,
-				providerBaseUrl: jsonProv?.baseUrl ?? asString(model.baseUrl),
-				providerApi: jsonProv?.api ?? null,
-			});
-		}
-
-		// Provider with apiKey in models.json but empty models list: nothing to pick.
+		const apiKey = providerApiKey(auth.byProvider.get(provider), jsonProv?.apiKey);
+		if (!apiKey) continue;
+		const mergedModels = mergeProviderModels(jsonProv, storeProv);
+		const flags: { sawAnyModelApi: boolean; sawUnsupportedApi: boolean; sawSupportedApi: boolean } =
+			{
+				sawAnyModelApi,
+				sawUnsupportedApi,
+				sawSupportedApi,
+			};
 		for (const { model, providerBaseUrl, providerApi } of mergedModels) {
-			const modelId = asString(model.id);
-			if (!modelId) continue;
-			const wireApi = asString(model.api) ?? providerApi;
-			if (!wireApi) continue;
-			sawAnyModelApi = true;
-			if (
-				!SUPPORTED_WIRE_APIS.has(wireApi) ||
-				(wireApi === "anthropic-messages" && provider.toLowerCase() !== "anthropic")
-			) {
-				sawUnsupportedApi = true;
-				continue;
-			}
-			sawSupportedApi = true;
-
-			const baseUrl = asString(model.baseUrl) ?? providerBaseUrl;
-			const ref = `${provider}/${modelId}`;
-			const enabled = settings.enabledModels.size === 0 ? true : settings.enabledModels.has(ref);
-			const isDefault = settings.defaultModel === ref || settings.defaultModel === modelId;
-
-			candidates.push({
+			const candidate = considerModel(
 				provider,
-				modelId,
-				baseUrl,
-				wireApi,
 				apiKey,
-				declaredCost: declaredCostOf(model),
-				nameTier: nameCostTier(modelId),
-				enabled,
-				isDefault,
-			});
+				model,
+				providerBaseUrl,
+				providerApi,
+				settings,
+				flags,
+			);
+			if (candidate) candidates.push(candidate);
 		}
+		sawAnyModelApi = flags.sawAnyModelApi;
+		sawUnsupportedApi = flags.sawUnsupportedApi;
+		sawSupportedApi = flags.sawSupportedApi;
 	}
 
 	return {
@@ -460,6 +494,51 @@ function toOk(c: PiModelCandidate): PiObserverResolveOk {
 		apiKey: c.apiKey,
 		openAIUseResponses: c.wireApi === "openai-responses",
 		wireApi: c.wireApi,
+	};
+}
+
+function diagnoseEmptyCandidates(
+	piDir: string,
+	auth: ReturnType<typeof loadPiAuth>,
+	flags: {
+		hasModelsJson: boolean;
+		hasModelsStore: boolean;
+		sawSupportedApi: boolean;
+		sawUnsupportedOnly: boolean;
+	},
+): PiObserverResolveErr {
+	const oauthOnly = (): PiObserverResolveErr => ({
+		ok: false,
+		reason: "oauth-only",
+		detail:
+			"pi auth.json contains only OAuth providers; codemem v1 cannot refresh OAuth. Set observer_provider/observer_model explicitly with an API-key provider.",
+	});
+	if (auth.sawOAuth && !auth.sawApiKey && !jsonHasEmbeddedApiKey(piDir)) return oauthOnly();
+	if (
+		auth.sawApiKey &&
+		(flags.sawUnsupportedOnly ||
+			(!flags.sawSupportedApi && (flags.hasModelsJson || flags.hasModelsStore)))
+	) {
+		return {
+			ok: false,
+			reason: "unsupported-api",
+			detail:
+				"Authenticated pi providers use unsupported wire APIs (need openai-completions, openai-responses, or anthropic-messages).",
+		};
+	}
+	if (!auth.sawApiKey && !jsonHasEmbeddedApiKey(piDir)) {
+		return auth.sawOAuth
+			? oauthOnly()
+			: {
+					ok: false,
+					reason: "no-api-key-provider",
+					detail: "No API-key authenticated pi provider found in auth.json or models.json.",
+				};
+	}
+	return {
+		ok: false,
+		reason: "not-configured",
+		detail: `No eligible API-key model found under ${piDir}`,
 	};
 }
 
@@ -513,67 +592,12 @@ export function resolvePiObserverConfig(
 		if (pick) return toOk(pick);
 	}
 
-	// Diagnosis when nothing eligible.
-	if (auth.sawOAuth && !auth.sawApiKey) {
-		// models.json may still embed apiKey — already considered above.
-		// If we truly have no api-key path:
-		const jsonProvs = loadModelsJsonProviders(piDir);
-		let embeddedKey = false;
-		for (const p of jsonProvs.values()) {
-			if (p.apiKey) {
-				embeddedKey = true;
-				break;
-			}
-		}
-		if (!embeddedKey) {
-			return {
-				ok: false,
-				reason: "oauth-only",
-				detail:
-					"pi auth.json contains only OAuth providers; codemem v1 cannot refresh OAuth. Set observer_provider/observer_model explicitly with an API-key provider.",
-			};
-		}
-	}
-
-	if (sawUnsupportedOnly || (!sawSupportedApi && (hasModelsJson || hasModelsStore))) {
-		// Providers exist but none speak a supported wire API (and no eligible candidates).
-		if (!auth.sawApiKey) {
-			// fall through
-		} else {
-			return {
-				ok: false,
-				reason: "unsupported-api",
-				detail:
-					"Authenticated pi providers use unsupported wire APIs (need openai-completions, openai-responses, or anthropic-messages).",
-			};
-		}
-	}
-
-	if (!auth.sawApiKey) {
-		const jsonProvs = loadModelsJsonProviders(piDir);
-		let embeddedKey = false;
-		for (const p of jsonProvs.values()) {
-			if (p.apiKey) {
-				embeddedKey = true;
-				break;
-			}
-		}
-		if (!embeddedKey) {
-			return {
-				ok: false,
-				reason: auth.sawOAuth ? "oauth-only" : "no-api-key-provider",
-				detail: auth.sawOAuth
-					? "pi auth.json contains only OAuth providers; codemem v1 cannot refresh OAuth. Set observer_provider/observer_model explicitly with an API-key provider."
-					: "No API-key authenticated pi provider found in auth.json or models.json.",
-			};
-		}
-	}
-
-	return {
-		ok: false,
-		reason: "not-configured",
-		detail: `No eligible API-key model found under ${piDir}`,
-	};
+	return diagnoseEmptyCandidates(piDir, auth, {
+		hasModelsJson,
+		hasModelsStore,
+		sawSupportedApi,
+		sawUnsupportedOnly,
+	});
 }
 
 /**

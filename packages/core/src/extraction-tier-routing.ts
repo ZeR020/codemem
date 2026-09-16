@@ -1,6 +1,19 @@
 import type { ObserverConfig } from "./observer-client.js";
 import { observerBaseUrlForProviderOverride } from "./observer-client.js";
 
+function withProviderOverride(
+	baseConfig: ObserverConfig,
+	provider: string | null,
+	rest: Partial<ObserverConfig>,
+) {
+	return {
+		...baseConfig,
+		observerProvider: provider,
+		observerBaseUrl: observerBaseUrlForProviderOverride(baseConfig, provider ?? ""),
+		...rest,
+	};
+}
+
 export interface ExtractionReplayTierRoutingInput {
 	batchId: number;
 	sessionId: number;
@@ -143,10 +156,7 @@ export function buildTieredObserverSelection(
 			trimmedProvider(baseConfig.observerProvider);
 		const tierDefaults =
 			decision.tier === "simple" ? SIMPLE_TIER_ANTHROPIC_DEFAULTS : RICH_TIER_ANTHROPIC_DEFAULTS;
-		const observer = {
-			...baseConfig,
-			observerProvider: "anthropic",
-			observerBaseUrl: observerBaseUrlForProviderOverride(baseConfig, "anthropic"),
+		const observer = withProviderOverride(baseConfig, "anthropic", {
 			observerModel:
 				decision.tier === "simple"
 					? (baseConfig.observerSimpleModel ??
@@ -172,7 +182,7 @@ export function buildTieredObserverSelection(
 					: (baseConfig.observerRichMaxOutputTokens ??
 						tierDefaults.observerMaxOutputTokens ??
 						baseConfig.observerMaxTokens),
-		};
+		});
 		const fallbackReason =
 			hasExplicitProviderOverride && requestedProvider && requestedProvider !== "anthropic"
 				? "unsupported tier override for runtime"
@@ -200,10 +210,7 @@ export function buildTieredObserverSelection(
 				? trimmedProvider(baseConfig.observerSimpleProvider)
 				: trimmedProvider(baseConfig.observerRichProvider)) ??
 			trimmedProvider(baseConfig.observerProvider);
-		const observer = {
-			...baseConfig,
-			observerProvider: "openai",
-			observerBaseUrl: observerBaseUrlForProviderOverride(baseConfig, "openai"),
+		const observer = withProviderOverride(baseConfig, "openai", {
 			observerModel:
 				decision.tier === "simple"
 					? (baseConfig.observerSimpleModel ?? baseConfig.observerModel)
@@ -219,7 +226,7 @@ export function buildTieredObserverSelection(
 				decision.tier === "simple"
 					? baseConfig.observerMaxTokens
 					: (baseConfig.observerRichMaxOutputTokens ?? baseConfig.observerMaxTokens),
-		};
+		});
 		const fallbackReason =
 			hasExplicitProviderOverride && requestedProvider && requestedProvider !== "openai"
 				? "unsupported tier override for runtime"
@@ -246,10 +253,7 @@ export function buildTieredObserverSelection(
 			const tierDefaults = resolveSimpleTierDefaults(knownProvider);
 			const useOpenAIResponses =
 				knownProvider === "openai" && shouldUseOpenAIResponses(baseConfig, explicitConfigKeys);
-			const observer = {
-				...baseConfig,
-				observerProvider: knownProvider,
-				observerBaseUrl: observerBaseUrlForProviderOverride(baseConfig, knownProvider),
+			const observer = withProviderOverride(baseConfig, knownProvider, {
 				observerModel:
 					baseConfig.observerSimpleModel ?? tierDefaults.observerModel ?? baseConfig.observerModel,
 				observerTemperature:
@@ -264,7 +268,7 @@ export function buildTieredObserverSelection(
 					? (baseConfig.observerReasoningSummary ?? tierDefaults.observerReasoningSummary ?? null)
 					: null,
 				observerMaxOutputTokens: baseConfig.observerMaxOutputTokens ?? baseConfig.observerMaxTokens,
-			};
+			});
 			return {
 				observer,
 				metadata: requestedMetadata(decision, {
@@ -278,17 +282,14 @@ export function buildTieredObserverSelection(
 		// OpenAI or Anthropic defaults.
 		const preservedProvider =
 			trimmedProvider(baseConfig.observerSimpleProvider) ?? baseConfig.observerProvider ?? null;
-		const observer = {
-			...baseConfig,
-			observerProvider: preservedProvider,
-			observerBaseUrl: observerBaseUrlForProviderOverride(baseConfig, preservedProvider ?? ""),
+		const observer = withProviderOverride(baseConfig, preservedProvider, {
 			observerModel: baseConfig.observerSimpleModel ?? baseConfig.observerModel,
 			observerTemperature: baseConfig.observerSimpleTemperature ?? baseConfig.observerTemperature,
 			observerOpenAIUseResponses: undefined,
 			observerReasoningEffort: null,
 			observerReasoningSummary: null,
 			observerMaxOutputTokens: baseConfig.observerMaxOutputTokens ?? baseConfig.observerMaxTokens,
-		};
+		});
 		return {
 			observer,
 			metadata: requestedMetadata(decision, {
@@ -305,10 +306,7 @@ export function buildTieredObserverSelection(
 		const tierDefaults = resolveRichTierDefaults(knownProvider);
 		const isOpenAI = knownProvider === "openai";
 		const useOpenAIResponses = isOpenAI && shouldUseOpenAIResponses(baseConfig, explicitConfigKeys);
-		const observer = {
-			...baseConfig,
-			observerProvider: knownProvider,
-			observerBaseUrl: observerBaseUrlForProviderOverride(baseConfig, knownProvider),
+		const observer = withProviderOverride(baseConfig, knownProvider, {
 			observerModel:
 				baseConfig.observerRichModel ?? tierDefaults.observerModel ?? baseConfig.observerModel,
 			observerTemperature:
@@ -335,7 +333,7 @@ export function buildTieredObserverSelection(
 					: undefined) ??
 				tierDefaults.observerMaxOutputTokens ??
 				baseConfig.observerMaxTokens,
-		};
+		});
 		return {
 			observer,
 			metadata: requestedMetadata(decision, {
@@ -348,10 +346,7 @@ export function buildTieredObserverSelection(
 	// rich-tier overrides.
 	const preservedProvider =
 		trimmedProvider(baseConfig.observerRichProvider) ?? baseConfig.observerProvider ?? null;
-	const observer = {
-		...baseConfig,
-		observerProvider: preservedProvider,
-		observerBaseUrl: observerBaseUrlForProviderOverride(baseConfig, preservedProvider ?? ""),
+	const observer = withProviderOverride(baseConfig, preservedProvider, {
 		observerModel: baseConfig.observerRichModel ?? baseConfig.observerModel,
 		observerTemperature: baseConfig.observerRichTemperature ?? baseConfig.observerTemperature,
 		observerOpenAIUseResponses: undefined,
@@ -363,7 +358,7 @@ export function buildTieredObserverSelection(
 				? baseConfig.observerMaxOutputTokens
 				: undefined) ??
 			baseConfig.observerMaxTokens,
-	};
+	});
 	return {
 		observer,
 		metadata: requestedMetadata(decision, {

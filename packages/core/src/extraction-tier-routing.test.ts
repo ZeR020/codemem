@@ -584,7 +584,9 @@ describe("extraction tier routing", () => {
 		expect(selection.metadata.fallbackReason).toBe("unsupported tier override for runtime");
 		expect(selection.observer.observerProvider).toBe("anthropic");
 	});
+});
 
+describe("extraction tier routing observer base URL provenance", () => {
 	it("clears a pi-derived base URL when the tier routes to a different provider", () => {
 		const decision = decideExtractionReplayTier({
 			batchId: 18503,

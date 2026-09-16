@@ -222,7 +222,9 @@ describe("resolvePiObserverConfig — api-key happy path", () => {
 			rmSync(piDir, { recursive: true, force: true });
 		}
 	});
+});
 
+describe("resolvePiObserverConfig — embedded models.json apiKey", () => {
 	it("accepts apiKey embedded in models.json without auth.json entry", () => {
 		const piDir = makePiDir("embedded-key");
 		try {
@@ -248,7 +250,9 @@ describe("resolvePiObserverConfig — api-key happy path", () => {
 			rmSync(piDir, { recursive: true, force: true });
 		}
 	});
+});
 
+describe("resolvePiObserverConfig — models.json apiKey env", () => {
 	it("resolves models.json apiKey $VAR from the environment", () => {
 		const envName = "CODEMEM_PI_OBS_KEY";
 		const prev = process.env[envName];

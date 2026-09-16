@@ -528,6 +528,26 @@ function resolvePiApiKeyForObserver(
 	}
 }
 
+function finalizeLoadedObserverConfig(
+	cfg: ObserverConfig,
+	data: Record<string, unknown>,
+): ObserverConfig {
+	if (cfg.observerRuntime !== "claude_sidecar" && cfg.observerRuntime !== "codex_sidecar") {
+		applyPiDerivedObserverFields(cfg);
+	}
+	cfg.observerExplicitConfigKeys = collectExplicitObserverConfigKeys(data, process.env);
+	if (
+		cfg.observerOpenAIUseResponses !== undefined &&
+		!cfg.observerExplicitConfigKeys.includes("observerOpenAIUseResponses")
+	) {
+		cfg.observerExplicitConfigKeys = [
+			...cfg.observerExplicitConfigKeys,
+			"observerOpenAIUseResponses",
+		];
+	}
+	return cfg;
+}
+
 /**
  * Load observer config from `~/.config/codemem/config.json{c}`.
  *
@@ -819,24 +839,7 @@ export function loadObserverConfig(): ObserverConfig {
 		}
 	}
 
-	// D8: fill unset observer provider/model/baseUrl/wire from pi after sidecar
-	// auto-select. Sidecar runtimes must not inherit pi models. Credential is
-	// NOT copied onto cfg — resolved in-memory at ObserverClient auth time.
-	if (cfg.observerRuntime !== "claude_sidecar" && cfg.observerRuntime !== "codex_sidecar") {
-		applyPiDerivedObserverFields(cfg);
-	}
-
-	cfg.observerExplicitConfigKeys = collectExplicitObserverConfigKeys(data, process.env);
-	if (
-		cfg.observerOpenAIUseResponses !== undefined &&
-		!cfg.observerExplicitConfigKeys.includes("observerOpenAIUseResponses")
-	) {
-		cfg.observerExplicitConfigKeys = [
-			...cfg.observerExplicitConfigKeys,
-			"observerOpenAIUseResponses",
-		];
-	}
-	return cfg;
+	return finalizeLoadedObserverConfig(cfg, data);
 }
 
 // ---------------------------------------------------------------------------
@@ -1513,12 +1516,12 @@ export class ObserverClient {
 	readonly authCacheTtlS: number;
 
 	/** Resolved auth material — updated on refresh. */
-	auth: ObserverAuthMaterial;
-	readonly authAdapter: ObserverAuthAdapter;
+	auth!: ObserverAuthMaterial;
+	authAdapter!: ObserverAuthAdapter;
 
 	private _observerHeaders: Record<string, string>;
-	private _customBaseUrl: string | null;
-	private _customBaseUrlAllowsNoAuth: boolean;
+	private _customBaseUrl!: string | null;
+	private _customBaseUrlAllowsNoAuth!: boolean;
 	private readonly _apiKey: string | null;
 	/** In-memory pi auth.json key (D8). Never persisted or logged. */
 	private _piApiKey: string | null = null;
@@ -1734,54 +1737,9 @@ export class ObserverClient {
 		this._observerHeaders = { ...cfg.observerHeaders };
 		this._apiKey = cfg.observerApiKey ?? null;
 
-		const baseUrl = cfg.observerBaseUrl;
-		this._customBaseUrl = typeof baseUrl === "string" && baseUrl.trim() ? baseUrl.trim() : null;
-
-		// Custom pi providers need a baseUrl. Only fill for non-builtin providers
-		// that match pi — never redirect official openai/anthropic endpoints.
-		// Skip the pi fill when an OpenCode provider block exists: its credential
-		// (highest-priority token in _initProvider) must never be sent to the pi
-		// endpoint — endpoint and key must come from the same source.
-		if (
-			!this._customBaseUrl &&
-			this.provider !== "openai" &&
-			this.provider !== "anthropic" &&
-			this.provider !== "opencode"
-		) {
-			try {
-				const pi = resolvePiObserverConfig();
-				if (
-					pi.ok &&
-					pi.baseUrl &&
-					pi.provider.toLowerCase() === this.provider.toLowerCase() &&
-					!hasOpenCodeProviderConfig(this.provider)
-				) {
-					this._customBaseUrl = pi.baseUrl;
-				}
-			} catch {
-				/* ignore */
-			}
-		}
-		this._customBaseUrlAllowsNoAuth =
-			this._customBaseUrl != null && explicitConfigKeys.has("observerBaseUrl");
-
-		// Set up auth adapter
-		this.authAdapter = new ObserverAuthAdapter({
-			source: cfg.observerAuthSource,
-			filePath: cfg.observerAuthFile,
-			command: cfg.observerAuthCommand,
-			timeoutMs: Math.max(100, cfg.observerAuthTimeoutMs),
-			cacheTtlS: Math.max(0, cfg.observerAuthCacheTtlS),
-		});
-		this.auth = { token: null, authType: "none", source: "none" };
-
-		// D8: resolve pi credential in memory at point of use. Never assign onto
-		// cfg.observerApiKey (that would look "explicit" and could be persisted
-		// by callers of toConfig()). Only used as a lower-priority cascade source.
-		if (!this._apiKey) {
-			const effectiveEndpoint = effectiveObserverEndpoint(this.provider, this._customBaseUrl);
-			this._piApiKey = resolvePiApiKeyForObserver(this.provider, effectiveEndpoint);
-		}
+		this.bindCustomBaseUrl(cfg.observerBaseUrl, explicitConfigKeys);
+		this.bindPiApiKey();
+		this.bindAuthAdapter(cfg);
 
 		// Initialize provider client state — skip for sidecar runtimes (no API
 		// key needed; auth is delegated to the local Claude/Codex CLI).
@@ -2040,38 +1998,8 @@ export class ObserverClient {
 			return this._structuredResponse(call, authRetry, startedAt);
 		}
 		if (this.provider === "anthropic") {
-			// Anthropic OAuth consumer uses SSE streaming, so only direct API keys use
-			// structured output_config. OAuth falls through to the plain observer path.
-			if (!this._anthropicOAuthAccess) {
-				if (!this.auth.token) this._initProvider(true);
-				if (this.auth.token) {
-					const payload = buildAnthropicStructuredPayload(
-						this.model,
-						clipped.system,
-						clipped.user,
-						this.maxTokens,
-						schema,
-					);
-					const { value: call, authRetry } = await this._callWithAuthRetry(() => {
-						const headers = mergeHeadersCaseInsensitive(
-							buildAnthropicHeaders(this.auth.token ?? "", false),
-							renderObserverHeaders(this._observerHeaders, this.auth),
-						);
-						return this._fetchJSON(
-							resolveAnthropicEndpoint(this._customBaseUrl),
-							headers,
-							payload,
-							{
-								parseResponse: parseAnthropicResponse,
-								providerLabel: "Anthropic",
-								classifyStructuredFailure: classifyAnthropicStructuredFailure,
-							},
-						);
-					});
-					return this._structuredResponse(call, authRetry, startedAt);
-				}
-				return this._missingStructuredAuthResponse("Anthropic", startedAt);
-			}
+			const structured = await this._anthropicStructuredJson(clipped, schema, startedAt);
+			if (structured) return structured;
 		}
 		const fallback = await this.observe(systemPrompt, userPrompt);
 		return {
@@ -2086,6 +2014,35 @@ export class ObserverClient {
 			failureReason: null,
 			transportFailureCode: null,
 		};
+	}
+
+	private async _anthropicStructuredJson(
+		clipped: { system: string; user: string },
+		schema: Record<string, unknown>,
+		startedAt: number,
+	): Promise<ObserverStructuredJsonResponse | null> {
+		if (this._anthropicOAuthAccess) return null;
+		if (!this.auth.token) this._initProvider(true);
+		if (!this.auth.token) return this._missingStructuredAuthResponse("Anthropic", startedAt);
+		const payload = buildAnthropicStructuredPayload(
+			this.model,
+			clipped.system,
+			clipped.user,
+			this.maxTokens,
+			schema,
+		);
+		const { value: call, authRetry } = await this._callWithAuthRetry(() => {
+			const headers = mergeHeadersCaseInsensitive(
+				buildAnthropicHeaders(this.auth.token ?? "", false),
+				renderObserverHeaders(this._observerHeaders, this.auth),
+			);
+			return this._fetchJSON(resolveAnthropicEndpoint(this._customBaseUrl), headers, payload, {
+				parseResponse: parseAnthropicResponse,
+				providerLabel: "Anthropic",
+				classifyStructuredFailure: classifyAnthropicStructuredFailure,
+			});
+		});
+		return this._structuredResponse(call, authRetry, startedAt);
 	}
 
 	private _missingStructuredAuthResponse(
@@ -2135,6 +2092,64 @@ export class ObserverClient {
 	}
 
 	// -----------------------------------------------------------------------
+	private bindCustomBaseUrl(
+		baseUrl: string | null | undefined,
+		explicitConfigKeys: Set<string>,
+	): void {
+		this._customBaseUrl = typeof baseUrl === "string" && baseUrl.trim() ? baseUrl.trim() : null;
+		if (
+			!this._customBaseUrl &&
+			this.provider !== "openai" &&
+			this.provider !== "anthropic" &&
+			this.provider !== "opencode"
+		) {
+			try {
+				const pi = resolvePiObserverConfig();
+				if (
+					pi.ok &&
+					pi.baseUrl &&
+					pi.provider.toLowerCase() === this.provider.toLowerCase() &&
+					!hasOpenCodeProviderConfig(this.provider)
+				) {
+					this._customBaseUrl = pi.baseUrl;
+				}
+			} catch {
+				/* ignore */
+			}
+		}
+		this._customBaseUrlAllowsNoAuth =
+			this._customBaseUrl != null && explicitConfigKeys.has("observerBaseUrl");
+	}
+
+	private bindAuthAdapter(cfg: ObserverConfig): void {
+		this.authAdapter = new ObserverAuthAdapter({
+			source: cfg.observerAuthSource,
+			filePath: cfg.observerAuthFile,
+			command: cfg.observerAuthCommand,
+			timeoutMs: Math.max(100, cfg.observerAuthTimeoutMs),
+			cacheTtlS: Math.max(0, cfg.observerAuthCacheTtlS),
+		});
+		this.auth = { token: null, authType: "none", source: "none" };
+	}
+
+	private bindPiApiKey(): void {
+		if (this._apiKey) return;
+		this._piApiKey = resolvePiApiKeyForObserver(
+			this.provider,
+			effectiveObserverEndpoint(this.provider, this._customBaseUrl),
+		);
+	}
+
+	private vendorCredentialsAllowed(): boolean {
+		return (
+			!this._customBaseUrl ||
+			observerEndpointsMatch(
+				effectiveObserverEndpoint(this.provider, this._customBaseUrl),
+				officialObserverEndpoint(this.provider),
+			)
+		);
+	}
+
 	// Provider initialization
 	// -----------------------------------------------------------------------
 
@@ -2156,78 +2171,87 @@ export class ObserverClient {
 			}
 		}
 
-		// Vendor-scoped env/OAuth credentials (OPENAI_API_KEY, ANTHROPIC_API_KEY,
-		// OPENCODE_API_KEY, CODEX_API_KEY, Anthropic OAuth) only flow to the official
-		// provider endpoint. A custom base URL (e.g. a pi-derived gateway literally
-		// named "openai") gets the generic CODEMEM_OBSERVER_API_KEY override or the
-		// endpoint-checked pi key instead — never a vendor credential.
-		const vendorCredentialsAllowed =
-			!this._customBaseUrl ||
-			observerEndpointsMatch(
-				effectiveObserverEndpoint(this.provider, this._customBaseUrl),
-				officialObserverEndpoint(this.provider),
-			);
+		this._resolveProviderAuth(forceRefresh, oauthCache, oauthAccess, oauthProvider);
+	}
+
+	private _resolveCustomProviderAuth(
+		forceRefresh: boolean,
+		oauthCache: ReturnType<typeof loadOpenCodeOAuthCache>,
+	): void {
+		const providerConfig = getOpenCodeProviderConfig(this.provider);
+		const hasExplicitProviderConfig = Object.keys(providerConfig).length > 0;
+		const [baseUrl, modelId, providerHeaders] = hasExplicitProviderConfig
+			? resolveCustomProviderModel(this.provider, this.model)
+			: resolveBuiltInProviderModel(this.provider, this.model);
+		if (baseUrl && !this._customBaseUrl) {
+			this._customBaseUrl = baseUrl;
+			this._customBaseUrlAllowsNoAuth = hasExplicitProviderConfig;
+		}
+		if (modelId) this.model = modelId;
+		if (providerHeaders && Object.keys(providerHeaders).length > 0) {
+			this._observerHeaders = { ...this._observerHeaders, ...providerHeaders };
+		}
+		if (!this._customBaseUrl) return;
+		const cachedApiKey =
+			this.provider === "opencode" ? extractProviderApiKey(oauthCache, this.provider) : null;
+		this.auth = this.authAdapter.resolve({
+			explicitToken: getProviderApiKey(providerConfig) || this._apiKey || cachedApiKey,
+			envTokens: [process.env.CODEMEM_OBSERVER_API_KEY ?? ""],
+			piToken: this._piApiKey,
+			forceRefresh,
+		});
+	}
+
+	private _resolveAnthropicAuth(forceRefresh: boolean, oauthAccess: string | null): void {
+		const vendorOk = this.vendorCredentialsAllowed();
+		this.auth = this.authAdapter.resolve({
+			explicitToken: this._apiKey,
+			envTokens: vendorOk ? [process.env.ANTHROPIC_API_KEY ?? ""] : [],
+			oauthToken: vendorOk ? oauthAccess : null,
+			piToken: this._piApiKey,
+			forceRefresh,
+		});
+		if (this.auth.source === "oauth" && oauthAccess) this._anthropicOAuthAccess = oauthAccess;
+	}
+
+	private _resolveOpenAIAuth(
+		forceRefresh: boolean,
+		oauthAccess: string | null,
+		oauthProvider: string | null,
+		oauthCache: ReturnType<typeof loadOpenCodeOAuthCache>,
+	): void {
+		const vendorOk = this.vendorCredentialsAllowed();
+		this.auth = this.authAdapter.resolve({
+			explicitToken: this._apiKey,
+			envTokens: vendorOk
+				? [
+						process.env.OPENCODE_API_KEY ?? "",
+						process.env.OPENAI_API_KEY ?? "",
+						process.env.CODEX_API_KEY ?? "",
+					]
+				: [],
+			oauthToken: vendorOk ? oauthAccess : null,
+			piToken: this._piApiKey,
+			forceRefresh,
+		});
+		if (this.auth.source === "oauth" && oauthAccess) {
+			this._codexAccess = oauthAccess;
+			this._codexAccountId = extractOAuthAccountId(oauthCache, oauthProvider ?? "openai");
+		}
+	}
+
+	private _resolveProviderAuth(
+		forceRefresh: boolean,
+		oauthCache: ReturnType<typeof loadOpenCodeOAuthCache>,
+		oauthAccess: string | null,
+		oauthProvider: string | null,
+	): void {
 		if (this.provider !== "openai" && this.provider !== "anthropic") {
-			// Custom provider — resolve base URL, model ID, and headers from OpenCode config
-			const providerConfig = getOpenCodeProviderConfig(this.provider);
-			const hasExplicitProviderConfig = Object.keys(providerConfig).length > 0;
-			const [baseUrl, modelId, providerHeaders] = hasExplicitProviderConfig
-				? resolveCustomProviderModel(this.provider, this.model)
-				: resolveBuiltInProviderModel(this.provider, this.model);
-
-			// Persist resolved values for use in _callOpenAIDirect
-			if (baseUrl && !this._customBaseUrl) {
-				this._customBaseUrl = baseUrl;
-				this._customBaseUrlAllowsNoAuth = hasExplicitProviderConfig;
-			}
-			if (modelId) this.model = modelId;
-			if (providerHeaders && Object.keys(providerHeaders).length > 0) {
-				this._observerHeaders = { ...this._observerHeaders, ...providerHeaders };
-			}
-
-			const effectiveBaseUrl = this._customBaseUrl;
-			if (!effectiveBaseUrl) return;
-
-			const cachedApiKey =
-				this.provider === "opencode" ? extractProviderApiKey(oauthCache, this.provider) : null;
-			const apiKey = getProviderApiKey(providerConfig) || this._apiKey || cachedApiKey;
-
-			this.auth = this.authAdapter.resolve({
-				explicitToken: apiKey,
-				envTokens: [process.env.CODEMEM_OBSERVER_API_KEY ?? ""],
-				piToken: this._piApiKey,
-				forceRefresh,
-			});
+			this._resolveCustomProviderAuth(forceRefresh, oauthCache);
 		} else if (this.provider === "anthropic") {
-			this.auth = this.authAdapter.resolve({
-				explicitToken: this._apiKey,
-				envTokens: vendorCredentialsAllowed ? [process.env.ANTHROPIC_API_KEY ?? ""] : [],
-				oauthToken: vendorCredentialsAllowed ? oauthAccess : null,
-				piToken: this._piApiKey,
-				forceRefresh,
-			});
-			if (this.auth.source === "oauth" && oauthAccess) {
-				this._anthropicOAuthAccess = oauthAccess;
-			}
+			this._resolveAnthropicAuth(forceRefresh, oauthAccess);
 		} else {
-			// OpenAI
-			this.auth = this.authAdapter.resolve({
-				explicitToken: this._apiKey,
-				envTokens: vendorCredentialsAllowed
-					? [
-							process.env.OPENCODE_API_KEY ?? "",
-							process.env.OPENAI_API_KEY ?? "",
-							process.env.CODEX_API_KEY ?? "",
-						]
-					: [],
-				oauthToken: vendorCredentialsAllowed ? oauthAccess : null,
-				piToken: this._piApiKey,
-				forceRefresh,
-			});
-			if (this.auth.source === "oauth" && oauthAccess) {
-				this._codexAccess = oauthAccess;
-				this._codexAccountId = extractOAuthAccountId(oauthCache, oauthProvider ?? "openai");
-			}
+			this._resolveOpenAIAuth(forceRefresh, oauthAccess, oauthProvider, oauthCache);
 		}
 	}
 

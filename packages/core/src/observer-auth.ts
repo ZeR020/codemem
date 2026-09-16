@@ -267,6 +267,20 @@ function normalizeAuthSource(value: string | null | undefined): string {
 	return VALID_SOURCES.has(normalized) ? normalized || "auto" : "auto";
 }
 
+function autoCascadeToken(
+	explicitToken: string | null,
+	envTokens: string[],
+	oauthToken: string | null,
+	piToken: string | null,
+) {
+	if (explicitToken) return { token: explicitToken, tokenSource: "explicit" };
+	const envToken = envTokens.find((t) => !!t) ?? null;
+	if (envToken) return { token: envToken, tokenSource: "env" };
+	if (oauthToken) return { token: oauthToken, tokenSource: "oauth" };
+	if (piToken) return { token: piToken, tokenSource: "pi" };
+	return { token: null, tokenSource: "none" };
+}
+
 // ---------------------------------------------------------------------------
 // Auth adapter (credential cascade with caching)
 // ---------------------------------------------------------------------------
@@ -336,23 +350,9 @@ export class ObserverAuthAdapter {
 		let tokenSource = "none";
 
 		if (source === "auto") {
-			if (explicitToken) {
-				token = explicitToken;
-				tokenSource = "explicit";
-			}
-			if (!token) {
-				token = envTokens.find((t) => !!t) ?? null;
-				if (token) tokenSource = "env";
-			}
-			if (!token && oauthToken) {
-				token = oauthToken;
-				tokenSource = "oauth";
-			}
-			// D8: pi auth.json credential at point of use (after explicit/env/oauth).
-			if (!token && piToken) {
-				token = piToken;
-				tokenSource = "pi";
-			}
+			const picked = autoCascadeToken(explicitToken, envTokens, oauthToken, piToken);
+			token = picked.token;
+			tokenSource = picked.tokenSource;
 		} else if (source === "env") {
 			token = envTokens.find((t) => !!t) ?? null;
 			if (token) tokenSource = "env";
