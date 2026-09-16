@@ -3,6 +3,7 @@ import {
 	assignIdentityDeviceInTransaction,
 	IdentityDeviceAssignmentError,
 } from "./identity-device-assignment.js";
+import { managedProjectScopeId } from "./managed-project-scope.js";
 import { derivePolicyTeamDeviceEligibility } from "./policy-team-device-eligibility.js";
 import { normalizeIdentityDisplayName } from "./project-invite-identity.js";
 import {
@@ -15,7 +16,6 @@ import {
 	type RecipientReviewedIntentV1,
 } from "./recipient-reviewed-intent.js";
 import { canonicalWorkspaceIdentity } from "./scope-resolution.js";
-import { managedProjectScopeId } from "./share-operation.js";
 import { SYNC_BOOTSTRAP_CWD_PREFIX } from "./sync-bootstrap-constants.js";
 import { fingerprintPublicKey } from "./sync-fingerprint.js";
 import { buildBaseUrl } from "./sync-http-client.js";
