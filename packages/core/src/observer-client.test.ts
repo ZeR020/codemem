@@ -16,6 +16,24 @@ import {
 	shouldAutoSelectCodexSidecar,
 } from "./observer-client.js";
 
+let isolatedHome: string | undefined;
+const savedHomeEnv: { HOME?: string; PI_CODING_AGENT_DIR?: string } = {};
+beforeEach(() => {
+	savedHomeEnv.HOME = process.env.HOME;
+	savedHomeEnv.PI_CODING_AGENT_DIR = process.env.PI_CODING_AGENT_DIR;
+	isolatedHome = mkdtempSync(join(tmpdir(), "codemem-obs-home-"));
+	process.env.HOME = isolatedHome;
+	delete process.env.PI_CODING_AGENT_DIR;
+});
+afterEach(() => {
+	if (savedHomeEnv.HOME === undefined) delete process.env.HOME;
+	else process.env.HOME = savedHomeEnv.HOME;
+	if (savedHomeEnv.PI_CODING_AGENT_DIR === undefined) delete process.env.PI_CODING_AGENT_DIR;
+	else process.env.PI_CODING_AGENT_DIR = savedHomeEnv.PI_CODING_AGENT_DIR;
+	if (isolatedHome) rmSync(isolatedHome, { recursive: true, force: true });
+	isolatedHome = undefined;
+});
+
 function fixtureToken(label: string): string {
 	return ["fixture", label, "token"].join("-");
 }

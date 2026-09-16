@@ -34,6 +34,7 @@ import {
 	type ObserverOutputMode,
 	ObserverOutputTransportError,
 	type ObserverTokenUsage,
+	observerBaseUrlForProviderOverride,
 	replayBatchExtraction,
 	replayBatchExtractionWithTierRouting,
 	resolveDbPath,
@@ -1345,6 +1346,17 @@ export function summarizeExtractionBenchmarkAttempts(
 	};
 }
 
+function cliObserverProviderOverride(
+	cfg: ReturnType<typeof loadObserverConfig>,
+	providerFlag: string | undefined,
+) {
+	const observerProvider = providerFlag?.trim() || cfg.observerProvider;
+	return {
+		observerProvider,
+		observerBaseUrl: observerBaseUrlForProviderOverride(cfg, observerProvider || ""),
+	};
+}
+
 function createMemoryExtractionBenchmarkCommand(): Command {
 	const cmd = new Command("extraction-benchmark")
 		.configureHelp(helpStyle)
@@ -1441,7 +1453,7 @@ function createMemoryExtractionBenchmarkCommand(): Command {
 				const observerConfig = loadObserverConfig();
 				const observerConfigWithOverrides = {
 					...observerConfig,
-					observerProvider: opts.observerProvider?.trim() || observerConfig.observerProvider,
+					...cliObserverProviderOverride(observerConfig, opts.observerProvider),
 					observerModel: opts.observerModel?.trim() || observerConfig.observerModel,
 					observerTemperature: observerTemperature ?? observerConfig.observerTemperature,
 					observerOpenAIUseResponses: resolveOpenAIResponsesOverride(

@@ -267,6 +267,20 @@ function normalizeAuthSource(value: string | null | undefined): string {
 	return VALID_SOURCES.has(normalized) ? normalized || "auto" : "auto";
 }
 
+function autoCascadeToken(
+	explicitToken: string | null,
+	envTokens: string[],
+	oauthToken: string | null,
+	piToken: string | null,
+) {
+	if (explicitToken) return { token: explicitToken, tokenSource: "explicit" };
+	const envToken = envTokens.find((t) => !!t) ?? null;
+	if (envToken) return { token: envToken, tokenSource: "env" };
+	if (oauthToken) return { token: oauthToken, tokenSource: "oauth" };
+	if (piToken) return { token: piToken, tokenSource: "pi" };
+	return { token: null, tokenSource: "none" };
+}
+
 // ---------------------------------------------------------------------------
 // Auth adapter (credential cascade with caching)
 // ---------------------------------------------------------------------------
@@ -275,12 +289,17 @@ export interface ObserverAuthResolveOptions {
 	explicitToken?: string | null;
 	envTokens?: string[];
 	oauthToken?: string | null;
+	/**
+	 * In-memory credential from pi auth.json (D8). Used only when no explicit,
+	 * env, or oauth token is available. Never persist or log this value.
+	 */
+	piToken?: string | null;
 	forceRefresh?: boolean;
 }
 
 /**
  * Resolves auth credentials through a configurable cascade:
- * explicit → env → oauth → file → command.
+ * explicit → env → oauth → pi → file → command.
  *
  * Results from file/command sources are cached for `cacheTtlS` seconds.
  */
@@ -314,6 +333,7 @@ export class ObserverAuthAdapter {
 		const explicitToken = opts?.explicitToken ?? null;
 		const envTokens = opts?.envTokens ?? [];
 		const oauthToken = opts?.oauthToken ?? null;
+		const piToken = opts?.piToken ?? null;
 		const forceRefresh = opts?.forceRefresh ?? false;
 
 		if (source === "none") return noAuth();
@@ -330,18 +350,9 @@ export class ObserverAuthAdapter {
 		let tokenSource = "none";
 
 		if (source === "auto") {
-			if (explicitToken) {
-				token = explicitToken;
-				tokenSource = "explicit";
-			}
-			if (!token) {
-				token = envTokens.find((t) => !!t) ?? null;
-				if (token) tokenSource = "env";
-			}
-			if (!token && oauthToken) {
-				token = oauthToken;
-				tokenSource = "oauth";
-			}
+			const picked = autoCascadeToken(explicitToken, envTokens, oauthToken, piToken);
+			token = picked.token;
+			tokenSource = picked.tokenSource;
 		} else if (source === "env") {
 			token = envTokens.find((t) => !!t) ?? null;
 			if (token) tokenSource = "env";
