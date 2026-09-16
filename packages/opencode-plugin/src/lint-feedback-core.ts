@@ -2,13 +2,22 @@ import { type ChildProcess, spawn, spawnSync } from "node:child_process";
 import { readFile, realpath } from "node:fs/promises";
 import path from "node:path";
 import type { Plugin, PluginOptions } from "@opencode-ai/plugin";
+import {
+	compareDiagnostics,
+	formatFeedback,
+	type LintDiagnostic,
+	parseBiomeDiagnostics,
+} from "./lint-diagnostics.js";
+
+export {
+	compareDiagnostics,
+	formatFeedback,
+	type LintDiagnostic,
+	parseBiomeDiagnostics,
+	parseMeasuredValue,
+} from "./lint-diagnostics.js";
 
 const SOURCE_EXTENSIONS = new Set([".cjs", ".cts", ".js", ".jsx", ".mjs", ".mts", ".ts", ".tsx"]);
-const MEASURED_CATEGORIES = new Set([
-	"lint/complexity/noExcessiveCognitiveComplexity",
-	"lint/complexity/noExcessiveLinesPerFunction",
-]);
-const DIAGNOSTIC_LIMIT = 10;
 const SNAPSHOT_LIMIT = 100;
 const WARNING = "[lint-feedback] Lint check failed; the edit was preserved.";
 const liveChildren = new Set<ChildProcess>();
@@ -48,17 +57,6 @@ export interface LintFeedbackOptions extends PluginOptions {
 	timeoutMs?: number;
 }
 
-export interface LintDiagnostic {
-	category: string;
-	description: string;
-	path?: string;
-	line?: number;
-	column?: number;
-	offset?: number;
-	sourceText?: string;
-	measuredValue?: number;
-}
-
 interface ApplyPatchPath {
 	operation: "Add" | "Update" | "Delete";
 	path: string;
@@ -90,275 +88,33 @@ interface AfterOutput {
 	output: string;
 }
 
+export interface LintFeedbackInvocation {
+	tool: string;
+	sessionID: string;
+	callID: string;
+	args?: unknown;
+}
+
+export interface LintFeedbackController {
+	before(input: LintFeedbackInvocation): Promise<void>;
+	after(input: LintFeedbackInvocation): Promise<string | undefined>;
+	discard(input: Pick<LintFeedbackInvocation, "sessionID" | "callID">): void;
+	dispose(): Promise<void>;
+}
+
 interface HookDependencies {
 	worktree: string;
 	command: [string, ...string[]];
 	timeoutMs: number;
-	runDiagnostics: (relativePath: string) => Promise<LintDiagnostic[]>;
+	runDiagnostics: (relativePath: string, signal?: AbortSignal) => Promise<LintDiagnostic[]>;
 	fileExists: (relativePath: string) => Promise<boolean>;
+	disposeDiagnostics?: () => void;
 }
 
 type UnknownRecord = Record<string, unknown>;
 
 function isRecord(value: unknown): value is UnknownRecord {
 	return typeof value === "object" && value !== null;
-}
-
-function getText(value: unknown): string {
-	if (typeof value === "string") return value;
-	if (Array.isArray(value)) return value.map(getText).join(" ");
-	if (!isRecord(value)) return "";
-	if (typeof value.content === "string") return value.content;
-	if (typeof value.text === "string") return value.text;
-	return Object.values(value).map(getText).join(" ");
-}
-
-function getSpanStart(location: UnknownRecord): number | undefined {
-	if (Array.isArray(location.span) && typeof location.span[0] === "number") return location.span[0];
-	if (!isRecord(location.span)) return undefined;
-	if (typeof location.span.start === "number") return location.span.start;
-	return typeof location.span.offset === "number" ? location.span.offset : undefined;
-}
-
-function getSpanEnd(location: UnknownRecord): number | undefined {
-	if (Array.isArray(location.span) && typeof location.span[1] === "number") return location.span[1];
-	if (!isRecord(location.span)) return undefined;
-	if (typeof location.span.end === "number") return location.span.end;
-	return typeof location.span.length === "number" && typeof location.span.offset === "number"
-		? location.span.offset + location.span.length
-		: undefined;
-}
-
-function getSourceText(location: UnknownRecord): string | undefined {
-	if (typeof location.sourceCode !== "string") return undefined;
-	const start = getSpanStart(location);
-	const end = getSpanEnd(location);
-	if (start === undefined || end === undefined) return undefined;
-	return Buffer.from(location.sourceCode).subarray(start, end).toString("utf8");
-}
-
-function getPositionIndex(sourceCode: string, line: number, column: number): number | undefined {
-	let index = 0;
-	for (let currentLine = 1; currentLine < line; currentLine += 1) {
-		const newline = sourceCode.indexOf("\n", index);
-		if (newline === -1) return undefined;
-		index = newline + 1;
-	}
-	return index + Math.max(column - 1, 0);
-}
-
-function getSourceTextFromPositions(
-	location: UnknownRecord,
-	sourceCode?: string,
-): string | undefined {
-	if (!sourceCode) return undefined;
-	const start = isRecord(location.start) ? location.start : undefined;
-	const end = isRecord(location.end) ? location.end : undefined;
-	if (typeof start?.line !== "number" || typeof start.column !== "number") return undefined;
-	const startIndex = getPositionIndex(sourceCode, start.line, start.column);
-	if (startIndex === undefined) return undefined;
-	const endIndex =
-		typeof end?.line === "number" && typeof end.column === "number"
-			? getPositionIndex(sourceCode, end.line, end.column)
-			: sourceCode.indexOf("\n", startIndex);
-	return sourceCode.slice(
-		startIndex,
-		endIndex === -1 || endIndex === undefined ? sourceCode.length : endIndex,
-	);
-}
-
-function positionFromByteOffset(
-	sourceCode: string,
-	offset: number,
-): { line: number; column: number } {
-	const prefix = Buffer.from(sourceCode).subarray(0, offset).toString("utf8");
-	const lines = prefix.split("\n");
-	return {
-		line: lines.length,
-		column: Array.from(lines.at(-1) ?? "").length + 1,
-	};
-}
-
-function getPosition(location: UnknownRecord): { line?: number; column?: number; offset?: number } {
-	const start = isRecord(location.start) ? location.start : undefined;
-	const offset = getSpanStart(location);
-	if (
-		typeof start?.line !== "number" &&
-		offset !== undefined &&
-		typeof location.sourceCode === "string"
-	) {
-		return { ...positionFromByteOffset(location.sourceCode, offset), offset };
-	}
-	return {
-		line: typeof start?.line === "number" ? start.line : undefined,
-		column: typeof start?.column === "number" ? start.column : undefined,
-		offset,
-	};
-}
-
-function getDiagnosticPath(location: UnknownRecord): string | undefined {
-	if (typeof location.path === "string") return location.path;
-	return isRecord(location.path) && typeof location.path.file === "string"
-		? location.path.file
-		: undefined;
-}
-
-export function parseMeasuredValue(category: string, text: string): number | undefined {
-	if (category.endsWith("noExcessiveCognitiveComplexity")) {
-		const match = text.match(/complexity(?:\s+score)?(?:\s+(?:of|is|from)|:)?\s+(\d+)/i);
-		return match ? Number(match[1]) : undefined;
-	}
-	if (category.endsWith("noExcessiveLinesPerFunction")) {
-		const match = text.match(
-			/(?:has|contains)\s+(\d+)\s+lines?|lines?\s*\((\d+)\)|(\d+)\s+lines?/i,
-		);
-		const value = match?.slice(1).find((item) => item !== undefined);
-		return value ? Number(value) : undefined;
-	}
-	return undefined;
-}
-
-export function parseBiomeDiagnostics(output: string, sourceCode?: string): LintDiagnostic[] {
-	const parsed: unknown = JSON.parse(output);
-	if (!isRecord(parsed) || !Array.isArray(parsed.diagnostics)) {
-		throw new Error("Biome output has no diagnostics array");
-	}
-
-	return parsed.diagnostics.flatMap((raw): LintDiagnostic[] => {
-		if (!isRecord(raw) || typeof raw.category !== "string" || !raw.category.startsWith("lint/"))
-			return [];
-		const location = isRecord(raw.location) ? raw.location : {};
-		const description =
-			typeof raw.description === "string" ? raw.description : getText(raw.message);
-		const position = getPosition(location);
-		const diagnosticPath = getDiagnosticPath(location);
-		const measuredValue =
-			parseMeasuredValue(raw.category, getText([description, raw.message])) ??
-			parseMeasuredValue(raw.category, getText([raw.advices, raw.advice]));
-		return [
-			{
-				category: raw.category,
-				description,
-				path: diagnosticPath,
-				line: position.line,
-				column: position.column,
-				offset: position.offset,
-				sourceText: getSourceText(location) ?? getSourceTextFromPositions(location, sourceCode),
-				measuredValue,
-			},
-		];
-	});
-}
-
-function groupDiagnostics(diagnostics: LintDiagnostic[]): Map<string, LintDiagnostic[]> {
-	const groups = new Map<string, LintDiagnostic[]>();
-	for (const diagnostic of diagnostics) {
-		const group = groups.get(diagnostic.category) ?? [];
-		group.push(diagnostic);
-		groups.set(diagnostic.category, group);
-	}
-	return groups;
-}
-
-function measuredCandidateIndexes(
-	previous: LintDiagnostic,
-	diagnostics: LintDiagnostic[],
-): number[] {
-	const allIndexes = diagnostics.map((_, index) => index);
-	if (!previous.sourceText) return allIndexes;
-	const sameSource = diagnostics.flatMap((diagnostic, index) =>
-		diagnostic.sourceText === previous.sourceText ? [index] : [],
-	);
-	return sameSource.length > 0 ? sameSource : allIndexes;
-}
-
-function compareMeasured(before: LintDiagnostic[], after: LintDiagnostic[]): LintDiagnostic[] {
-	const unmatched = [...after];
-	const regressions: LintDiagnostic[] = [];
-	for (const previous of before) {
-		if (unmatched.length === 0) break;
-		const candidateIndexes = measuredCandidateIndexes(previous, unmatched);
-		let nearestIndex = candidateIndexes[0] ?? 0;
-		for (const index of candidateIndexes.slice(1)) {
-			const candidate = unmatched[index];
-			const nearest = unmatched[nearestIndex];
-			if (
-				candidate &&
-				nearest &&
-				diagnosticDistance(previous, candidate) < diagnosticDistance(previous, nearest)
-			) {
-				nearestIndex = index;
-			}
-		}
-		const current = unmatched.splice(nearestIndex, 1)[0];
-		if (current && (current.measuredValue ?? 0) > (previous.measuredValue ?? 0))
-			regressions.push(current);
-	}
-	return [...regressions, ...unmatched];
-}
-
-function diagnosticDistance(before: LintDiagnostic, after: LintDiagnostic): number {
-	if (before.offset !== undefined && after.offset !== undefined) {
-		return Math.abs(before.offset - after.offset);
-	}
-	if (before.line === undefined || after.line === undefined) return 0;
-	const lineDistance = Math.abs(before.line - after.line);
-	const columnDistance =
-		before.column === undefined || after.column === undefined
-			? 0
-			: Math.abs(before.column - after.column);
-	return lineDistance * 1_000 + columnDistance;
-}
-
-function compareCountOnly(before: LintDiagnostic[], after: LintDiagnostic[]): LintDiagnostic[] {
-	const unmatched = [...after];
-	for (const previous of before) {
-		const sameDescription = unmatched
-			.map((diagnostic, index) => ({ diagnostic, index }))
-			.filter(({ diagnostic }) => diagnostic.description === previous.description)
-			.filter(
-				({ diagnostic }) =>
-					!previous.sourceText ||
-					!diagnostic.sourceText ||
-					diagnostic.sourceText === previous.sourceText,
-			);
-		const candidateIndexes = sameDescription.map(({ index }) => index);
-		const firstCandidate = candidateIndexes[0];
-		if (firstCandidate === undefined) continue;
-		let nearestIndex = firstCandidate;
-		for (const index of candidateIndexes.slice(1)) {
-			const candidate = unmatched[index];
-			const nearest = unmatched[nearestIndex];
-			if (
-				candidate &&
-				nearest &&
-				diagnosticDistance(previous, candidate) < diagnosticDistance(previous, nearest)
-			) {
-				nearestIndex = index;
-			}
-		}
-		unmatched.splice(nearestIndex, 1);
-	}
-	return unmatched;
-}
-
-export function compareDiagnostics(
-	before: LintDiagnostic[],
-	after: LintDiagnostic[],
-): LintDiagnostic[] {
-	const beforeByCategory = groupDiagnostics(before);
-	const afterByCategory = groupDiagnostics(after);
-	const regressions: LintDiagnostic[] = [];
-
-	for (const [category, current] of afterByCategory) {
-		const previous = beforeByCategory.get(category) ?? [];
-		if (MEASURED_CATEGORIES.has(category)) {
-			regressions.push(...compareMeasured(previous, current));
-			continue;
-		}
-		regressions.push(...compareCountOnly(previous, current));
-	}
-	return regressions;
 }
 
 export function parseApplyPatchPaths(patchText: string): ApplyPatchPath[] {
@@ -398,6 +154,10 @@ export function resolveWorktreePath(worktree: string, candidate: string): string
 function isConfiguredLintPath(relativePath: string): boolean {
 	// Keep this allowlist synchronized with biome.json files.includes; the focused test enforces the mirror.
 	if (/^packages\/.+\/src\/.+\.(?:js|ts|tsx)$/.test(relativePath)) return true;
+	if (/^packages\/opencode-plugin\/\.opencode\/(?:lib|plugins)\/.+\.js$/.test(relativePath)) {
+		return true;
+	}
+	if (/^\.opencode\/plugins\/.+\.js$/.test(relativePath)) return true;
 	if (/^packages\/.+\/vite\.config\.ts$/.test(relativePath)) return true;
 	if (
 		/^plugins\/(?:claude|codex)\/scripts\/(?:ingest-hook|user-prompt-hook)\.mjs$/.test(relativePath)
@@ -431,7 +191,7 @@ function getApplyPatchTouchedFiles(args: UnknownRecord, worktree: string): Touch
 }
 
 function getTouchedFiles(tool: string, args: UnknownRecord, worktree: string): TouchedFile[] {
-	if (tool === "apply_patch") return getApplyPatchTouchedFiles(args, worktree);
+	if (tool === "apply_patch" || tool === "patch") return getApplyPatchTouchedFiles(args, worktree);
 	if (tool !== "edit" && tool !== "write") return [];
 	const candidate = getPathArgument(args);
 	const resolved = candidate ? resolveWorktreePath(worktree, candidate) : undefined;
@@ -442,26 +202,6 @@ export function getTouchedPaths(tool: string, args: UnknownRecord, worktree: str
 	return getTouchedFiles(tool, args, worktree).map((item) => item.afterPath);
 }
 
-function formatDiagnostic(diagnostic: LintDiagnostic): string {
-	const value = diagnostic.measuredValue === undefined ? "" : ` (${diagnostic.measuredValue})`;
-	let position = "";
-	if (diagnostic.line) {
-		position = `:${diagnostic.line}${diagnostic.column ? `:${diagnostic.column}` : ""}`;
-	} else if (diagnostic.offset !== undefined) {
-		position = `@byte ${diagnostic.offset}`;
-	}
-	const location = diagnostic.path ? `${diagnostic.path}${position} — ` : "";
-	return `- ${location}${diagnostic.category}${value}: ${diagnostic.description}`;
-}
-
-export function formatFeedback(diagnostics: LintDiagnostic[], limit = DIAGNOSTIC_LIMIT): string {
-	const visible = diagnostics.slice(0, limit);
-	const remaining = diagnostics.length - visible.length;
-	const suffix =
-		remaining > 0 ? `\n- …and ${remaining} more regression${remaining === 1 ? "" : "s"}.` : "";
-	return `[lint-feedback] New or worsened diagnostics:\n${visible.map(formatDiagnostic).join("\n")}${suffix}\nFix local regressions now. Do not broadly refactor legacy code.`;
-}
-
 function appendOutput(output: AfterOutput, message: string): void {
 	output.output = output.output ? `${output.output}\n\n${message}` : message;
 }
@@ -470,73 +210,127 @@ function callKey(input: Pick<HookInput, "sessionID" | "callID">): string {
 	return `${input.sessionID}\u0000${input.callID}`;
 }
 
-export function createLintFeedbackHooks(dependencies: HookDependencies) {
+async function captureSnapshot(
+	input: LintFeedbackInvocation,
+	dependencies: HookDependencies,
+	signal: AbortSignal,
+): Promise<Snapshot | undefined> {
+	if (signal.aborted) return undefined;
+	const args = isRecord(input.args) ? input.args : {};
+	const files = getTouchedFiles(input.tool, args, dependencies.worktree);
+	if (files.length === 0) return undefined;
+	const diagnosticsByPath = new Map<string, LintDiagnostic[]>();
+	let failed = false;
+	await Promise.all(
+		files.map(async ({ beforePath, afterPath }) => {
+			try {
+				if (signal.aborted) return;
+				if (!beforePath) {
+					diagnosticsByPath.set(afterPath, []);
+					return;
+				}
+				const exists = await dependencies.fileExists(beforePath);
+				if (signal.aborted) return;
+				diagnosticsByPath.set(
+					afterPath,
+					exists ? await dependencies.runDiagnostics(beforePath, signal) : [],
+				);
+			} catch {
+				failed = true;
+			}
+		}),
+	);
+	return { diagnosticsByPath, failed };
+}
+
+async function inspectAfter(
+	snapshot: Snapshot,
+	dependencies: HookDependencies,
+	signal: AbortSignal,
+): Promise<{ regressions: LintDiagnostic[]; failed: boolean }> {
+	const regressions: LintDiagnostic[] = [];
+	let failed = snapshot.failed;
+	await Promise.all(
+		Array.from(snapshot.diagnosticsByPath, async ([relativePath, before]) => {
+			try {
+				if (signal.aborted) return;
+				if (!(await dependencies.fileExists(relativePath))) return;
+				if (signal.aborted) return;
+				const after = await dependencies.runDiagnostics(relativePath, signal);
+				regressions.push(...compareDiagnostics(before, after));
+			} catch {
+				failed = true;
+			}
+		}),
+	);
+	return { regressions, failed };
+}
+
+export function createLintFeedbackController(
+	dependencies: HookDependencies,
+): LintFeedbackController {
 	const snapshots = new Map<string, Snapshot>();
 	const warnedSessions = new Set<string>();
+	const cancellation = new AbortController();
+	let active = true;
 
 	return {
-		"tool.execute.before": async (input: HookInput, output: BeforeOutput): Promise<void> => {
-			const args = isRecord(output.args) ? output.args : {};
-			const files = getTouchedFiles(input.tool, args, dependencies.worktree);
-			if (files.length === 0) return;
-
-			const diagnosticsByPath = new Map<string, LintDiagnostic[]>();
-			let failed = false;
-			await Promise.all(
-				files.map(async ({ beforePath, afterPath }) => {
-					try {
-						if (!beforePath) {
-							diagnosticsByPath.set(afterPath, []);
-							return;
-						}
-						const exists = await dependencies.fileExists(beforePath);
-						diagnosticsByPath.set(
-							afterPath,
-							exists ? await dependencies.runDiagnostics(beforePath) : [],
-						);
-					} catch {
-						failed = true;
-					}
-				}),
-			);
+		before: async (input): Promise<void> => {
+			if (!active) return;
+			const snapshot = await captureSnapshot(input, dependencies, cancellation.signal);
+			if (!active || !snapshot) return;
 			if (snapshots.size >= SNAPSHOT_LIMIT) {
 				const oldest = snapshots.keys().next().value;
 				if (oldest) snapshots.delete(oldest);
 			}
-			snapshots.set(callKey(input), { diagnosticsByPath, failed });
+			snapshots.set(callKey(input), snapshot);
 		},
 
-		"tool.execute.after": async (input: HookInput, output: AfterOutput): Promise<void> => {
+		after: async (input): Promise<string | undefined> => {
+			if (!active) return undefined;
 			const key = callKey(input);
 			const snapshot = snapshots.get(key);
 			snapshots.delete(key);
-			if (!snapshot) return;
+			if (!snapshot) return undefined;
 
-			const regressions: LintDiagnostic[] = [];
-			let failed = snapshot.failed;
-			await Promise.all(
-				Array.from(snapshot.diagnosticsByPath, async ([relativePath, before]) => {
-					try {
-						if (!(await dependencies.fileExists(relativePath))) return;
-						const after = await dependencies.runDiagnostics(relativePath);
-						regressions.push(...compareDiagnostics(before, after));
-					} catch {
-						failed = true;
-					}
-				}),
+			const { regressions, failed } = await inspectAfter(
+				snapshot,
+				dependencies,
+				cancellation.signal,
 			);
-
-			if (regressions.length > 0) appendOutput(output, formatFeedback(regressions));
+			if (!active) return undefined;
+			const messages: string[] = [];
+			if (regressions.length > 0) messages.push(formatFeedback(regressions));
 			if (failed && !warnedSessions.has(input.sessionID)) {
 				warnedSessions.add(input.sessionID);
-				appendOutput(output, WARNING);
+				messages.push(WARNING);
 			}
+			return messages.length > 0 ? messages.join("\n\n") : undefined;
+		},
+		discard: (input): void => {
+			snapshots.delete(callKey(input));
 		},
 		dispose: async (): Promise<void> => {
+			active = false;
+			cancellation.abort();
 			snapshots.clear();
 			warnedSessions.clear();
-			killLiveChildren();
+			dependencies.disposeDiagnostics?.();
 		},
+	};
+}
+
+export function createLintFeedbackHooks(dependencies: HookDependencies) {
+	const controller = createLintFeedbackController(dependencies);
+	return {
+		"tool.execute.before": async (input: HookInput, output: BeforeOutput): Promise<void> => {
+			await controller.before({ ...input, args: output.args });
+		},
+		"tool.execute.after": async (input: HookInput, output: AfterOutput): Promise<void> => {
+			const message = await controller.after(input);
+			if (message) appendOutput(output, message);
+		},
+		dispose: controller.dispose,
 	};
 }
 
@@ -545,7 +339,10 @@ async function runCommand(
 	relativePath: string,
 	worktree: string,
 	timeoutMs: number,
+	ownerChildren: Set<ChildProcess>,
+	signal?: AbortSignal,
 ): Promise<string> {
+	if (signal?.aborted) throw new Error("Lint command cancelled");
 	const [executable, ...args] = command;
 	const child = spawn(executable, [...args, "--", relativePath], {
 		cwd: worktree,
@@ -554,6 +351,7 @@ async function runCommand(
 		stdio: ["ignore", "pipe", "pipe"],
 	});
 	liveChildren.add(child);
+	ownerChildren.add(child);
 	const stdout: Buffer[] = [];
 	const stderr: Buffer[] = [];
 	child.stdout.on("data", (chunk) => stdout.push(Buffer.from(chunk)));
@@ -561,18 +359,28 @@ async function runCommand(
 
 	return await new Promise<string>((resolve, reject) => {
 		let forceKillTimer: ReturnType<typeof setTimeout> | undefined;
+		const abort = () => {
+			killProcessTree(child, "SIGKILL");
+			reject(new Error("Lint command cancelled"));
+		};
+		signal?.addEventListener("abort", abort, { once: true });
 		const timer = setTimeout(() => {
 			killProcessTree(child, "SIGTERM");
 			forceKillTimer = setTimeout(() => killProcessTree(child, "SIGKILL"), 250);
 			reject(new Error(`Lint command timed out after ${timeoutMs}ms`));
 		}, timeoutMs);
 		child.once("error", (error) => {
+			liveChildren.delete(child);
+			ownerChildren.delete(child);
+			signal?.removeEventListener("abort", abort);
 			clearTimeout(timer);
 			if (forceKillTimer) clearTimeout(forceKillTimer);
 			reject(error);
 		});
 		child.once("close", (code) => {
 			liveChildren.delete(child);
+			ownerChildren.delete(child);
+			signal?.removeEventListener("abort", abort);
 			clearTimeout(timer);
 			if (forceKillTimer) clearTimeout(forceKillTimer);
 			const text = Buffer.concat(stdout).toString("utf8");
@@ -608,9 +416,12 @@ async function isInsideWorktree(worktree: string, relativePath: string): Promise
 	}
 }
 
-export const LintFeedbackPlugin: Plugin = async ({ worktree }, options?: PluginOptions) => {
+export function createWorktreeLintFeedbackController(
+	worktree: string,
+	options?: PluginOptions,
+): LintFeedbackController | undefined {
 	const settings = options as LintFeedbackOptions | undefined;
-	if (!validCommand(settings?.command)) return {};
+	if (!validCommand(settings?.command)) return undefined;
 	const [executable, ...args] = settings.command;
 	const command: [string, ...string[]] = [executable, ...args];
 	const timeoutMs =
@@ -619,20 +430,40 @@ export const LintFeedbackPlugin: Plugin = async ({ worktree }, options?: PluginO
 		settings.timeoutMs > 0
 			? settings.timeoutMs
 			: 10_000;
+	const ownerChildren = new Set<ChildProcess>();
 
-	return createLintFeedbackHooks({
+	return createLintFeedbackController({
 		worktree,
 		command,
 		timeoutMs,
 		fileExists: async (relativePath) => isInsideWorktree(worktree, relativePath),
-		runDiagnostics: async (relativePath) => {
+		runDiagnostics: async (relativePath, signal) => {
 			const [output, sourceCode] = await Promise.all([
-				runCommand(command, relativePath, worktree, timeoutMs),
+				runCommand(command, relativePath, worktree, timeoutMs, ownerChildren, signal),
 				readFile(path.join(worktree, relativePath), "utf8"),
 			]);
 			return parseBiomeDiagnostics(output, sourceCode);
 		},
+		disposeDiagnostics: () => {
+			for (const child of ownerChildren) killProcessTree(child, "SIGKILL");
+			ownerChildren.clear();
+		},
 	});
+}
+
+export const LintFeedbackPlugin: Plugin = async ({ worktree }, options?: PluginOptions) => {
+	const controller = createWorktreeLintFeedbackController(worktree, options);
+	if (!controller) return {};
+	return {
+		"tool.execute.before": async (input: HookInput, output: BeforeOutput) => {
+			await controller.before({ ...input, args: output.args });
+		},
+		"tool.execute.after": async (input: HookInput, output: AfterOutput) => {
+			const message = await controller.after(input);
+			if (message) appendOutput(output, message);
+		},
+		dispose: controller.dispose,
+	};
 };
 
 export default LintFeedbackPlugin;

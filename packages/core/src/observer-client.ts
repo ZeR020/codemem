@@ -45,6 +45,7 @@ import {
 	stripTrailingCommas,
 } from "./observer-config.js";
 import type { ObserverEnvelopeFailureReason } from "./observer-output-schema.js";
+import { parseObserverSSE } from "./observer-sse.js";
 import { resolvePiObserverConfig } from "./pi-observer-config.js";
 
 // ---------------------------------------------------------------------------
@@ -150,6 +151,25 @@ export interface ObserverResponse {
 	elapsedMs?: number;
 	/** Provider-reported token usage. Null when the transport does not expose it. */
 	usage?: ObserverTokenUsage | null;
+	/** Call-local result details. Additive so existing ObserverResponse producers remain compatible. */
+	outcome?: ObserverCallOutcome;
+}
+
+export interface ObserverCallError {
+	code: string;
+	message: string;
+}
+
+export interface ObserverAuthRetryOutcome {
+	attempted: true;
+	initialError: ObserverCallError;
+	retryError: ObserverCallError | null;
+}
+
+export interface ObserverCallOutcome {
+	status: "success" | "empty" | "failure";
+	error: ObserverCallError | null;
+	authRetry: ObserverAuthRetryOutcome | null;
 }
 
 export interface ObserverTokenUsage {
@@ -824,9 +844,24 @@ export function loadObserverConfig(): ObserverConfig {
 // ---------------------------------------------------------------------------
 
 export class ObserverAuthError extends Error {
-	constructor(message: string) {
+	readonly detail: ObserverCallError;
+
+	constructor(message: string, detail: ObserverCallError = { code: "auth_failed", message }) {
 		super(message);
 		this.name = "ObserverAuthError";
+		this.detail = detail;
+	}
+}
+
+export class ObserverAuthRetryError extends ObserverAuthError {
+	readonly initialError: ObserverAuthError;
+	readonly retryError: unknown;
+
+	constructor(initialError: ObserverAuthError, retryError: unknown) {
+		super(initialError.message, initialError.detail);
+		this.initialError = initialError;
+		this.retryError = retryError;
+		this.cause = retryError;
 	}
 }
 
@@ -1091,6 +1126,7 @@ function parseAnthropicResponse(body: Record<string, unknown>): string | null {
 interface ObserverCallResult {
 	raw: string | null;
 	usage: ObserverTokenUsage | null;
+	error: ObserverCallError | null;
 	failureReason?: ObserverEnvelopeFailureReason | null;
 	transportFailureCode?: string | null;
 	httpStatus?: number | null;
@@ -1126,8 +1162,11 @@ function normalizeObserverUsage(body: Record<string, unknown>): ObserverTokenUsa
 	return normalized;
 }
 
-function emptyCallResult(raw: string | null): ObserverCallResult {
-	return { raw, usage: null, failureReason: null, transportFailureCode: null };
+function emptyCallResult(
+	raw: string | null,
+	error: ObserverCallError | null = null,
+): ObserverCallResult {
+	return { raw, usage: null, error, failureReason: null, transportFailureCode: null };
 }
 
 function classifyOpenAIResponsesStructuredFailure(
@@ -1386,38 +1425,6 @@ function buildCodexPayload(
 // ---------------------------------------------------------------------------
 // SSE stream text extraction (shared for Codex and Anthropic OAuth)
 // ---------------------------------------------------------------------------
-
-function extractTextFromSSE(
-	rawText: string,
-	extractDelta: (event: Record<string, unknown>) => string | null,
-): ObserverCallResult {
-	const parts: string[] = [];
-	const usageFields: Record<string, unknown> = {};
-	for (const line of rawText.split("\n")) {
-		if (!line.startsWith("data:")) continue;
-		const payload = line.slice(5).trim();
-		if (!payload || payload === "[DONE]") continue;
-		try {
-			const event = JSON.parse(payload) as Record<string, unknown>;
-			const delta = extractDelta(event);
-			if (delta) parts.push(delta);
-			for (const candidate of [event, event.response, event.message]) {
-				if (typeof candidate !== "object" || candidate == null || Array.isArray(candidate))
-					continue;
-				const usage = (candidate as Record<string, unknown>).usage;
-				if (typeof usage === "object" && usage != null && !Array.isArray(usage)) {
-					Object.assign(usageFields, usage);
-				}
-			}
-		} catch {
-			// skip malformed events
-		}
-	}
-	return {
-		raw: parts.length > 0 ? parts.join("").trim() : null,
-		usage: normalizeObserverUsage({ usage: usageFields }),
-	};
-}
 
 function extractCodexDelta(event: Record<string, unknown>): string | null {
 	if (event.type === "response.output_text.delta") {
@@ -1914,27 +1921,43 @@ export class ObserverClient {
 			this._codexSidecarModelFallbackApplied = false;
 			this._codexSidecarModelFallbackReason = null;
 		}
-		const call = await this._callWithAuthRetry(() => this._callOnce(clipped.system, clipped.user));
+		const { value: call, authRetry } = await this._callWithAuthRetry(() =>
+			this._callOnce(clipped.system, clipped.user),
+		);
 		if (call.raw) this._clearLastError();
-		return this._buildResponse(call, startedAt);
+		return this._buildResponse(call, startedAt, authRetry);
 	}
 
-	private async _callWithAuthRetry<T>(call: () => Promise<T>): Promise<T> {
+	private async _callWithAuthRetry<T extends ObserverCallResult>(
+		call: () => Promise<T>,
+	): Promise<{ value: T; authRetry: ObserverAuthRetryOutcome | null }> {
 		try {
-			return await call();
+			return { value: await call(), authRetry: null };
 		} catch (error) {
 			if (!(error instanceof ObserverAuthError)) throw error;
 			this.refreshAuth();
 			if (!this.auth.token) throw error;
 			try {
-				return await call();
-			} catch {
-				throw error;
+				const value = await call();
+				return {
+					value,
+					authRetry: {
+						attempted: true,
+						initialError: error.detail,
+						retryError: value.error,
+					},
+				};
+			} catch (retryError) {
+				throw new ObserverAuthRetryError(error, retryError);
 			}
 		}
 	}
 
-	private _buildResponse(call: ObserverCallResult, startedAt: number): ObserverResponse {
+	private _buildResponse(
+		call: ObserverCallResult,
+		startedAt: number,
+		authRetry: ObserverAuthRetryOutcome | null,
+	): ObserverResponse {
 		return {
 			raw: call.raw,
 			parsed: call.raw ? tryParseJSON(call.raw) : null,
@@ -1942,7 +1965,24 @@ export class ObserverClient {
 			model: this._resolvedResultModel(),
 			elapsedMs: Math.max(0, nowMs() - startedAt),
 			usage: call.usage,
+			outcome: this._buildCallOutcome(call, authRetry),
 		};
+	}
+
+	private _buildCallOutcome(
+		call: ObserverCallResult,
+		authRetry: ObserverAuthRetryOutcome | null,
+	): ObserverCallOutcome {
+		let status: ObserverCallOutcome["status"] = "success";
+		if (call.error) {
+			status =
+				call.error.code === "empty_response" || call.error.code === "structured_output_missing"
+					? "empty"
+					: "failure";
+		} else if (!call.raw) {
+			status = "empty";
+		}
+		return { status, error: call.error, authRetry };
 	}
 
 	/** Model string to report for a result, accounting for sidecar fallback. */
@@ -1969,30 +2009,12 @@ export class ObserverClient {
 			if (!this.auth.token && !this.canCallOpenAIDirectWithoutAuth()) {
 				this._initProvider(true);
 				if (!this.auth.token && !this.canCallOpenAIDirectWithoutAuth()) {
-					this._setLastError(
-						"OpenAI observer authentication is not configured.",
-						"observer_auth_missing",
-					);
-					return {
-						raw: null,
-						parsed: null,
-						provider: this.provider,
-						model: this.model,
-						elapsedMs: Math.max(0, nowMs() - startedAt),
-						usage: null,
-						usedStructuredOutputs: true,
-						failureReason: null,
-						transportFailureCode: "observer_auth_missing",
-					};
+					return this._missingStructuredAuthResponse("OpenAI", startedAt);
 				}
 			}
-
-			let url: string;
-			if (this._customBaseUrl) {
-				url = `${stripTrailingSlashes(this._customBaseUrl)}/responses`;
-			} else {
-				url = "https://api.openai.com/v1/responses";
-			}
+			const url = this._customBaseUrl
+				? `${stripTrailingSlashes(this._customBaseUrl)}/responses`
+				: "https://api.openai.com/v1/responses";
 			const payload = buildOpenAIResponsesStructuredPayload(
 				this.model,
 				clipped.system,
@@ -2004,43 +2026,24 @@ export class ObserverClient {
 				schemaName,
 				schema,
 			);
-			const call = await this._callWithAuthRetry(() => {
-				const headers = buildOpenAIHeaders(this.auth.token);
-				const mergedHeaders = mergeHeadersCaseInsensitive(
-					headers,
+			const { value: call, authRetry } = await this._callWithAuthRetry(() => {
+				const headers = mergeHeadersCaseInsensitive(
+					buildOpenAIHeaders(this.auth.token),
 					renderObserverHeaders(this._observerHeaders, this.auth),
 				);
-				return this._fetchJSON(url, mergedHeaders, payload, {
+				return this._fetchJSON(url, headers, payload, {
 					parseResponse: parseOpenAIResponsesResponse,
 					providerLabel: "OpenAI",
 					classifyStructuredFailure: classifyOpenAIResponsesStructuredFailure,
 				});
 			});
-			if (call.raw && !call.failureReason && !call.transportFailureCode) this._clearLastError();
-			return {
-				raw: call.raw,
-				parsed: call.raw ? tryParseJSON(call.raw) : null,
-				provider: this.provider,
-				model: this.model,
-				elapsedMs: Math.max(0, nowMs() - startedAt),
-				usage: call.usage,
-				usedStructuredOutputs: true,
-				failureReason:
-					call.failureReason ??
-					(call.raw || call.transportFailureCode ? null : "structured_output_missing"),
-				transportFailureCode: call.transportFailureCode ?? null,
-				httpStatus: call.httpStatus ?? null,
-			};
+			return this._structuredResponse(call, authRetry, startedAt);
 		}
-
 		if (this.provider === "anthropic") {
-			// Anthropic OAuth consumer uses SSE streaming which may not support
-			// structured output_config reliably. Fall back to observe() for OAuth.
-			// Direct API key path supports non-streaming structured outputs.
+			// Anthropic OAuth consumer uses SSE streaming, so only direct API keys use
+			// structured output_config. OAuth falls through to the plain observer path.
 			if (!this._anthropicOAuthAccess) {
-				if (!this.auth.token) {
-					this._initProvider(true);
-				}
+				if (!this.auth.token) this._initProvider(true);
 				if (this.auth.token) {
 					const payload = buildAnthropicStructuredPayload(
 						this.model,
@@ -2049,15 +2052,14 @@ export class ObserverClient {
 						this.maxTokens,
 						schema,
 					);
-					const call = await this._callWithAuthRetry(() => {
-						const headers = buildAnthropicHeaders(this.auth.token ?? "", false);
-						const mergedHeaders = mergeHeadersCaseInsensitive(
-							headers,
+					const { value: call, authRetry } = await this._callWithAuthRetry(() => {
+						const headers = mergeHeadersCaseInsensitive(
+							buildAnthropicHeaders(this.auth.token ?? "", false),
 							renderObserverHeaders(this._observerHeaders, this.auth),
 						);
 						return this._fetchJSON(
 							resolveAnthropicEndpoint(this._customBaseUrl),
-							mergedHeaders,
+							headers,
 							payload,
 							{
 								parseResponse: parseAnthropicResponse,
@@ -2066,43 +2068,11 @@ export class ObserverClient {
 							},
 						);
 					});
-					if (call.raw && !call.failureReason && !call.transportFailureCode) {
-						this._clearLastError();
-					}
-					return {
-						raw: call.raw,
-						parsed: call.raw ? tryParseJSON(call.raw) : null,
-						provider: this.provider,
-						model: this.model,
-						elapsedMs: Math.max(0, nowMs() - startedAt),
-						usage: call.usage,
-						usedStructuredOutputs: true,
-						failureReason:
-							call.failureReason ??
-							(call.raw || call.transportFailureCode ? null : "structured_output_missing"),
-						transportFailureCode: call.transportFailureCode ?? null,
-						httpStatus: call.httpStatus ?? null,
-					};
+					return this._structuredResponse(call, authRetry, startedAt);
 				}
-				this._setLastError(
-					"Anthropic observer authentication is not configured.",
-					"observer_auth_missing",
-				);
-				return {
-					raw: null,
-					parsed: null,
-					provider: this.provider,
-					model: this.model,
-					elapsedMs: Math.max(0, nowMs() - startedAt),
-					usage: null,
-					usedStructuredOutputs: true,
-					failureReason: null,
-					transportFailureCode: "observer_auth_missing",
-				};
+				return this._missingStructuredAuthResponse("Anthropic", startedAt);
 			}
-			// OAuth or no token — fall through to observe() fallback below
 		}
-
 		const fallback = await this.observe(systemPrompt, userPrompt);
 		return {
 			raw: fallback.raw,
@@ -2111,9 +2081,56 @@ export class ObserverClient {
 			model: fallback.model,
 			elapsedMs: Math.max(0, nowMs() - startedAt),
 			usage: fallback.usage,
+			outcome: fallback.outcome,
 			usedStructuredOutputs: false,
 			failureReason: null,
 			transportFailureCode: null,
+		};
+	}
+
+	private _missingStructuredAuthResponse(
+		providerLabel: string,
+		startedAt: number,
+	): ObserverStructuredJsonResponse {
+		const error = this._setLastError(
+			`${providerLabel} observer authentication is not configured.`,
+			"observer_auth_missing",
+		);
+		const call = emptyCallResult(null, error);
+		return {
+			raw: null,
+			parsed: null,
+			provider: this.provider,
+			model: this.model,
+			elapsedMs: Math.max(0, nowMs() - startedAt),
+			usage: null,
+			outcome: this._buildCallOutcome(call, null),
+			usedStructuredOutputs: true,
+			failureReason: null,
+			transportFailureCode: "observer_auth_missing",
+		};
+	}
+
+	private _structuredResponse(
+		call: ObserverCallResult,
+		authRetry: ObserverCallOutcome["authRetry"],
+		startedAt: number,
+	): ObserverStructuredJsonResponse {
+		if (call.raw && !call.failureReason && !call.transportFailureCode) this._clearLastError();
+		return {
+			raw: call.raw,
+			parsed: call.raw ? tryParseJSON(call.raw) : null,
+			provider: this.provider,
+			model: this.model,
+			elapsedMs: Math.max(0, nowMs() - startedAt),
+			usage: call.usage,
+			outcome: this._buildCallOutcome(call, authRetry),
+			usedStructuredOutputs: true,
+			failureReason:
+				call.failureReason ??
+				(call.raw || call.transportFailureCode ? null : "structured_output_missing"),
+			transportFailureCode: call.transportFailureCode ?? null,
+			httpStatus: call.httpStatus ?? null,
 		};
 	}
 
@@ -2221,12 +2238,12 @@ export class ObserverClient {
 	private async _callOnce(systemPrompt: string, userPrompt: string): Promise<ObserverCallResult> {
 		// Claude sidecar path — dispatches before any API-based paths
 		if (this.runtime === "claude_sidecar") {
-			return emptyCallResult(await this._callSidecar(systemPrompt, userPrompt));
+			return this._callSidecar(systemPrompt, userPrompt);
 		}
 
 		// Codex sidecar path — dispatches before any API-based paths
 		if (this.runtime === "codex_sidecar") {
-			return emptyCallResult(await this._callCodexSidecar(systemPrompt, userPrompt));
+			return this._callCodexSidecar(systemPrompt, userPrompt);
 		}
 
 		// Codex consumer path (OpenAI OAuth)
@@ -2245,8 +2262,11 @@ export class ObserverClient {
 			if (this._codexAccess) return this._callCodexConsumer(systemPrompt, userPrompt);
 			if (this._anthropicOAuthAccess) return this._callAnthropicConsumer(systemPrompt, userPrompt);
 			if (!this.auth.token && !this.canCallOpenAIDirectWithoutAuth()) {
-				this._setLastError(`${capitalize(this.provider)} credentials are missing.`, "auth_missing");
-				return emptyCallResult(null);
+				const error = this._setLastError(
+					`${capitalize(this.provider)} credentials are missing.`,
+					"auth_missing",
+				);
+				return emptyCallResult(null, error);
 			}
 		}
 
@@ -2407,7 +2427,7 @@ export class ObserverClient {
 	// -----------------------------------------------------------------------
 
 	private _buildSidecarCommand(prompt: string, useModel: boolean): string[] {
-		const cmd = [
+		const claudeCommand = [
 			...this._claudeCommand,
 			"-p",
 			"--output-format",
@@ -2416,10 +2436,10 @@ export class ObserverClient {
 			"bypassPermissions",
 		];
 		if (useModel && this._sidecarModel) {
-			cmd.push("--model", this._sidecarModel);
+			claudeCommand.push("--model", this._sidecarModel);
 		}
-		cmd.push(prompt);
-		return cmd;
+		claudeCommand.push(prompt);
+		return claudeCommand;
 	}
 
 	private async _invokeSidecar(
@@ -2539,7 +2559,10 @@ export class ObserverClient {
 		}
 	}
 
-	private async _callSidecar(systemPrompt: string, userPrompt: string): Promise<string | null> {
+	private async _callSidecar(
+		systemPrompt: string,
+		userPrompt: string,
+	): Promise<ObserverCallResult> {
 		const prompt = `${systemPrompt}\n\n${userPrompt}`;
 
 		let { output, error, reportedModel } = await this._invokeSidecar(prompt, true);
@@ -2560,23 +2583,14 @@ export class ObserverClient {
 			else this._lastResolvedModel = null;
 		}
 		if (error) {
-			if (isSidecarAuthError(error)) {
-				this._setLastError(
-					"Claude authentication failed. Refresh credentials and retry.",
-					"auth_failed",
-				);
-				throw new ObserverAuthError(error);
-			}
-			if (isSidecarModelError(error)) {
-				this._setLastError(
-					`Claude model is unavailable: ${this._sidecarModel || this.model}.`,
-					"invalid_model_id",
-				);
-			}
-			console.warn(`[codemem] observer claude_sidecar call failed: ${error}`);
-			return null;
+			return this._sidecarErrorResult(error, {
+				providerLabel: "Claude",
+				model: this._sidecarModel || this.model,
+				isAuthError: isSidecarAuthError,
+				isModelError: isSidecarModelError,
+			});
 		}
-		return output;
+		return emptyCallResult(output);
 	}
 
 	// -----------------------------------------------------------------------
@@ -2589,7 +2603,7 @@ export class ObserverClient {
 	 * the prompt is read from stdin (trailing `-`).
 	 */
 	private _buildCodexSidecarCommand(useModel: boolean, outputFile: string): string[] {
-		const cmd = [
+		const codexCommand = [
 			...this._codexCommand,
 			"exec",
 			"--ephemeral",
@@ -2599,10 +2613,10 @@ export class ObserverClient {
 			"read-only",
 		];
 		if (useModel && this._codexSidecarModel) {
-			cmd.push("-m", this._codexSidecarModel);
+			codexCommand.push("-m", this._codexSidecarModel);
 		}
-		cmd.push("-o", outputFile, "-");
-		return cmd;
+		codexCommand.push("-o", outputFile, "-");
+		return codexCommand;
 	}
 
 	private async _invokeCodexSidecar(
@@ -2785,7 +2799,7 @@ export class ObserverClient {
 	private async _callCodexSidecar(
 		systemPrompt: string,
 		userPrompt: string,
-	): Promise<string | null> {
+	): Promise<ObserverCallResult> {
 		let { output, error, reportedModel } = await this._invokeCodexSidecar(
 			systemPrompt,
 			userPrompt,
@@ -2812,23 +2826,14 @@ export class ObserverClient {
 			else this._lastResolvedModel = null;
 		}
 		if (error) {
-			if (isCodexSidecarAuthError(error)) {
-				this._setLastError(
-					"Codex authentication failed. Refresh credentials and retry.",
-					"auth_failed",
-				);
-				throw new ObserverAuthError(error);
-			}
-			if (isCodexSidecarModelError(error)) {
-				this._setLastError(
-					`Codex model is unavailable: ${this._codexSidecarModel || this.model}.`,
-					"invalid_model_id",
-				);
-			}
-			console.warn(`[codemem] observer codex_sidecar call failed: ${redactText(error)}`);
-			return null;
+			return this._sidecarErrorResult(error, {
+				providerLabel: "Codex",
+				model: this._codexSidecarModel || this.model,
+				isAuthError: isCodexSidecarAuthError,
+				isModelError: isCodexSidecarModelError,
+			});
 		}
-		return output;
+		return emptyCallResult(output);
 	}
 
 	// -----------------------------------------------------------------------
@@ -2857,29 +2862,28 @@ export class ObserverClient {
 
 			if (!response.ok) {
 				const errorText = await response.text().catch(() => "");
-				const transportFailureCode = this._handleHttpError(
-					response.status,
-					errorText,
-					opts.providerLabel,
-				);
+				const error = this._handleHttpError(response.status, errorText, opts.providerLabel);
 				return {
 					...emptyCallResult(null),
-					transportFailureCode,
+					error,
+					transportFailureCode: error.code,
 					httpStatus: response.status,
 				};
 			}
 
 			const body = (await response.json()) as Record<string, unknown>;
 			const failureReason = opts.classifyStructuredFailure?.(body) ?? null;
-			const result = opts.parseResponse(body);
+			const parsedResult = opts.parseResponse(body);
+			const result = parsedResult?.trim() ? parsedResult : null;
+			let error: ObserverCallError | null = null;
 			if (failureReason) {
-				this._setLastError(
+				error = this._setLastError(
 					`${opts.providerLabel} structured observer output failed (${failureReason}).`,
 					failureReason,
 				);
 			} else if (result === null) {
 				const structured = opts.classifyStructuredFailure != null;
-				this._setLastError(
+				error = this._setLastError(
 					structured
 						? `${opts.providerLabel} structured observer output was missing.`
 						: `${opts.providerLabel} returned 200 but response contained no extractable text.`,
@@ -2889,19 +2893,17 @@ export class ObserverClient {
 			return {
 				raw: result,
 				usage: normalizeObserverUsage(body),
+				error,
 				failureReason,
 				transportFailureCode: null,
 				httpStatus: null,
 			};
 		} catch (err) {
 			if (err instanceof ObserverAuthError) throw err;
-			this._setLastError(
-				`${opts.providerLabel} processing failed during observer inference.`,
-				"observer_call_failed",
-			);
+			const error = this._processingError(err, opts.providerLabel);
 			return {
-				...emptyCallResult(null),
-				transportFailureCode: "observer_call_failed",
+				...emptyCallResult(null, error),
+				transportFailureCode: error.code,
 				httpStatus: null,
 			};
 		}
@@ -2930,27 +2932,46 @@ export class ObserverClient {
 				// Consume body to avoid dangling connection
 				await response.text().catch(() => "");
 				if (isAuthStatus(response.status)) {
-					this._setLastError(opts.authErrorMessage, "auth_failed");
-					throw new ObserverAuthError(`${opts.providerLabel} auth error: ${response.status}`);
+					const detail = this._setLastError(opts.authErrorMessage, "auth_failed");
+					throw new ObserverAuthError(
+						`${opts.providerLabel} auth error: ${response.status}`,
+						detail,
+					);
 				}
-				this._setLastError(
+				const error = this._setLastError(
 					`${opts.providerLabel} request failed during observer processing.`,
 					"provider_request_failed",
 				);
-				return emptyCallResult(null);
+				return {
+					...emptyCallResult(null, error),
+					transportFailureCode: error.code,
+					httpStatus: response.status,
+				};
 			}
 
-			// Read full response body as text and parse SSE events. Token usage is
-			// collected only from parsed events, never inferred from response length.
-			const rawText = await response.text();
-			return extractTextFromSSE(rawText, extractDelta);
+			// Parse complete SSE events incrementally. Token usage is collected only
+			// from parsed events, never inferred from response length.
+			const parsed = await parseObserverSSE(response.body, extractDelta);
+			const result: ObserverCallResult = {
+				raw: parsed.raw,
+				usage: normalizeObserverUsage({ usage: parsed.usageFields }),
+				error: null,
+				failureReason: null,
+				transportFailureCode: null,
+			};
+			if (result.raw) return result;
+			result.error = this._setLastError(
+				`${opts.providerLabel} returned 200 but response contained no extractable text.`,
+				"empty_response",
+			);
+			return result;
 		} catch (err) {
 			if (err instanceof ObserverAuthError) throw err;
-			this._setLastError(
-				`${opts.providerLabel} processing failed during observer inference.`,
-				"observer_call_failed",
-			);
-			return emptyCallResult(null);
+			const error = this._processingError(err, opts.providerLabel);
+			return {
+				...emptyCallResult(null, error),
+				transportFailureCode: error.code,
+			};
 		}
 	}
 
@@ -2958,20 +2979,67 @@ export class ObserverClient {
 	// Error handling
 	// -----------------------------------------------------------------------
 
-	private _handleHttpError(status: number, errorText: string, providerLabel: string): string {
+	private _processingError(error: unknown, providerLabel: string): ObserverCallError {
+		const timeout = error instanceof Error && error.name === "TimeoutError";
+		const code = timeout ? "observer_timeout" : "observer_call_failed";
+		const message = timeout
+			? `${providerLabel} request timed out during observer inference.`
+			: `${providerLabel} processing failed during observer inference.`;
+		return this._setLastError(message, code);
+	}
+
+	private _sidecarErrorResult(
+		error: string,
+		opts: {
+			providerLabel: string;
+			model: string;
+			isAuthError: (message: string) => boolean;
+			isModelError: (message: string) => boolean;
+		},
+	): ObserverCallResult {
+		if (opts.isAuthError(error)) {
+			const detail = this._setLastError(
+				`${opts.providerLabel} authentication failed. Refresh credentials and retry.`,
+				"auth_failed",
+			);
+			throw new ObserverAuthError(error, detail);
+		}
+		let detail: ObserverCallError;
+		if (opts.isModelError(error)) {
+			detail = this._setLastError(
+				`${opts.providerLabel} model is unavailable: ${opts.model}.`,
+				"invalid_model_id",
+			);
+		} else {
+			const code = /timeout|timed out/i.test(error) ? "observer_timeout" : "observer_call_failed";
+			detail = this._setLastError(
+				`${opts.providerLabel} processing failed during observer inference.`,
+				code,
+			);
+		}
+		console.warn(
+			`[codemem] observer ${opts.providerLabel.toLowerCase()}_sidecar call failed: ${redactText(error)}`,
+		);
+		return emptyCallResult(null, detail);
+	}
+
+	private _handleHttpError(
+		status: number,
+		errorText: string,
+		providerLabel: string,
+	): ObserverCallError {
 		const summary = redactText(errorText);
 
 		if (isAuthStatus(status)) {
-			this._setLastError(
+			const detail = this._setLastError(
 				`${providerLabel} authentication failed. Refresh credentials and retry.`,
 				"auth_failed",
 			);
-			throw new ObserverAuthError(`${providerLabel} auth error: ${status}: ${summary}`);
+			throw new ObserverAuthError(`${providerLabel} auth error: ${status}: ${summary}`, detail);
 		}
 
 		if (status === 429) {
-			this._setLastError(`${providerLabel} rate limited. Retry later.`, "rate_limited");
-			return "rate_limited";
+			return this._setLastError(`${providerLabel} rate limited. Retry later.`, "rate_limited");
 		}
 
 		// Check for model-not-found in Anthropic error responses
@@ -2983,11 +3051,10 @@ export class ObserverClient {
 					const errorType = String(error.type ?? "").toLowerCase();
 					const message = String(error.message ?? "");
 					if (errorType === "not_found_error" && message.toLowerCase().startsWith("model:")) {
-						this._setLastError(
+						return this._setLastError(
 							`${providerLabel} model ID not found: ${message.split(":")[1]?.trim() ?? this.model}.`,
 							"invalid_model_id",
 						);
-						return "invalid_model_id";
 					}
 				}
 			} catch {
@@ -2995,15 +3062,19 @@ export class ObserverClient {
 			}
 		}
 
-		this._setLastError(`${providerLabel} request failed (${status}).`, "provider_request_failed");
-		return "provider_request_failed";
+		return this._setLastError(
+			`${providerLabel} request failed (${status}).`,
+			"provider_request_failed",
+		);
 	}
 
-	private _setLastError(message: string, code?: string): void {
+	private _setLastError(message: string, code?: string): ObserverCallError {
 		const text = message.trim();
-		if (!text) return;
+		const normalizedCode = (code ?? "observer_error").trim() || "observer_error";
+		if (!text) return { code: normalizedCode, message: "Observer request failed." };
 		this._lastErrorMessage = text;
-		this._lastErrorCode = (code ?? "observer_error").trim() || "observer_error";
+		this._lastErrorCode = normalizedCode;
+		return { code: normalizedCode, message: text };
 	}
 
 	private _clearLastError(): void {

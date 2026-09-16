@@ -11,7 +11,7 @@ codemem is persistent coding memory across sessions, machines, and teammates for
 - **Optional sync and sharing** — peer-to-peer sync carries selected project memory across machines; share project knowledge with a teammate or Team when it helps
 - **Local-first storage** — memories live in SQLite on your machine; observer processing uses your configured model provider and can incur costs or consume plan usage
 - **Hybrid retrieval** — FTS5 BM25 lexical search + sqlite-vec semantic search, merged and re-ranked
-- **Automatic injection for OpenCode 1** — the plugin injects context into every prompt, no manual steps
+- **Automatic injection for OpenCode 1 and 2** — the plugin injects context into every prompt, no manual steps; the OpenCode 2 integration is beta
 - **Claude Code plugin support** — install from the codemem marketplace source
 - **Built-in viewer** — browse memories, sessions, and observer output in a local web UI
 - **Remote MCP access** — advanced single-user self-hosting can expose an OAuth-protected Streamable HTTP MCP endpoint to configured remote clients; keep the localhost viewer private ([guide](docs/remote-mcp-oauth.md))
@@ -33,12 +33,22 @@ covers macOS x64/arm64, Linux x64/arm64 (glibc 2.34+ or musl), and Windows x64.
 
 ### OpenCode
 
-Codemem requires OpenCode 1.18.29 or newer.
+Codemem requires OpenCode 1.18.29 or newer. One installed
+`@codemem/opencode-plugin` package serves both host generations: OpenCode 1 calls
+its `server()` entrypoint and OpenCode 2 calls its `setup()` entrypoint. OpenCode 2
+support is validated against the exact stable `@opencode/cli@2.0.2` and
+`@opencode/plugin@2.0.2` releases; Codemem labels its OpenCode 2 integration
+**beta** until it has shipped through a full release cycle.
 
-The experimental OpenCode 2 beta entrypoint captures user and assistant messages,
-terminal usage, tool results, and session lifecycle events. It also exposes the
-manual `mem-status`, `mem-recent`, and `mem-stats` tools. Automatic recall remains
-an OpenCode 1 feature because the V2 context hook has no request kind or request ID.
+On OpenCode 2 the plugin captures user and assistant messages, terminal usage,
+tool results, and session lifecycle events, and exposes the same `mem-status`,
+`mem-recent`, and `mem-stats` tools. Automatic recall runs through
+`session.context`: the latest user-message ID is required, and a missing or blank
+ID skips recall safely. Each identified turn performs one fresh retrieval; retries
+and tool continuations replay retained context byte-for-byte. Compaction, title,
+and generate hooks stay isolated. Both the default message surface and legacy
+`CODEMEM_INJECT_SURFACE=system` surface work. See
+[OpenCode host support, troubleshooting, and rollback](docs/plugin-reference.md#opencode-host-support-troubleshooting-and-rollback).
 
 1. Install the OpenCode plugin and MCP config:
 
@@ -48,7 +58,9 @@ npx -y codemem setup --opencode-only
 
 2. Restart OpenCode.
 
-`npx` uses a downloaded or cached package to configure the OpenCode host; it does not create a durable `codemem` CLI installation. On OpenCode 1, the configured plugin manages backend execution independently, so no global install is required for automatic capture and context injection.
+`npx` uses a downloaded or cached package to configure the OpenCode host; it does not create a durable `codemem` CLI installation. The configured plugin manages backend execution independently on both hosts, so no global install is required for automatic capture and context injection.
+
+Setup writes the singular `plugin` key on purpose. OpenCode 1 requires that key, and OpenCode 2 translates it into its native `plugins` configuration, so one config entry works on both hosts. Keep one Codemem entry; if OpenCode loads Codemem twice for one project, the first registration wins and later copies skip their hooks with a warning.
 
 3. Verify:
 
@@ -58,7 +70,7 @@ npx -y codemem stats
 npx -y codemem db raw-events-status
 ```
 
-That's it. On OpenCode 1, the plugin captures activity, builds memories, and injects relevant context from here on.
+That's it. On either host, the plugin captures activity, builds memories, and injects relevant context from here on.
 
 ### Try a fresh-session recall
 
@@ -116,9 +128,20 @@ OpenCode plugin and CLI are now split intentionally:
 - `@codemem/embeddings` — optional semantic embedding runtime installed by the CLI
 
 OpenCode treats configured npm plugins and checkout-local `.opencode/plugins/` files as separate
-sources. If both load Codemem for one Project, the first registration wins and later copies skip
-their hooks with a warning. Remove the configured npm entry when testing a source checkout so the
-checkout-local plugin loads first; otherwise your edits may appear to do nothing.
+sources. The repository wrapper loads the checkout source on OpenCode 1 and acts as a no-op on
+OpenCode 2. Before dogfooding OpenCode 1 source changes, temporarily remove the configured npm
+plugin so it cannot initialize before the checkout wrapper; restore the npm entry after testing.
+On OpenCode 2, the configured npm plugin remains the only active Codemem instance and loads the
+package's `./tui` companion, which displays injection, compatibility, persistence, and update
+notices emitted by the server plugin. Notices remain best-effort and never affect capture or recall.
+
+When dogfooding unpublished TUI changes from a source checkout, add the checkout's
+`packages/opencode-plugin` directory to the OpenCode 2 `cli.json` `plugins` list, temporarily
+remove the configured npm plugin, restart the TUI, and restore the npm entry after testing.
+
+OpenCode 2 support needs no storage change. Both hosts write the same raw-event stream and SQLite
+database, so switching between OpenCode 1 and OpenCode 2, or setting `CODEMEM_PLUGIN_IGNORE=1` in
+the OpenCode 2 environment to stop the V2 path, requires no database migration.
 
 Capture follows the OpenCode 1.18.29 runtime contract: completed assistant
 messages use `info.time.completed`, token usage comes from `info.tokens`, and
@@ -126,6 +149,16 @@ successful and failed tool executions are both recorded. OpenCode reports
 successful tools through `tool.execute.after` and failed tools through errored
 tool parts; Codemem normalizes both into the shared raw-event stream without
 double-counting repeated failure updates.
+
+OpenCode 1 also preserves verified delegation provenance for individual task briefs.
+A proven brief-only batch stays in raw storage without an observer call or learned
+memory; later findings recover bounded earlier instructions from the same raw stream.
+Recovered instructions follow new evidence so observer clipping does not replace
+current findings with old task briefs.
+
+Missing or ambiguous provenance retains normal extraction. See
+[delegated brief capture](docs/plugin-reference.md#delegated-brief-capture-opencode-1)
+for matching rules and limits. Restart OpenCode after updating the plugin.
 
 Automatic OpenCode recall carries the host session ID through Viewer or CLI into
 Core assembly. Summary memories are eligible only from the exact mapped session;
@@ -198,9 +231,9 @@ Codex hook ingestion shares the same raw-event pipeline as Claude and OpenCode t
 
 Adapters hook into runtime event systems (the OpenCode 1 plugin and Claude hooks). They capture tool calls and conversation messages, flush them through an observer pipeline that produces typed memories, and surface retrieval context for future prompts.
 
-> The workflow below describes OpenCode 1 recall. OpenCode 2 captures activity,
-> manages lifecycle cleanup, and exposes manual memory tools, but it does not inject
-> automatic recall because its context hook cannot identify the request safely.
+> The workflow below illustrates the OpenCode 1 hook names. OpenCode 2.0.2 uses
+> `session.context` for the same automatic recall behavior, with the latest
+> user-message ID required for safe turn identity.
 
 ```mermaid
 sequenceDiagram
@@ -376,6 +409,8 @@ Config resolution precedence for runtime commands is:
 
 Environment variables still override file values once a config file has been selected.
 
+Codemem config mutations use a same-directory lock and atomic replacement. Concurrent Codemem writers fail with a retryable conflict instead of silently losing an update; malformed or unreadable existing config is left unchanged. External editors do not participate in the lock, so Codemem checks that the file has not changed again immediately before replacement.
+
 Common overrides:
 
 | Variable | Purpose |
@@ -517,9 +552,13 @@ npx -y codemem stats
 
 ### Plugin for development
 
-Start OpenCode inside the codemem repo directory — the plugin auto-loads from `.opencode/plugin/`.
+On OpenCode 1, temporarily remove the configured npm plugin, then start OpenCode inside the codemem
+repo directory to auto-load the V1 plugin source from `.opencode/plugins/`; restore the npm entry
+after testing. On OpenCode 2, that repository wrapper is a no-op: keep the configured npm plugin
+for normal use, or follow the source-checkout steps above to load `packages/opencode-plugin`
+explicitly while testing unpublished changes.
 
-The repository's root `opencode.jsonc` also enables a contributor-only lint-feedback pilot from `packages/opencode-plugin/src/lint-feedback.ts`. That repository-owned entrypoint pins the local Biome command, runs it before and after JavaScript or TypeScript edits covered by `biome.json`, appends only new or worsened diagnostics, and preserves edits with one warning if linting fails or times out. The root config and pilot source are excluded from `@codemem/opencode-plugin`; installing codemem does not enable this feedback hook.
+The repository's `.opencode/plugins/lint-feedback.js` auto-loads contributor-only OpenCode 1 and OpenCode 2 adapters backed by the shared lint-feedback implementation in `packages/opencode-plugin/src/`. The repository-owned entrypoint pins the local Biome command, runs it before and after JavaScript or TypeScript edits covered by `biome.json`, appends only new or worsened diagnostics to successful `edit`, `write`, or patch results, and preserves edits with one warning if linting fails or times out. OpenCode 2 shell commands have no post-execution hook, so changes made through shell commands require an explicit `pnpm lint:delta -- --base <ref>` checkpoint. The wrapper and lint-feedback sources are excluded from `@codemem/opencode-plugin`; installing codemem does not enable this feedback hook.
 
 </details>
 

@@ -8,7 +8,7 @@ import CodememDualPlugin, { CodememPlugin, OpencodeMemPlugin } from "../index.js
 
 const repositoryRoot = path.resolve(import.meta.dirname, "../../..");
 const minimumOpenCodeVersion = "1.18.29";
-const pinnedOpenCodeV2Version = "0.0.0-beta-19296";
+const pinnedOpenCodeV2Version = "2.0.2";
 
 async function readJson(relativePath: string) {
 	return JSON.parse(await readFile(path.join(repositoryRoot, relativePath), "utf8"));
@@ -39,22 +39,44 @@ it("keeps the OpenCode 1 SDK manifests aligned with the supported host floor", a
 	expect(packageManifest.engines.opencode).toBe(`>=${minimumOpenCodeVersion}`);
 	expect(pluginRuntimeManifest.dependencies["@opencode-ai/plugin"]).toBe(minimumOpenCodeVersion);
 	expect(cliRuntimeManifest.dependencies["@opencode-ai/plugin"]).toBe(minimumOpenCodeVersion);
-	expect(packageManifest.dependencies["@opencode/plugin"]).toBeUndefined();
-	expect(packageManifest.devDependencies["@opencode/plugin"]).toBe(pinnedOpenCodeV2Version);
+	expect(packageManifest.dependencies["@opencode/plugin"]).toBe(pinnedOpenCodeV2Version);
+	expect(packageManifest.devDependencies["@opencode/plugin"]).toBeUndefined();
+	expect(packageManifest.files).not.toContain("src/lint-feedback.ts");
+	expect(packageManifest.files).not.toContain("src/lint-feedback-core.ts");
+	expect(packageManifest.files).not.toContain("src/lint-feedback-v2.ts");
+	expect(packageManifest.exports["./rpc"]).toEqual({
+		types: "./rpc.d.ts",
+		import: "./rpc.js",
+	});
+	expect(packageManifest.exports["./tui"]).toEqual({
+		types: "./tui.d.ts",
+		import: "./tui.js",
+	});
 });
 
-it("loads the repository wrapper from the canonical package implementation", async () => {
-	const packageEntrypointUrl = pathToFileURL(
-		path.join(repositoryRoot, "packages/opencode-plugin/index.js"),
-	).href;
+it("keeps repository dogfooding on V1 without activating a second V2 plugin", async () => {
 	const repositoryWrapperUrl = pathToFileURL(
 		path.join(repositoryRoot, ".opencode/plugins/codemem.js"),
 	).href;
 
-	const packageEntrypoint = await import(packageEntrypointUrl);
 	const repositoryWrapper = await import(repositoryWrapperUrl);
 
 	expect(Object.keys(repositoryWrapper)).toEqual(["default"]);
-	expect(repositoryWrapper.default).toBe(packageEntrypoint.CodememPlugin);
-	expect(packageEntrypoint.default.server).toBe(repositoryWrapper.default);
+	expect(repositoryWrapper.default.id).toBe("codemem-source-checkout-v1");
+	expect(repositoryWrapper.default.server).toBe(CodememPlugin);
+	expect(await repositoryWrapper.default.setup({})).toBeUndefined();
+});
+
+it("uses host-specific repository lint feedback adapters", async () => {
+	const lintFeedbackEntrypoint = await import("./lint-feedback.js");
+	const lintFeedbackV2Entrypoint = await import("./lint-feedback-v2.js");
+	const repositoryWrapperUrl = pathToFileURL(
+		path.join(repositoryRoot, ".opencode/plugins/lint-feedback.js"),
+	).href;
+	const repositoryWrapper = await import(repositoryWrapperUrl);
+
+	expect(Object.keys(repositoryWrapper)).toEqual(["default"]);
+	expect(repositoryWrapper.default.id).toBe("codemem-lint-feedback");
+	expect(repositoryWrapper.default.server).toBe(lintFeedbackEntrypoint.default);
+	expect(repositoryWrapper.default.setup).toBe(lintFeedbackV2Entrypoint.default.setup);
 });

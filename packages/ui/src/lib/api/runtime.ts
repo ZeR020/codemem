@@ -2,8 +2,9 @@
  * info, and project list. Kept separate from stats so the tiny
  * readiness ping does not pull in the stats payload helpers. */
 
+import type { ReadRequestOptions } from "../read-request";
 import { fetchJson } from "./internal";
-import type { RuntimeInfo } from "./types";
+import type { RuntimeInfo, ViewerStatus } from "./types";
 
 export async function pingViewerReady(timeoutMs = 1200): Promise<void> {
 	const controller = new AbortController();
@@ -23,7 +24,11 @@ export async function loadRuntimeInfo(): Promise<RuntimeInfo> {
 	return fetchJson("/api/runtime");
 }
 
-export async function loadProjects(): Promise<string[]> {
-	const payload = await fetchJson<{ projects?: string[] }>("/api/projects");
+export function loadViewerStatus(options: ReadRequestOptions = {}): Promise<ViewerStatus> {
+	return fetchJson("/api/viewer-status", options);
+}
+
+export async function loadProjects(options: ReadRequestOptions = {}): Promise<string[]> {
+	const payload = await fetchJson<{ projects?: string[] }>("/api/projects", options);
 	return payload.projects || [];
 }

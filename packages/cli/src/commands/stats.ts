@@ -22,6 +22,27 @@ function fmtTokens(n: number): string {
 	return `${n}`;
 }
 
+function formatUsageEvent(
+	event: ReturnType<MemoryStore["stats"]>["usage"]["events"][number],
+	provenance: ReturnType<MemoryStore["stats"]>["usage"]["provenance"]["events"][number] | undefined,
+): string {
+	const parts = [`${event.event}: ${event.count.toLocaleString()}`];
+	if (event.tokens_read > 0) parts.push(`read ${fmtTokens(event.tokens_read)} tokens`);
+	if (event.tokens_saved > 0) {
+		parts.push(`est. saved ${fmtTokens(event.tokens_saved)} tokens`);
+	}
+	if (provenance?.measured_count) parts.push(`${provenance.measured_count} provider-measured`);
+	if (provenance?.estimated_count) parts.push(`${provenance.estimated_count} estimated`);
+	if (provenance?.unavailable_count) parts.push(`${provenance.unavailable_count} unavailable`);
+	if (provenance?.legacy_text_length_count) {
+		parts.push(`${provenance.legacy_text_length_count} legacy length excluded`);
+	}
+	if (provenance?.legacy_unclassified_count) {
+		parts.push(`${provenance.legacy_unclassified_count} legacy unclassified`);
+	}
+	return `  ${parts.join(", ")}`;
+}
+
 const statsCmd = new Command("stats")
 	.configureHelp(helpStyle)
 	.description("Show database statistics");
@@ -93,12 +114,12 @@ export const statsCommand = statsCmd.action(
 			);
 
 			if (result.usage.events.length > 0) {
-				const lines = result.usage.events.map((e: (typeof result.usage.events)[number]) => {
-					const parts = [`${e.event}: ${e.count.toLocaleString()}`];
-					if (e.tokens_read > 0) parts.push(`read ${fmtTokens(e.tokens_read)} tokens`);
-					if (e.tokens_saved > 0) parts.push(`est. saved ${fmtTokens(e.tokens_saved)} tokens`);
-					return `  ${parts.join(", ")}`;
-				});
+				const provenanceByEvent = new Map(
+					result.usage.provenance.events.map((event) => [event.event, event]),
+				);
+				const lines = result.usage.events.map((event) =>
+					formatUsageEvent(event, provenanceByEvent.get(event.event)),
+				);
 
 				const t = result.usage.totals;
 				lines.push("");

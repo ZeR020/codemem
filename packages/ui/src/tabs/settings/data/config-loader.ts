@@ -3,17 +3,18 @@
  * the result into settingsState + the Preact shell. */
 
 import * as api from "../../../lib/api";
+import type { ReadRequestOptions } from "../../../lib/read-request";
 import { state } from "../../../lib/state";
 import { collectSettingsPayload as collectSettingsPayloadRaw } from "./collect-payload";
 import { PROTECTED_VIEWER_CONFIG_KEYS } from "./constants";
 import { type ConfigPayload, formStateFromPayload } from "./form-state";
 import { isProtectedConfigKey as isProtectedConfigKeyRaw } from "./model-accessors";
 import { settingsState } from "./state";
-import { setDirty, updateRenderState } from "./state-ops";
+import { getSettingsViewState, setDirty, updateRenderState } from "./state-ops";
 import { mergeOverrideBaseline, toProviderList } from "./value-helpers";
 
 export function isSettingsOpen(): boolean {
-	return settingsState.open;
+	return getSettingsViewState().open;
 }
 
 export function isProtectedConfigKey(key: string): boolean {
@@ -24,7 +25,7 @@ export function collectSettingsPayload(
 	options: { allowUntouchedParseErrors?: boolean } = {},
 ): Record<string, unknown> {
 	return collectSettingsPayloadRaw({
-		values: settingsState.renderState.values,
+		values: getSettingsViewState().renderState.values,
 		touchedKeys: settingsState.touchedKeys,
 		baseline: settingsState.baseline,
 		allowUntouchedParseErrors: options.allowUntouchedParseErrors,
@@ -80,13 +81,14 @@ export function renderConfigModal(payload: unknown) {
 	setDirty(false);
 }
 
-export async function loadConfigData() {
-	if (settingsState.open) return;
+export async function loadConfigData(options: ReadRequestOptions = {}) {
+	if (getSettingsViewState().open) return;
 	try {
 		const [payload, status] = await Promise.all([
-			api.loadConfig(),
-			api.loadObserverStatus().catch(() => null),
+			api.loadConfig(options),
+			api.loadObserverStatus(options).catch(() => null),
 		]);
+		if (options.signal?.aborted) return;
 		renderConfigModal(payload);
 		renderObserverStatusBanner(status);
 	} catch {}

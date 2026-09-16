@@ -113,6 +113,10 @@ try {
 	const tarListing = run("tar", ["-tf", packedTarball]).stdout;
 	assert(tarListing.includes("package/index.js"), "Packed artifact is missing index.js");
 	assert(tarListing.includes("package/index.d.ts"), "Packed artifact is missing index.d.ts");
+	assert(tarListing.includes("package/rpc.js"), "Packed artifact is missing rpc.js");
+	assert(tarListing.includes("package/rpc.d.ts"), "Packed artifact is missing rpc.d.ts");
+	assert(tarListing.includes("package/tui.js"), "Packed artifact is missing tui.js");
+	assert(tarListing.includes("package/tui.d.ts"), "Packed artifact is missing tui.d.ts");
 	assert(
 		tarListing.includes("package/.opencode/plugins/codemem.js"),
 		"Packed artifact is missing .opencode/plugins/codemem.js",
@@ -152,6 +156,8 @@ try {
 		existsSync(join(installedPackageRoot, "index.d.ts")),
 		"Installed artifact is missing index.d.ts",
 	);
+	assert(existsSync(join(installedPackageRoot, "rpc.js")), "Installed artifact is missing rpc.js");
+	assert(existsSync(join(installedPackageRoot, "tui.js")), "Installed artifact is missing tui.js");
 	assert(
 		existsSync(join(installedPackageRoot, ".opencode", "plugins", "codemem.js")),
 		"Installed artifact is missing .opencode/plugins/codemem.js",
@@ -180,7 +186,7 @@ try {
 	const typeConsumer = join(installDir, "consumer.ts");
 	writeFileSync(
 		typeConsumer,
-		'import plugin from "@codemem/opencode-plugin";\nplugin.setup({ directory: "/tmp" });\nvoid plugin.server;\n',
+		'import plugin from "@codemem/opencode-plugin";\nimport rpc from "@codemem/opencode-plugin/tui";\nimport { CodememNotifications } from "@codemem/opencode-plugin/rpc";\nplugin.setup({ directory: "/tmp" });\nvoid plugin.server;\nvoid rpc.setup;\nvoid CodememNotifications.id;\n',
 	);
 	run("pnpm", [
 		"exec",
@@ -210,18 +216,22 @@ try {
 		CODEMEM_DB: "",
 		CODEMEM_RUNNER: "node",
 		CODEMEM_RUNNER_FROM: builtCli,
-		CODEMEM_VIEWER: "0",
+		CODEMEM_VIEWER: "1",
+		CODEMEM_VIEWER_AUTO: "0",
+		CODEMEM_VIEWER_AUTO_STOP: "0",
 	};
 	const installedV2Adapter = pathToFileURL(
 		join(installedPackageRoot, ".opencode", "lib", "opencode-v2-adapter.js"),
 	).href;
 	const packedEntrypoint = pathToFileURL(join(installedPackageRoot, "index.js")).href;
+	const packedTuiEntrypoint = pathToFileURL(join(installedPackageRoot, "tui.js")).href;
 	run(
 		process.execPath,
 		[
 			join(packageRoot, "scripts", "packed-v2-adapter-probe.mjs"),
 			packedEntrypoint,
 			installedV2Adapter,
+			packedTuiEntrypoint,
 		],
 		installDir,
 		v2Env,
@@ -251,6 +261,8 @@ try {
 		CODEMEM_BACKEND_UPDATE_POLICY: "off",
 		OPENCODE_SERVER_PASSWORD: randomBytes(32).toString("base64url"),
 	};
+	delete v1Env.OPENCODE_CONFIG;
+	delete v1Env.OPENCODE_CONFIG_DIR;
 	const v1Version = run(opencodeV1, ["--version"], installDir, v1Env).stdout.trim();
 	assert(v1Version === pinnedOpenCodeV1Version, `Unexpected OpenCode 1 host version: ${v1Version}`);
 	const v1Host = await exerciseV1Host(opencodeV1, installDir, v1Env, v1ActivationLog);
@@ -258,6 +270,29 @@ try {
 		v1Host.activated &&
 			readFileSync(v1ActivationLog, "utf8").includes("plugin initialized"),
 		`Pinned OpenCode 1 host did not invoke server() on the installed dual plugin\n${v1Host.output}`,
+	);
+	const checkoutV1Home = join(tempDir, "checkout-v1-home");
+	const checkoutV1ActivationLog = join(tempDir, "checkout-v1-activation.log");
+	mkdirSync(checkoutV1Home, { recursive: true });
+	const checkoutV1Host = await exerciseV1Host(
+		opencodeV1,
+		join(packageRoot, "..", ".."),
+		{
+			...v1Env,
+			HOME: checkoutV1Home,
+			XDG_CONFIG_HOME: join(checkoutV1Home, ".config"),
+			CODEMEM_PLUGIN_LOG: checkoutV1ActivationLog,
+		},
+		checkoutV1ActivationLog,
+	);
+	assert(
+		checkoutV1Host.activated &&
+			readFileSync(checkoutV1ActivationLog, "utf8").includes("plugin initialized"),
+		`Pinned OpenCode 1 host did not activate the checkout dual plugin\n${checkoutV1Host.output}`,
+	);
+	assert(
+		!checkoutV1Host.output.toLowerCase().includes("failed to load plugin"),
+		`Pinned OpenCode 1 host rejected a checkout-local plugin\n${checkoutV1Host.output}`,
 	);
 
 	const brokenPluginRoot = join(tempDir, "broken-plugin");
@@ -276,7 +311,7 @@ try {
 	);
 	assert(
 		!brokenHost.activated && !existsSync(brokenActivationLog),
-		"OpenCode 1 activation check did not reject a sabotaged plugin entrypoint",
+		`OpenCode 1 activation check did not reject a sabotaged plugin entrypoint\nactivated=${brokenHost.activated}\nlog=${existsSync(brokenActivationLog) ? readFileSync(brokenActivationLog, "utf8") : "<missing>"}\n${brokenHost.output}`,
 	);
 
 	const checkoutPluginUrl = pathToFileURL(join(packageRoot, ".opencode", "plugins", "codemem.js")).href;

@@ -81,10 +81,13 @@ let recipientPolicyIntent = emptyRecipientPolicyIntent;
 let recipientPolicyIntentReady = false;
 let openTeamSetup: ((candidateRef: string) => void) | undefined;
 
-function loadTeamSetupSummaryOnce(forceFresh = false): Promise<TeamSetupSummaryResult> {
+function loadTeamSetupSummaryOnce(
+	forceFresh = false,
+	options: { signal?: AbortSignal } = {},
+): Promise<TeamSetupSummaryResult> {
 	if (!forceFresh && teamSetupSummaryInFlight) return teamSetupSummaryInFlight;
 	const request = api
-		.loadLegacyTeamSetupSummary()
+		.loadLegacyTeamSetupSummary(options)
 		.then((summary) => ({ ok: true as const, summary }))
 		.catch(() => ({ ok: false as const }));
 	teamSetupSummaryInFlight = request;
@@ -92,6 +95,15 @@ function loadTeamSetupSummaryOnce(forceFresh = false): Promise<TeamSetupSummaryR
 		if (teamSetupSummaryInFlight === request) teamSetupSummaryInFlight = null;
 	});
 	return request;
+}
+
+function loadRequiredTeamSetupSummary(
+	options: ProjectsDataLoadOptions,
+): Promise<TeamSetupSummaryResult> {
+	return loadTeamSetupSummaryOnce(
+		options.awaitTeamSetupSummary === true || options.requireTeamSetupSummary === true,
+		options,
+	);
 }
 
 function el<T extends HTMLElement>(id: string): T | null {
@@ -1427,16 +1439,32 @@ function refreshProjectCoordinatorGroupNamesInBackground(
 	});
 }
 
-async function loadAllProjectShareChoices(): Promise<ProjectScopeInventoryProject[]> {
+async function loadAllProjectShareChoices(
+	options: { signal?: AbortSignal } = {},
+): Promise<ProjectScopeInventoryProject[]> {
 	const projects = new Map<string, ProjectScopeInventoryProject>();
 	let offset = 0;
 	while (true) {
-		const page = await api.loadProjectScopeInventory({ limit: 250, offset });
+		const page = await api.loadProjectScopeInventory({
+			limit: 250,
+			offset,
+			signal: options.signal,
+		});
 		for (const project of page.projects) projects.set(project.workspace_identity, project);
 		if (!page.has_more) break;
 		offset += page.limit;
 	}
 	return [...projects.values()];
+}
+
+function loadProjectInventoryPage(options: ProjectsDataLoadOptions) {
+	return api.loadProjectScopeInventory({
+		limit: lastLimit,
+		offset: currentOffset,
+		q: el<HTMLInputElement>("projectsSearch")?.value.trim() || undefined,
+		status: el<HTMLSelectElement>("projectsStatusFilter")?.value || undefined,
+		signal: options.signal,
+	});
 }
 
 function mountProjectRecipientManagement(
@@ -1555,7 +1583,9 @@ function recipientPolicyReviewContentMount(mount: HTMLElement): HTMLElement {
 }
 
 export interface ProjectsDataLoadOptions {
+	awaitTeamSetupSummary?: boolean;
 	requireTeamSetupSummary?: boolean;
+	signal?: AbortSignal;
 }
 
 export function loadProjectsData(options: ProjectsDataLoadOptions = {}): Promise<boolean> {
@@ -1568,34 +1598,78 @@ async function supersededProjectsLoad(
 	options: ProjectsDataLoadOptions,
 	teamSetupSummaryPromise: Promise<TeamSetupSummaryResult> | null,
 ): Promise<boolean> {
-	if (!options.requireTeamSetupSummary) return latestProjectsLoad ?? false;
+	if (options.signal?.aborted) return false;
+	if (!options.awaitTeamSetupSummary && !options.requireTeamSetupSummary)
+		return latestProjectsLoad ?? false;
 	await teamSetupSummaryPromise;
+	return false;
+}
+
+function isCurrentProjectsLoad(loadGeneration: number, options: ProjectsDataLoadOptions): boolean {
+	return !options.signal?.aborted && loadGeneration === projectsLoadGeneration;
+}
+
+function waitsForTeamSetupSummary(options: ProjectsDataLoadOptions): boolean {
+	return options.awaitTeamSetupSummary === true || options.requireTeamSetupSummary === true;
+}
+
+async function loadProjectsWithoutInventory(options: ProjectsDataLoadOptions): Promise<boolean> {
+	if (!waitsForTeamSetupSummary(options)) return true;
+	const summary = await loadRequiredTeamSetupSummary(options);
+	if (options.signal?.aborted) return false;
+	return !options.requireTeamSetupSummary || summary.ok;
+}
+
+async function loadProjectsWhileSelectActive(options: ProjectsDataLoadOptions): Promise<boolean> {
+	skippedProjectRefreshForActiveSelect = true;
+	if (!waitsForTeamSetupSummary(options)) return true;
+	const entryLoadGeneration = ++teamSetupEntryLoadGeneration;
+	// Completion refresh must remove the setup card without replacing the
+	// focused Space select or moving the user's cursor in Project inventory.
+	const teamSetupSummary = await loadRequiredTeamSetupSummary(options);
+	if (options.signal?.aborted || entryLoadGeneration !== teamSetupEntryLoadGeneration) return false;
+	const reviewMount = el<HTMLDivElement>("recipientPolicyReviewMount");
+	if (!teamSetupSummary.ok) {
+		if (reviewMount) markProjectTeamSetupEntryUnavailable(reviewMount);
+		return !options.requireTeamSetupSummary;
+	}
+	if (reviewMount) renderProjectTeamSetupEntry(reviewMount, teamSetupSummary.summary);
+	return true;
+}
+
+function finishProjectsLoad(input: {
+	entryLoadGeneration: number;
+	loadGeneration: number;
+	options: ProjectsDataLoadOptions;
+	requiredLoadSucceeded: boolean;
+	teamSetupSummaryPromise: Promise<TeamSetupSummaryResult>;
+}): boolean | Promise<boolean> {
+	if (!waitsForTeamSetupSummary(input.options)) return input.requiredLoadSucceeded;
+	return input.teamSetupSummaryPromise.then((teamSetupSummary) => {
+		if (
+			!isCurrentProjectsLoad(input.loadGeneration, input.options) ||
+			input.entryLoadGeneration !== teamSetupEntryLoadGeneration
+		)
+			return false;
+		return (
+			input.requiredLoadSucceeded && (!input.options.requireTeamSetupSummary || teamSetupSummary.ok)
+		);
+	});
+}
+
+async function finishFailedProjectsLoad(
+	options: ProjectsDataLoadOptions,
+	teamSetupSummaryPromise: Promise<TeamSetupSummaryResult> | null,
+): Promise<false> {
+	if (waitsForTeamSetupSummary(options)) await teamSetupSummaryPromise;
 	return false;
 }
 
 async function loadProjectsDataOperation(options: ProjectsDataLoadOptions): Promise<boolean> {
 	const meta = el<HTMLDivElement>("projectsInventoryMeta");
 	const list = el<HTMLDivElement>("projectsInventoryList");
-	if (!meta || !list) {
-		if (!options.requireTeamSetupSummary) return true;
-		return (await loadTeamSetupSummaryOnce(true)).ok;
-	}
-	if (isProjectSpaceSelectActive()) {
-		skippedProjectRefreshForActiveSelect = true;
-		if (!options.requireTeamSetupSummary) return true;
-		const entryLoadGeneration = ++teamSetupEntryLoadGeneration;
-		// Completion refresh must remove the setup card without replacing the
-		// focused Space select or moving the user's cursor in Project inventory.
-		const teamSetupSummary = await loadTeamSetupSummaryOnce(true);
-		if (entryLoadGeneration !== teamSetupEntryLoadGeneration) return false;
-		const reviewMount = el<HTMLDivElement>("recipientPolicyReviewMount");
-		if (!teamSetupSummary.ok) {
-			if (reviewMount) markProjectTeamSetupEntryUnavailable(reviewMount);
-			return false;
-		}
-		if (reviewMount) renderProjectTeamSetupEntry(reviewMount, teamSetupSummary.summary);
-		return true;
-	}
+	if (!meta || !list) return loadProjectsWithoutInventory(options);
+	if (isProjectSpaceSelectActive()) return loadProjectsWhileSelectActive(options);
 	skippedProjectRefreshForActiveSelect = false;
 	const loadGeneration = ++projectsLoadGeneration;
 	projectShareInventoryReady = false;
@@ -1605,29 +1679,24 @@ async function loadProjectsDataOperation(options: ProjectsDataLoadOptions): Prom
 	let teamSetupSummaryPromise: Promise<TeamSetupSummaryResult> | null = null;
 	try {
 		const entryLoadGeneration = ++teamSetupEntryLoadGeneration;
-		teamSetupSummaryPromise = loadTeamSetupSummaryOnce(options.requireTeamSetupSummary === true);
+		teamSetupSummaryPromise = loadRequiredTeamSetupSummary(options);
 		const [result, settings, shareInventory, recipientPolicyReview, intentResult] =
 			await Promise.all([
-				api.loadProjectScopeInventory({
-					limit: lastLimit,
-					offset: currentOffset,
-					q: el<HTMLInputElement>("projectsSearch")?.value.trim() || undefined,
-					status: el<HTMLSelectElement>("projectsStatusFilter")?.value || undefined,
-				}),
-				api.loadSharingDomainSettings(),
-				loadAllProjectShareChoices()
+				loadProjectInventoryPage(options),
+				api.loadSharingDomainSettings(options),
+				loadAllProjectShareChoices(options)
 					.then((projects) => ({ ok: true as const, projects }))
 					.catch(() => ({ ok: false as const, projects: [] as ProjectScopeInventoryProject[] })),
 				api
-					.loadRecipientPolicyReview()
+					.loadRecipientPolicyReview(options)
 					.then((review) => ({ ok: true as const, review }))
 					.catch((error: unknown) => ({ ok: false as const, error })),
 				api
-					.loadRecipientPolicyIntent()
+					.loadRecipientPolicyIntent(options)
 					.then((intent) => ({ ok: true as const, intent }))
 					.catch((error: unknown) => ({ ok: false as const, error })),
 			]);
-		if (loadGeneration !== projectsLoadGeneration) {
+		if (!isCurrentProjectsLoad(loadGeneration, options)) {
 			return supersededProjectsLoad(options, teamSetupSummaryPromise);
 		}
 		scopes = settings.scopes;
@@ -1676,7 +1745,7 @@ async function loadProjectsDataOperation(options: ProjectsDataLoadOptions): Prom
 		// resolved promise as proof that a completed setup card has disappeared.
 		void teamSetupSummaryPromise.then((teamSetupSummary) => {
 			if (
-				loadGeneration !== projectsLoadGeneration ||
+				!isCurrentProjectsLoad(loadGeneration, options) ||
 				entryLoadGeneration !== teamSetupEntryLoadGeneration
 			)
 				return;
@@ -1690,16 +1759,15 @@ async function loadProjectsDataOperation(options: ProjectsDataLoadOptions): Prom
 		});
 		const requiredLoadSucceeded =
 			shareInventory.ok && "review" in recipientPolicyReview && intentResult.ok;
-		if (!options.requireTeamSetupSummary) return requiredLoadSucceeded;
-		const teamSetupSummary = await teamSetupSummaryPromise;
-		if (
-			loadGeneration !== projectsLoadGeneration ||
-			entryLoadGeneration !== teamSetupEntryLoadGeneration
-		)
-			return false;
-		return requiredLoadSucceeded && teamSetupSummary.ok;
+		return finishProjectsLoad({
+			entryLoadGeneration,
+			loadGeneration,
+			options,
+			requiredLoadSucceeded,
+			teamSetupSummaryPromise,
+		});
 	} catch (error) {
-		if (loadGeneration !== projectsLoadGeneration) {
+		if (!isCurrentProjectsLoad(loadGeneration, options)) {
 			return supersededProjectsLoad(options, teamSetupSummaryPromise);
 		}
 		projectInventoryByIdentity.clear();
@@ -1713,7 +1781,7 @@ async function loadProjectsDataOperation(options: ProjectsDataLoadOptions): Prom
 		hideProjectInventorySkeleton();
 		meta.textContent = "Project inventory failed to load.";
 		renderEmpty(error instanceof Error ? error.message : "Unable to load project inventory.");
-		return false;
+		return finishFailedProjectsLoad(options, teamSetupSummaryPromise);
 	}
 }
 

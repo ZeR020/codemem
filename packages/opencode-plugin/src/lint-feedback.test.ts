@@ -1,8 +1,11 @@
-import { readFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
 	compareDiagnostics,
+	createLintFeedbackController,
+	createWorktreeLintFeedbackController,
 	getTouchedPaths,
 	type LintDiagnostic,
 	parseApplyPatchPaths,
@@ -212,8 +215,163 @@ describe("lint feedback scope and measurements", () => {
 		expect(getTouchedPaths("apply_patch", { patchText: patch }, repositoryRoot)).toEqual([
 			"packages/core/src/example.ts",
 		]);
+		expect(getTouchedPaths("patch", { patchText: patch }, repositoryRoot)).toEqual([
+			"packages/core/src/example.ts",
+		]);
+	});
+});
+
+describe("lint feedback lifecycle", () => {
+	it("keeps concurrent call snapshots isolated", async () => {
+		const diagnostics = new Map<string, LintDiagnostic[]>();
+		const controller = createLintFeedbackController({
+			worktree: repositoryRoot,
+			command: ["unused"],
+			timeoutMs: 1,
+			fileExists: async () => true,
+			runDiagnostics: async (relativePath) => diagnostics.get(relativePath) ?? [],
+		});
+		const first = {
+			tool: "edit",
+			sessionID: "session-a",
+			callID: "call-a",
+			args: { path: "packages/core/src/a.ts" },
+		};
+		const second = {
+			...first,
+			callID: "call-b",
+			args: { path: "packages/core/src/b.ts" },
+		};
+		await Promise.all([controller.before(first), controller.before(second)]);
+		diagnostics.set("packages/core/src/a.ts", [
+			{ category: "lint/a", description: "first regression", line: 1 },
+		]);
+		diagnostics.set("packages/core/src/b.ts", [
+			{ category: "lint/b", description: "second regression", line: 2 },
+		]);
+
+		expect(await controller.after(second)).toContain("second regression");
+		expect(await controller.after(first)).toContain("first regression");
 	});
 
+	it("preserves edits and warns once per session after timeout", async () => {
+		const worktree = await mkdtemp(path.join(tmpdir(), "codemem-lint-feedback-"));
+		const relativePath = "packages/core/src/example.ts";
+		await mkdir(path.join(worktree, path.dirname(relativePath)), { recursive: true });
+		await writeFile(path.join(worktree, relativePath), "export const value = 1;\n", "utf8");
+		const controller = createWorktreeLintFeedbackController(worktree, {
+			command: [process.execPath, "-e", "setTimeout(() => {}, 1000)"],
+			timeoutMs: 20,
+		});
+		expect(controller).toBeDefined();
+		const invocation = {
+			tool: "write",
+			sessionID: "session-a",
+			callID: "call-a",
+			args: { path: relativePath },
+		};
+
+		await controller?.before(invocation);
+		expect(await controller?.after(invocation)).toContain("edit was preserved");
+		await controller?.before({ ...invocation, callID: "call-b" });
+		expect(await controller?.after({ ...invocation, callID: "call-b" })).toBeUndefined();
+		await controller?.dispose();
+		await rm(worktree, { recursive: true, force: true });
+	});
+
+	it("makes in-flight capture inert after disposal", async () => {
+		const entered = Promise.withResolvers<void>();
+		let release: (() => void) | undefined;
+		const blocked = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const runDiagnostics = vi.fn(async () => []);
+		const controller = createLintFeedbackController({
+			worktree: repositoryRoot,
+			command: ["unused"],
+			timeoutMs: 1,
+			fileExists: async () => {
+				entered.resolve();
+				await blocked;
+				return true;
+			},
+			runDiagnostics,
+		});
+		const invocation = {
+			tool: "edit",
+			sessionID: "session-a",
+			callID: "call-a",
+			args: { path: "packages/core/src/a.ts" },
+		};
+		const capture = controller.before(invocation);
+		await entered.promise;
+		await controller.dispose();
+		release?.();
+		await capture;
+
+		expect(runDiagnostics).not.toHaveBeenCalled();
+		expect(await controller.after(invocation)).toBeUndefined();
+	});
+});
+
+describe("lint feedback subprocess ownership", () => {
+	it("disposes only subprocesses owned by one controller", async () => {
+		const worktrees = await Promise.all([
+			mkdtemp(path.join(tmpdir(), "codemem-lint-owner-a-")),
+			mkdtemp(path.join(tmpdir(), "codemem-lint-owner-b-")),
+		]);
+		const relativePath = "packages/core/src/example.ts";
+		const markers = worktrees.map((worktree) => path.join(worktree, "started"));
+		const report = JSON.stringify({
+			summary: { errors: 0, warnings: 0, infos: 0, diagnosticsNotPrinted: 0 },
+			diagnostics: [],
+		});
+		const script =
+			'const fs=require("node:fs");fs.writeFileSync(process.argv[1],"started");' +
+			`setTimeout(()=>console.log(${JSON.stringify(report)}),200);`;
+		try {
+			await Promise.all(
+				worktrees.map(async (worktree) => {
+					await mkdir(path.join(worktree, path.dirname(relativePath)), { recursive: true });
+					await writeFile(path.join(worktree, relativePath), "export const value = 1;\n", "utf8");
+				}),
+			);
+			const controllers = worktrees.map((worktree, index) =>
+				createWorktreeLintFeedbackController(worktree, {
+					command: [process.execPath, "-e", script, markers[index] ?? ""],
+					timeoutMs: 2_000,
+				}),
+			);
+			const invocation = {
+				tool: "edit",
+				sessionID: "session-a",
+				callID: "call-a",
+				args: { path: relativePath },
+			};
+			const captures = controllers.map((controller) => controller?.before(invocation));
+			await Promise.all(
+				markers.map(async (marker) => {
+					for (let attempt = 0; attempt < 100; attempt += 1) {
+						if (await readFile(marker, "utf8").catch(() => undefined)) return;
+						await new Promise((resolve) => setTimeout(resolve, 10));
+					}
+					throw new Error(`Lint subprocess did not start: ${path.basename(marker)}`);
+				}),
+			);
+			await controllers[0]?.dispose();
+			await Promise.all(captures);
+
+			expect(await controllers[1]?.after(invocation)).toBeUndefined();
+			await controllers[1]?.dispose();
+		} finally {
+			await Promise.all(
+				worktrees.map((worktree) => rm(worktree, { recursive: true, force: true })),
+			);
+		}
+	});
+});
+
+describe("lint feedback configured paths", () => {
 	it("admits only source paths represented by the mirrored Biome includes", async () => {
 		const biome = JSON.parse(await readFile(path.join(repositoryRoot, "biome.json"), "utf8"));
 		const sourceIncludes = biome.files.includes.filter(
@@ -224,6 +382,9 @@ describe("lint feedback scope and measurements", () => {
 			"packages/**/src/**/*.ts",
 			"packages/**/src/**/*.tsx",
 			"packages/**/src/**/*.js",
+			"packages/opencode-plugin/.opencode/lib/**/*.js",
+			"packages/opencode-plugin/.opencode/plugins/**/*.js",
+			".opencode/plugins/**/*.js",
 			"packages/**/vite.config.ts",
 			"plugins/claude/scripts/ingest-hook.mjs",
 			"plugins/claude/scripts/user-prompt-hook.mjs",
@@ -238,6 +399,22 @@ describe("lint feedback scope and measurements", () => {
 		expect(resolveWorktreePath(repositoryRoot, "packages/core/src/example.ts")).toBe(
 			"packages/core/src/example.ts",
 		);
+		expect(
+			resolveWorktreePath(repositoryRoot, "packages/opencode-plugin/.opencode/lib/runtime.js"),
+		).toBe("packages/opencode-plugin/.opencode/lib/runtime.js");
+		expect(
+			resolveWorktreePath(repositoryRoot, "packages/opencode-plugin/.opencode/plugins/codemem.js"),
+		).toBe("packages/opencode-plugin/.opencode/plugins/codemem.js");
+		expect(resolveWorktreePath(repositoryRoot, ".opencode/plugins/codemem.js")).toBe(
+			".opencode/plugins/codemem.js",
+		);
+		expect(
+			getTouchedPaths(
+				"edit",
+				{ path: "packages/opencode-plugin/.opencode/lib/runtime.js" },
+				repositoryRoot,
+			),
+		).toEqual(["packages/opencode-plugin/.opencode/lib/runtime.js"]);
 		expect(resolveWorktreePath(repositoryRoot, "scripts/example.ts")).toBeUndefined();
 		expect(resolveWorktreePath(repositoryRoot, "scripts/ci-workflow.test.mjs")).toBe(
 			"scripts/ci-workflow.test.mjs",

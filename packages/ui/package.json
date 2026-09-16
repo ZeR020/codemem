@@ -8,9 +8,11 @@
 		"build": "vite build --mode production && node ./scripts/stage-viewer-static.mjs --precompress",
 		"build:watch": "node ./scripts/stage-viewer-static.mjs && vite build --watch --mode development",
 		"test": "pnpm exec vitest run",
-		"typecheck": "tsc -p tsconfig.json --noEmit"
+		"typecheck": "tsc -p tsconfig.json --noEmit",
+		"typecheck:health-strict": "tsc -p tsconfig.health-strict.json --noEmit"
 	},
 	"dependencies": {
+		"@codemem/core": "workspace:^",
 		"@preact/signals": "^2.11.1",
 		"@radix-ui/react-collapsible": "^1.1.20",
 		"@radix-ui/react-dialog": "^1.1.23",

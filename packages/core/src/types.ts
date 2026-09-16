@@ -188,9 +188,9 @@ export interface UsageEvent {
 	id: number;
 	session_id: number | null;
 	event: string;
-	tokens_read: number;
-	tokens_written: number;
-	tokens_saved: number;
+	tokens_read: number | null;
+	tokens_written: number | null;
+	tokens_saved: number | null;
 	created_at: string;
 	metadata_json: string | null;
 }
@@ -529,6 +529,17 @@ export interface UsageEventRow {
 	tokens_saved: number;
 }
 
+export interface TokenUsageProvenance {
+	token_unit: "tokens";
+	measured_count: number;
+	estimated_count: number;
+	unavailable_count: number;
+	legacy_text_length_count: number;
+	legacy_unclassified_count: number;
+}
+
+export interface ClassifiedUsageEventRow extends UsageEventRow, TokenUsageProvenance {}
+
 export interface StoreStats {
 	identity: {
 		device_id: string;
@@ -555,6 +566,10 @@ export interface StoreStats {
 			tokens_read: number;
 			tokens_written: number;
 			tokens_saved: number;
+		};
+		provenance: {
+			events: Array<Pick<ClassifiedUsageEventRow, "event" | keyof TokenUsageProvenance>>;
+			totals: TokenUsageProvenance;
 		};
 	};
 }

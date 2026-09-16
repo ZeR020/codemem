@@ -9,6 +9,7 @@ const mocks = vi.hoisted(() => ({
 	loadDeviceIdentityInventory: vi.fn(),
 	loadLegacyTeamSetupDetail: vi.fn(),
 	loadHealthData: vi.fn(),
+	refreshViewerStatus: vi.fn(),
 	loadProjectsData: vi.fn(),
 	loadRecipientPolicyIntent: vi.fn(),
 	loadRecipientPolicyReconciliationStatus: vi.fn(),
@@ -56,6 +57,8 @@ vi.mock("./tabs/feed", () => ({
 vi.mock("./tabs/health", () => ({
 	initHealthTab: vi.fn(),
 	loadHealthData: mocks.loadHealthData,
+	markHealthStatusUnchecked: vi.fn(),
+	refreshViewerStatus: mocks.refreshViewerStatus,
 }));
 vi.mock("./tabs/legacy-team-setup-dialog", () => ({
 	mountLegacyTeamSetupDialog: mocks.mountLegacyTeamSetupDialog,
@@ -167,7 +170,7 @@ async function verifyRestorationWaitsForQueuedActiveTabRefresh(): Promise<void> 
 	const { state } = await import("./lib/state");
 	const connectionEvents = await import("./components/diagnostics/viewer-connection-events");
 	connectionEvents.resetViewerConnectionEventsForTests();
-	mocks.loadHealthData.mockRejectedValueOnce(new Error("viewer unavailable"));
+	mocks.refreshViewerStatus.mockRejectedValueOnce(new Error("viewer unavailable"));
 	mocks.pingViewerReady.mockRejectedValueOnce(new Error("viewer unavailable"));
 
 	await act(async () => {
@@ -216,7 +219,7 @@ async function verifyHealthRestorationWaitsForSyncRefresh(): Promise<void> {
 	const connectionEvents = await import("./components/diagnostics/viewer-connection-events");
 	connectionEvents.resetViewerConnectionEventsForTests();
 	state.activeTab = "health";
-	mocks.loadHealthData.mockRejectedValueOnce(new Error("viewer unavailable"));
+	mocks.refreshViewerStatus.mockRejectedValueOnce(new Error("viewer unavailable"));
 	mocks.pingViewerReady.mockRejectedValueOnce(new Error("viewer unavailable"));
 
 	await act(async () => {
@@ -230,10 +233,13 @@ async function verifyHealthRestorationWaitsForSyncRefresh(): Promise<void> {
 	await act(async () => {
 		await vi.advanceTimersByTimeAsync(1_600);
 	});
-	expect(mocks.loadSyncData).toHaveBeenLastCalledWith({
-		requiredSurface: "health",
-		requireFreshSyncStatus: true,
-	});
+	expect(mocks.loadSyncData).toHaveBeenLastCalledWith(
+		expect.objectContaining({
+			requiredSurface: "health",
+			requireFreshSyncStatus: true,
+			signal: expect.any(AbortSignal),
+		}),
+	);
 	expect(connectionEvents.getViewerConnectionEvents().map((event) => event.code)).not.toContain(
 		"viewer_connection_restored",
 	);
@@ -249,7 +255,7 @@ async function verifyHealthRestorationWaitsForSyncRefresh(): Promise<void> {
 async function verifyDevicesRestorationWaitsForSyncRefresh(): Promise<void> {
 	const connectionEvents = await import("./components/diagnostics/viewer-connection-events");
 	connectionEvents.resetViewerConnectionEventsForTests();
-	mocks.loadHealthData.mockRejectedValueOnce(new Error("viewer unavailable"));
+	mocks.refreshViewerStatus.mockRejectedValueOnce(new Error("viewer unavailable"));
 	mocks.pingViewerReady.mockRejectedValueOnce(new Error("viewer unavailable"));
 
 	await act(async () => {
@@ -282,7 +288,7 @@ async function verifyPairingRestorationWaitsForRefresh(): Promise<void> {
 	state.activeTab = "advanced";
 	state.advancedSection = "sync";
 	state.syncPairingOpen = true;
-	mocks.loadHealthData.mockRejectedValueOnce(new Error("viewer unavailable"));
+	mocks.refreshViewerStatus.mockRejectedValueOnce(new Error("viewer unavailable"));
 	mocks.pingViewerReady.mockRejectedValueOnce(new Error("viewer unavailable"));
 
 	await act(async () => {
@@ -309,7 +315,7 @@ async function verifyHiddenPairingFailureDoesNotBlockRestoration(): Promise<void
 	const connectionEvents = await import("./components/diagnostics/viewer-connection-events");
 	connectionEvents.resetViewerConnectionEventsForTests();
 	state.syncPairingOpen = true;
-	mocks.loadHealthData.mockRejectedValueOnce(new Error("viewer unavailable"));
+	mocks.refreshViewerStatus.mockRejectedValueOnce(new Error("viewer unavailable"));
 	mocks.pingViewerReady.mockRejectedValueOnce(new Error("viewer unavailable"));
 
 	await act(async () => {
@@ -329,7 +335,7 @@ async function verifyHiddenPairingFailureDoesNotBlockRestoration(): Promise<void
 async function verifyDevicesRestorationIgnoresAuxiliarySyncFailures(): Promise<void> {
 	const connectionEvents = await import("./components/diagnostics/viewer-connection-events");
 	connectionEvents.resetViewerConnectionEventsForTests();
-	mocks.loadHealthData.mockRejectedValueOnce(new Error("viewer unavailable"));
+	mocks.refreshViewerStatus.mockRejectedValueOnce(new Error("viewer unavailable"));
 	mocks.pingViewerReady.mockRejectedValueOnce(new Error("viewer unavailable"));
 
 	await act(async () => {
@@ -338,7 +344,12 @@ async function verifyDevicesRestorationIgnoresAuxiliarySyncFailures(): Promise<v
 	await act(async () => {
 		await vi.advanceTimersByTimeAsync(1_600);
 	});
-	expect(mocks.loadSyncData).toHaveBeenLastCalledWith({ requiredSurface: "devices" });
+	expect(mocks.loadSyncData).toHaveBeenLastCalledWith(
+		expect.objectContaining({
+			requiredSurface: "devices",
+			signal: expect.any(AbortSignal),
+		}),
+	);
 	expect(connectionEvents.getViewerConnectionEvents().map((event) => event.code)).toContain(
 		"viewer_connection_restored",
 	);
@@ -372,6 +383,7 @@ async function setupDevicesAppTest() {
 	mocks.loadCoordinatorAdminData.mockResolvedValue(true);
 	mocks.loadPairingData.mockResolvedValue(true);
 	mocks.loadHealthData.mockResolvedValue(undefined);
+	mocks.refreshViewerStatus.mockResolvedValue(undefined);
 	mocks.loadSyncStatus.mockResolvedValue({});
 	mocks.pingViewerReady.mockResolvedValue(true);
 	mocks.loadLegacyTeamSetupDetail.mockResolvedValue({
@@ -451,14 +463,16 @@ async function setupDevicesAppTest() {
 	});
 }
 
+function teardownDevicesAppTest() {
+	vi.clearAllTimers();
+	vi.useRealTimers();
+	document.body.innerHTML = "";
+	window.location.hash = "";
+}
+
 describe("Devices app integration", () => {
 	beforeEach(setupDevicesAppTest);
-	afterEach(() => {
-		vi.clearAllTimers();
-		vi.useRealTimers();
-		document.body.innerHTML = "";
-		window.location.hash = "";
-	});
+	afterEach(teardownDevicesAppTest);
 
 	it("refreshes read-only inputs, routes actions canonically, and preserves polling focus", async () => {
 		const panel = document.getElementById("tab-devices");
@@ -517,20 +531,6 @@ describe("Devices app integration", () => {
 		expect(document.activeElement).toBe(
 			document.getElementById("coordinatorAdminLegacyNoticeTitle"),
 		);
-	});
-
-	it("opens the global Team setup dialog from Projects without changing tabs", async () => {
-		const { initProjectsTab } = await import("./tabs/projects");
-		const { openLegacyTeamSetup } = await import("./tabs/legacy-team-setup-dialog");
-		const options = vi.mocked(initProjectsTab).mock.calls[0]?.[1];
-		expect(options?.onOpenTeamSetup).toEqual(expect.any(Function));
-
-		act(() => options?.onOpenTeamSetup?.("opaque-candidate-ref"));
-		await Promise.resolve();
-
-		expect(openLegacyTeamSetup).toHaveBeenCalledWith("opaque-candidate-ref");
-		expect(window.location.hash).toBe("#devices");
-		expect(document.getElementById("tab-devices")?.hidden).toBe(false);
 	});
 
 	it("refreshes Sharing and Projects with the active surface mounting last", async () => {
@@ -773,7 +773,7 @@ describe("Devices app integration", () => {
 	it("records restoration only after the active Devices refresh succeeds", async () => {
 		const connectionEvents = await import("./components/diagnostics/viewer-connection-events");
 		connectionEvents.resetViewerConnectionEventsForTests();
-		mocks.loadHealthData.mockRejectedValueOnce(new Error("viewer unavailable"));
+		mocks.refreshViewerStatus.mockRejectedValueOnce(new Error("viewer unavailable"));
 		mocks.pingViewerReady.mockRejectedValueOnce(new Error("viewer unavailable"));
 
 		await act(async () => {
@@ -821,7 +821,7 @@ describe("Devices app integration", () => {
 			connectionEvents.resetViewerConnectionEventsForTests();
 			state.activeTab = "advanced";
 			state.advancedSection = advancedSection;
-			mocks.loadHealthData.mockRejectedValueOnce(new Error("viewer unavailable"));
+			mocks.refreshViewerStatus.mockRejectedValueOnce(new Error("viewer unavailable"));
 			mocks.pingViewerReady.mockRejectedValueOnce(new Error("viewer unavailable"));
 
 			await act(async () => {
@@ -937,5 +937,56 @@ describe("Devices app integration", () => {
 		});
 
 		expect(document.activeElement).toBe(healthTab);
+	});
+});
+
+describe("Viewer behavior contracts", () => {
+	beforeEach(setupDevicesAppTest);
+	afterEach(teardownDevicesAppTest);
+
+	it("opens the global Team setup dialog from Sharing and Projects without changing tabs", async () => {
+		const { createRecipientPolicySharingLoader } = await import("./app-sharing");
+		const { initProjectsTab } = await import("./tabs/projects");
+		const { openLegacyTeamSetup } = await import("./tabs/legacy-team-setup-dialog");
+		const projectOptions = vi.mocked(initProjectsTab).mock.calls[0]?.[1];
+		const sharingOptions = vi.mocked(createRecipientPolicySharingLoader).mock.calls[0]?.[1];
+		expect(projectOptions?.onOpenTeamSetup).toEqual(expect.any(Function));
+		expect(sharingOptions?.onOpenTeamSetup).toEqual(expect.any(Function));
+
+		act(() => document.getElementById("tabBtn-sharing")?.click());
+		await Promise.resolve();
+		act(() => sharingOptions?.onOpenTeamSetup?.("sharing-candidate-ref"));
+		expect(window.location.hash).toBe("#sharing");
+		expect(document.getElementById("tab-sharing")?.hidden).toBe(false);
+
+		act(() => document.getElementById("tabBtn-projects")?.click());
+		await Promise.resolve();
+		act(() => projectOptions?.onOpenTeamSetup?.("project-candidate-ref"));
+		expect(window.location.hash).toBe("#projects");
+		expect(document.getElementById("tab-projects")?.hidden).toBe(false);
+
+		expect(openLegacyTeamSetup).toHaveBeenNthCalledWith(1, "sharing-candidate-ref");
+		expect(openLegacyTeamSetup).toHaveBeenNthCalledWith(2, "project-candidate-ref");
+	});
+
+	it("routes legacy upgrade review actions to Advanced Sync and Projects", async () => {
+		const sharingReview = document.getElementById("syncSharingReview") as HTMLElement | null;
+		if (!sharingReview) throw new Error("Legacy Sharing review destination missing");
+		sharingReview.scrollIntoView = vi.fn();
+
+		act(() => document.getElementById("legacyUpgradeReviewGroups")?.click());
+		await act(async () => {
+			await vi.advanceTimersByTimeAsync(120);
+		});
+		expect(window.location.hash).toBe("#sync");
+		expect(document.getElementById("advancedSyncContent")?.hidden).toBe(false);
+		expect(sharingReview.scrollIntoView).toHaveBeenCalledWith({ block: "start" });
+
+		act(() => document.getElementById("legacyUpgradeReviewProjects")?.click());
+		await act(async () => {
+			await vi.advanceTimersByTimeAsync(0);
+		});
+		expect(window.location.hash).toBe("#projects");
+		expect(document.getElementById("tab-projects")?.hidden).toBe(false);
 	});
 });

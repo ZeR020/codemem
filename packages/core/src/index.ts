@@ -5,7 +5,7 @@
  * and type definitions shared across the codemem TS backend.
  */
 
-export const VERSION = "0.44.0";
+export const VERSION = "0.45.0";
 
 export * as Api from "./api-types.js";
 export { extractApplyPatchPaths, MUTATING_TOOL_NAMES } from "./apply-patch.js";
@@ -630,13 +630,17 @@ export {
 } from "./observer-client.js";
 export * from "./observer-concepts.js";
 export type {
+	CodememConfigMutationResult,
+	CodememConfigReadOutcome,
 	ConfigPathResolution,
 	ConfigPathSource,
 	ConfigResolutionResult,
 } from "./observer-config.js";
 export {
 	CODEMEM_CONFIG_ENV_OVERRIDES,
+	CodememConfigMutationError,
 	coerceObserverCommand,
+	deleteCodememConfigFile,
 	getCodememConfigPath,
 	getCodememEnvOverrides,
 	getOpenCodeProviderConfig,
@@ -650,8 +654,10 @@ export {
 	listCustomProviders,
 	listObserverProviderOptions,
 	loadOpenCodeConfig,
+	mutateCodememConfigFile,
 	readCodememConfigFile,
 	readCodememConfigFileAtPath,
+	readCodememConfigFileForMutation,
 	readWorkspaceCodememConfigFile,
 	resolveBuiltInProviderDefaultModel,
 	resolveBuiltInProviderFromModel,
@@ -790,6 +796,18 @@ export type {
 	RecipientPolicyAuthorityV1,
 	RecipientPolicyBlockedItemV1,
 	RecipientPolicyContractVersion,
+	RecipientPolicyEdgeChangeV1,
+	RecipientPolicyEdgeCommitOutcomeV1,
+	RecipientPolicyEdgeCommitRequestV1,
+	RecipientPolicyEdgeCommitResultV1,
+	RecipientPolicyEdgeEffectiveDeviceV1,
+	RecipientPolicyEdgeIdentitySummaryV1,
+	RecipientPolicyEdgeOutcomeV1,
+	RecipientPolicyEdgePreviewProjectV1,
+	RecipientPolicyEdgePreviewRequestV1,
+	RecipientPolicyEdgePreviewResponseV1,
+	RecipientPolicyEdgeRecipientRefV1,
+	RecipientPolicyEdgeSelectedRecipientV1,
 	RecipientPolicyEffectiveDeviceV1,
 	RecipientPolicyEnforcementV1,
 	RecipientPolicyIdentityDeviceV1,
@@ -810,23 +828,14 @@ export type {
 	RecipientPolicyReviewPreviewV1,
 	RecipientPolicyReviewResolutionV1,
 	RecipientPolicyTeamMembershipV1,
+	RecipientPolicyTeamRenameErrorCode,
+	RecipientPolicyTeamRenameResultV1,
 	RecipientPolicyTeamV1,
 } from "./recipient-policy-contract.js";
-export { RECIPIENT_POLICY_CONTRACT_VERSION } from "./recipient-policy-contract.js";
-export type {
-	RecipientPolicyEdgeChangeV1,
-	RecipientPolicyEdgeCommitOutcomeV1,
-	RecipientPolicyEdgeCommitRequestV1,
-	RecipientPolicyEdgeCommitResultV1,
-	RecipientPolicyEdgeEffectiveDeviceV1,
-	RecipientPolicyEdgeIdentitySummaryV1,
-	RecipientPolicyEdgeOutcomeV1,
-	RecipientPolicyEdgePreviewProjectV1,
-	RecipientPolicyEdgePreviewRequestV1,
-	RecipientPolicyEdgePreviewResponseV1,
-	RecipientPolicyEdgeRecipientRefV1,
-	RecipientPolicyEdgeSelectedRecipientV1,
-} from "./recipient-policy-edges.js";
+export {
+	RECIPIENT_POLICY_CONTRACT_VERSION,
+	RECIPIENT_POLICY_TEAM_RENAME_ERROR_CODES,
+} from "./recipient-policy-contract.js";
 export {
 	commitRecipientPolicyEdges,
 	parseRecipientPolicyEdgeCommitRequest,
@@ -945,11 +954,7 @@ export {
 	resolveRecipientPolicyReview,
 	resolveRecipientPolicyReviewBulk,
 } from "./recipient-policy-review.js";
-export type {
-	ConfiguredCoordinatorGroupV1,
-	RecipientPolicyTeamRenameErrorCode,
-	RecipientPolicyTeamRenameResultV1,
-} from "./recipient-policy-team-metadata.js";
+export type { ConfiguredCoordinatorGroupV1 } from "./recipient-policy-team-metadata.js";
 export {
 	claimRecipientPolicyActorMutations,
 	claimRecipientPolicyPublicationMutation,

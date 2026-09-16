@@ -5,23 +5,16 @@
  * Ports the `ingest()` function from codemem/plugin_ingest.py.
  *
  * Pipeline stages:
- * 1. Extract session context, events, cwd
- * 2. Create/find session in store
- * 3. Extract prompts, tool events, assistant messages
- * 4. Build transcript
- * 5. Budget tool events
- * 6. Build observer context + prompt
- * 7. Call observer LLM via ObserverClient.observe()
- * 8. Parse XML response
- * 9. Filter low-signal observations
- * 10. Persist observations as memories
- * 11. Persist session summary
- * 12. End session
+ * 1. Create or reuse the session.
+ * 2. Prepare normalized events and observer context.
+ * 3. Select and invoke the observer.
+ * 4. Build and atomically persist a memory/usage plan.
+ * 5. Write vectors after commit and end the session.
  */
 
 import { and, eq, isNull, lt } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/better-sqlite3";
-import { boundedDelegatedBriefs } from "./capture-context.js";
+import { boundedDelegatedBriefs, partitionDelegatedBriefEvents } from "./capture-context.js";
 import { normalizeProjectLabel } from "./claude-hooks.js";
 import { fromJson, toJson } from "./db.js";
 import {
@@ -57,13 +50,25 @@ import type {
 } from "./ingest-types.js";
 import { hasMeaningfulObservation } from "./ingest-xml-parser.js";
 import { REMEMBER_MEMORY_KINDS } from "./memory-kinds.js";
-import { type ObserverClient, ObserverClient as ObserverClientImpl } from "./observer-client.js";
 import {
+	ObserverAuthError,
+	type ObserverClient,
+	ObserverClient as ObserverClientImpl,
+	type ObserverTokenUsage,
+} from "./observer-client.js";
+import {
+	type NormalizedObserverOutput,
+	ObserverOutputError,
+	ObserverOutputTransportError,
 	observeAndNormalizeObserverOutput,
+	observerOutputAttemptCount,
+	observerOutputFailureStatus,
 	observerOutputMetadata,
+	observerOutputTotalUsage,
 	resolveObserverOutputCapability,
 } from "./observer-output.js";
 import { resolveProject } from "./project.js";
+import { resolveAdjacentDelegatedContext } from "./raw-event-context.js";
 import * as schema from "./schema.js";
 import { classifySessionForInjection, shouldSuppressSummaryOnlyOutput } from "./session-policy.js";
 import type { MemoryStore } from "./store.js";
@@ -293,12 +298,15 @@ export class RawEventObserverOutputError extends Error {
 		message: string,
 		reason: RawEventObserverOutputFailureReason,
 		observer: ObserverClient,
-		options: { includeObserverError?: boolean } = {},
+		options: {
+			includeObserverError?: boolean;
+			observerStatus?: ReturnType<ObserverClient["getStatus"]>;
+		} = {},
 	) {
 		super(message);
 		this.name = "RawEventObserverOutputError";
 		this.reason = reason;
-		const observerStatus = observer.getStatus();
+		const observerStatus = options.observerStatus ?? observer.getStatus();
 		if (options.includeObserverError === false) {
 			const { lastError: _lastError, ...statusWithoutError } = observerStatus;
 			this.observerStatus = statusWithoutError;
@@ -316,37 +324,1126 @@ export function rawEventObserverStatusFromError(
 	return observerFailureStatuses.get(error) ?? null;
 }
 
+function observerStatusForFailure(observer: ObserverClient, error: unknown) {
+	const status = observer.getStatus();
+	if (error instanceof ObserverAuthError) status.lastError = { ...error.detail };
+	if (!(error instanceof ObserverOutputError || error instanceof ObserverOutputTransportError)) {
+		return status;
+	}
+	const callError = error.outcome?.error;
+	if (error.outcome) delete status.lastError;
+	if (callError) status.lastError = { ...callError };
+	return status;
+}
+
+function recordObserverFailureUsage(
+	error: ObserverOutputError | ObserverOutputTransportError,
+	status: ReturnType<ObserverClient["getStatus"]>,
+	usageContext: { store: MemoryStore; sessionId: number; project: string | null },
+): void {
+	const usage = error.telemetry.totalUsage;
+	try {
+		recordObserverUsage(
+			usageContext.store,
+			usageContext.sessionId,
+			normalizedObserverTokenCounts(usage, status.provider),
+			{
+				project: usageContext.project,
+				token_usage: observerTokenUsageMetadata(
+					usage,
+					observerDiagnosticsAttemptCount(error.diagnostics),
+				),
+				provider: status.provider,
+				model: status.model,
+				runtime: status.runtime,
+				observer_output_failure_reason: error.diagnostics.failureReason,
+				observer_output_retry_attempted: error.diagnostics.retryAttempted,
+				observer_output_repair_attempted: error.diagnostics.repairAttempted,
+				observer_output_total_elapsed_ms: error.telemetry.totalElapsedMs,
+				observer_output_total_usage: usage,
+			},
+		);
+	} catch {
+		// Failure telemetry is best-effort and must not replace the observer cause.
+	}
+}
+
 async function observeRawEventOutput(
 	observer: ObserverClient,
 	system: string,
 	user: string,
 	capability: ReturnType<typeof resolveObserverOutputCapability>,
+	usageContext: { store: MemoryStore; sessionId: number; project: string | null },
 ): Promise<Awaited<ReturnType<typeof observeAndNormalizeObserverOutput>>> {
 	try {
 		return await observeAndNormalizeObserverOutput(observer, system, user, capability);
 	} catch (error) {
+		const status = observerStatusForFailure(observer, error);
 		if ((typeof error === "object" || typeof error === "function") && error !== null) {
-			observerFailureStatuses.set(error, observer.getStatus());
+			observerFailureStatuses.set(error, status);
+		}
+		if (error instanceof ObserverOutputError || error instanceof ObserverOutputTransportError) {
+			recordObserverFailureUsage(error, status, usageContext);
 		}
 		throw error;
 	}
 }
 
-function priorDelegatedBriefsForObserver(context: SessionContext): string[] | undefined {
-	if (
-		context.source !== "opencode" ||
-		context.flusher !== "raw_events" ||
-		!context.delegatedBriefs?.length
-	)
-		return undefined;
-	return boundedDelegatedBriefs(context.delegatedBriefs);
+function delegatedBriefsForObserver(
+	context: SessionContext,
+	priorBriefs: string[],
+	currentBriefs: string[],
+): string[] | undefined {
+	if (!isTrustedOpenCodeRawEventContext(context)) return undefined;
+	const briefs = boundedDelegatedBriefs([...priorBriefs, ...currentBriefs]);
+	return briefs.length ? briefs : undefined;
+}
+
+function isTrustedOpenCodeRawEventContext(
+	context: SessionContext,
+): context is SessionContext & { source: "opencode"; flusher: "raw_events" } {
+	return context.source === "opencode" && context.flusher === "raw_events";
+}
+
+function resolvePriorDelegatedContext(
+	store: MemoryStore,
+	context: SessionContext,
+): { briefs: string[]; hasDelegatedTask: boolean } {
+	if (!isTrustedOpenCodeRawEventContext(context)) {
+		return { briefs: [], hasDelegatedTask: false };
+	}
+	const opencodeSessionId = context.opencodeSessionId;
+	if (!context.streamId || !opencodeSessionId || context.streamId !== opencodeSessionId) {
+		return { briefs: [], hasDelegatedTask: false };
+	}
+	const startEventSeq = context.flushBatch?.start_event_seq;
+	const extractorVersion = context.flushBatch?.extractor_version;
+	if (typeof startEventSeq !== "number" || typeof extractorVersion !== "string") {
+		return { briefs: [], hasDelegatedTask: false };
+	}
+	return resolveAdjacentDelegatedContext(store.db, {
+		source: context.source,
+		streamId: context.streamId,
+		opencodeSessionId,
+		startEventSeq,
+		extractorVersion,
+	});
 }
 
 function sessionContextForStorage(
 	context: SessionContext,
 ): Omit<SessionContext, "delegatedBriefs"> {
 	const { delegatedBriefs: _delegatedBriefs, ...persistent } = context;
-	return persistent;
+	if (!persistent.flushBatch) return persistent;
+	const { batch_id, start_event_seq, end_event_seq, extractor_version } = persistent.flushBatch;
+	const flushBatch = { batch_id, start_event_seq, end_event_seq, extractor_version };
+	return { ...persistent, flushBatch };
+}
+
+interface IngestSessionStage {
+	captureRoutingEnabled: boolean;
+	cwd: string;
+	d: ReturnType<typeof drizzle>;
+	events: Record<string, unknown>[];
+	maxChars: number;
+	observerMaxChars: number;
+	priorDelegatedContext: ReturnType<typeof resolvePriorDelegatedContext>;
+	project: string | null;
+	sessionContext: SessionContext;
+	sessionId: number;
+	storeSummary: boolean;
+	storeTyped: boolean;
+}
+
+interface PreparedIngestStage {
+	assistantUsageEvents: ReturnType<typeof extractAssistantUsage>;
+	hasDelegatedTask: boolean;
+	lastAssistantMessage: string | null;
+	latestPrompt: string | null;
+	observerContext: ObserverContext;
+	promptNumber: number | null;
+	shouldProcess: boolean;
+	toolEvents: ToolEvent[];
+	transcript: string;
+}
+
+interface ObserverSelectionStage {
+	fallbackApplied: boolean;
+	fallbackReason: string | null;
+	observer: ObserverClient;
+	requestedModel: string | null;
+	requestedOpenAIResponses: boolean | null;
+	requestedProvider: string | null;
+	requestedRuntime: string | null;
+	tier: "simple" | "rich" | null;
+	tierReasons: string[];
+}
+
+interface ObserverInferenceStage {
+	observerStatus: ReturnType<ObserverClient["getStatus"]>;
+	output: NormalizedObserverOutput;
+	outputMetadata: Record<string, unknown>;
+	response: NormalizedObserverOutput["final"];
+	selection: ObserverSelectionStage;
+	usage: ObserverTokenUsage | null;
+}
+
+interface PlannedMemory {
+	bodyText: string;
+	confidence: number;
+	kind: string;
+	metadata: Record<string, unknown>;
+	tags: ReturnType<typeof deriveTags>;
+	title: string;
+}
+
+interface PersistIngestPlan {
+	memories: PlannedMemory[];
+	observerCallMetadata: Record<string, unknown>;
+	observerTokenCounts: ReturnType<typeof normalizedObserverTokenCounts>;
+	sessionMetadata: Record<string, unknown>;
+	summaryIndex: number | null;
+}
+
+interface SkipIngestPlan {
+	observerCallMetadata: Record<string, unknown>;
+	sessionMetadata: Record<string, unknown>;
+}
+
+type IngestPersistencePlan =
+	| { action: "persist"; plan: PersistIngestPlan }
+	| { action: "skip"; plan: SkipIngestPlan };
+
+function insertPluginSession(
+	stage: Pick<IngestSessionStage, "cwd" | "d" | "project" | "sessionContext">,
+	metadata: Record<string, unknown>,
+	now: string,
+): number {
+	const rows = stage.d
+		.insert(schema.sessions)
+		.values({
+			started_at: now,
+			cwd: stage.cwd,
+			project: stage.project,
+			user: process.env.USER ?? "unknown",
+			tool_version: "plugin-ts",
+			metadata_json: toJson(metadata),
+		})
+		.returning({ id: schema.sessions.id })
+		.all();
+	const id = rows[0]?.id;
+	if (id == null) throw new Error("session insert returned no id");
+	return id;
+}
+
+function resolveIngestSessionId(
+	stage: Pick<IngestSessionStage, "cwd" | "d" | "project" | "sessionContext">,
+	store: MemoryStore,
+	payload: IngestPayload,
+	metadata: Record<string, unknown>,
+	now: string,
+): number {
+	const { sessionContext } = stage;
+	if (sessionContext.flusher !== "raw_events" || !sessionContext.opencodeSessionId) {
+		return insertPluginSession(stage, metadata, now);
+	}
+	return store.getOrCreateSessionForOpencodeSession({
+		opencodeSessionId: sessionContext.opencodeSessionId,
+		source: sessionContext.source,
+		cwd: stage.cwd,
+		project: stage.project,
+		metadata,
+		startedAt: payload.startedAt ?? now,
+		toolVersion: "raw_events",
+	});
+}
+
+function createIngestSession(
+	payload: IngestPayload,
+	store: MemoryStore,
+	options: IngestOptions,
+): IngestSessionStage | null {
+	const cwd = payload.cwd ?? process.cwd();
+	const events = payload.events ?? [];
+	if (!Array.isArray(events) || events.length === 0) return null;
+
+	const sessionContext = payload.sessionContext ?? {};
+	const priorDelegatedContext = resolvePriorDelegatedContext(store, sessionContext);
+	const storeSummary = options.storeSummary ?? true;
+	const storeTyped = options.storeTyped ?? true;
+	const maxChars = options.maxChars ?? 12_000;
+	const observerMaxChars = options.observerMaxChars ?? 12_000;
+	const captureRoutingEnabled = process.env.CODEMEM_CAPTURE_ROUTING === "1";
+	const d = drizzle(store.db, { schema });
+	const now = new Date().toISOString();
+	const project = normalizeProjectLabel(payload.project) ?? resolveProject(cwd) ?? null;
+	const sessionMetadata = {
+		source: "plugin",
+		event_count: events.length,
+		started_at: payload.startedAt,
+		session_context: sessionContextForStorage(sessionContext),
+	};
+
+	const sessionId = resolveIngestSessionId(
+		{ cwd, d, project, sessionContext },
+		store,
+		payload,
+		sessionMetadata,
+		now,
+	);
+
+	return {
+		captureRoutingEnabled,
+		cwd,
+		d,
+		events,
+		maxChars,
+		observerMaxChars,
+		priorDelegatedContext,
+		project,
+		sessionContext,
+		sessionId,
+		storeSummary,
+		storeTyped,
+	};
+}
+
+function buildSessionInfoText(context: SessionContext): string {
+	const parts: string[] = [];
+	if ((context.promptCount ?? 0) > 1) parts.push(`Session had ${context.promptCount} prompts`);
+	if ((context.toolCount ?? 0) > 0) parts.push(`${context.toolCount} tool executions`);
+	if ((context.durationMs ?? 0) > 0) {
+		parts.push(`~${((context.durationMs ?? 0) / 60000).toFixed(1)} minutes of work`);
+	}
+	if (context.filesModified?.length) {
+		parts.push(`Modified: ${context.filesModified.slice(0, 5).join(", ")}`);
+	}
+	if (context.filesRead?.length) parts.push(`Read: ${context.filesRead.slice(0, 5).join(", ")}`);
+	return parts.join("; ");
+}
+
+function buildObserverPromptText(latestPrompt: string | null, context: SessionContext): string {
+	const info = buildSessionInfoText(context);
+	if (!info) return latestPrompt ?? "";
+	if (!latestPrompt) return `[Session context: ${info}]`;
+	return `${latestPrompt}\n\n[Session context: ${info}]`;
+}
+
+function buildPreparedObserverContext(
+	stage: IngestSessionStage,
+	input: {
+		currentDelegatedBriefs: string[];
+		lastAssistantMessage: string | null;
+		latestPrompt: string | null;
+		promptNumber: number | null;
+		toolEvents: ToolEvent[];
+		transcript: string;
+	},
+): ObserverContext {
+	const transcriptBudget = Math.max(1500, Math.min(5000, Math.floor(stage.observerMaxChars * 0.4)));
+	return {
+		delegatedBriefs: delegatedBriefsForObserver(
+			stage.sessionContext,
+			stage.priorDelegatedContext.briefs.length
+				? stage.priorDelegatedContext.briefs
+				: (stage.sessionContext.delegatedBriefs ?? []),
+			input.currentDelegatedBriefs,
+		),
+		project: stage.project,
+		userPrompt: buildObserverPromptText(input.latestPrompt, stage.sessionContext),
+		promptNumber: input.promptNumber,
+		transcript: truncateObserverTranscript(input.transcript, transcriptBudget),
+		toolEvents: input.toolEvents,
+		lastAssistantMessage: stage.storeSummary ? input.lastAssistantMessage : null,
+		includeSummary: stage.storeSummary,
+		diffSummary: "",
+		recentFiles: "",
+	};
+}
+
+function hasProcessableInput(
+	stage: IngestSessionStage,
+	latestPrompt: string | null,
+	toolEvents: ToolEvent[],
+	lastAssistantMessage: string | null,
+): boolean {
+	if (
+		latestPrompt &&
+		isTrivialRequest(latestPrompt) &&
+		toolEvents.length === 0 &&
+		!lastAssistantMessage
+	) {
+		return false;
+	}
+	return (
+		toolEvents.length > 0 ||
+		Boolean(latestPrompt) ||
+		(stage.storeSummary && Boolean(lastAssistantMessage))
+	);
+}
+
+function prepareIngestInput(stage: IngestSessionStage): PreparedIngestStage {
+	const normalizedEvents = normalizeAdapterEvents(stage.events);
+	const partitioned = isTrustedOpenCodeRawEventContext(stage.sessionContext)
+		? partitionDelegatedBriefEvents(normalizedEvents)
+		: { primaryEvents: normalizedEvents, delegatedBriefs: [] };
+	const hasDelegatedTask =
+		partitioned.delegatedBriefs.length > 0 || stage.priorDelegatedContext.hasDelegatedTask;
+	const prompts = extractPrompts(partitioned.primaryEvents);
+	const promptNumber =
+		prompts.length > 0 ? (prompts[prompts.length - 1]?.promptNumber ?? prompts.length) : null;
+	const toolBudget = Math.max(2000, Math.min(8000, stage.observerMaxChars - 5000));
+	const toolEvents = budgetToolEvents(
+		normalizeEventsForToolExtraction(stage.events, stage.maxChars),
+		toolBudget,
+		30,
+	);
+	const assistantMessages = extractAssistantMessages(partitioned.primaryEvents);
+	const assistantUsageEvents = extractAssistantUsage(partitioned.primaryEvents);
+	const lastAssistantMessage = assistantMessages.at(-1) ?? null;
+	const latestPrompt =
+		stage.sessionContext.firstPrompt ??
+		(prompts.length > 0 ? prompts[prompts.length - 1]?.promptText : null) ??
+		null;
+	const shouldProcess = hasProcessableInput(stage, latestPrompt, toolEvents, lastAssistantMessage);
+	const transcript = buildTranscript(partitioned.primaryEvents);
+	const observerContext = buildPreparedObserverContext(stage, {
+		currentDelegatedBriefs: partitioned.delegatedBriefs,
+		lastAssistantMessage,
+		latestPrompt,
+		promptNumber,
+		toolEvents,
+		transcript,
+	});
+	return {
+		assistantUsageEvents,
+		hasDelegatedTask,
+		lastAssistantMessage,
+		latestPrompt,
+		observerContext,
+		promptNumber,
+		shouldProcess,
+		toolEvents,
+		transcript,
+	};
+}
+
+function selectObserverForIngest(
+	stage: IngestSessionStage,
+	prepared: PreparedIngestStage,
+	options: IngestOptions,
+): ObserverSelectionStage {
+	const selection: ObserverSelectionStage = {
+		fallbackApplied: false,
+		fallbackReason: null,
+		observer: options.observer,
+		requestedModel: null,
+		requestedOpenAIResponses: null,
+		requestedProvider: null,
+		requestedRuntime: null,
+		tier: null,
+		tierReasons: [],
+	};
+	if (!options.observer.tierRoutingEnabled) return selection;
+
+	const flushBatchId =
+		stage.sessionContext.flushBatch &&
+		typeof stage.sessionContext.flushBatch === "object" &&
+		"batch_id" in stage.sessionContext.flushBatch
+			? Number((stage.sessionContext.flushBatch as Record<string, unknown>).batch_id ?? 0)
+			: 0;
+	const decision = decideExtractionReplayTier({
+		batchId: Number.isFinite(flushBatchId) ? flushBatchId : 0,
+		sessionId: stage.sessionId,
+		eventSpan: stage.events.length,
+		promptCount: stage.sessionContext.promptCount ?? 0,
+		toolCount: stage.sessionContext.toolCount ?? 0,
+		transcriptLength: prepared.transcript.length,
+	});
+	const tierSelection = buildTieredObserverSelection(options.observer.toConfig(), decision);
+	return {
+		fallbackApplied: tierSelection.metadata.fallbackApplied,
+		fallbackReason: tierSelection.metadata.fallbackReason,
+		observer: options.createTierObserver
+			? options.createTierObserver(tierSelection.observer)
+			: new ObserverClientImpl(tierSelection.observer),
+		requestedModel: tierSelection.metadata.requestedModel,
+		requestedOpenAIResponses: tierSelection.metadata.requestedOpenAIResponses,
+		requestedProvider: tierSelection.metadata.requestedProvider,
+		requestedRuntime: tierSelection.metadata.requestedRuntime,
+		tier: decision.tier,
+		tierReasons: decision.reasons,
+	};
+}
+
+async function runObserverInference(
+	store: MemoryStore,
+	stage: IngestSessionStage,
+	prepared: PreparedIngestStage,
+	options: IngestOptions,
+): Promise<ObserverInferenceStage> {
+	const selection = selectObserverForIngest(stage, prepared, options);
+	const outputCapability = resolveObserverOutputCapability(selection.observer);
+	const { system, user } = buildObserverPrompt(prepared.observerContext, {
+		outputMode: outputCapability.actualMode,
+	});
+	const output = await observeRawEventOutput(selection.observer, system, user, outputCapability, {
+		store,
+		sessionId: stage.sessionId,
+		project: stage.project,
+	});
+	return {
+		observerStatus: selection.observer.getStatus(),
+		output,
+		outputMetadata: observerOutputMetadata(output),
+		response: output.final,
+		selection,
+		usage: observerOutputTotalUsage(output),
+	};
+}
+
+function observerMemoryMetadata(inference: ObserverInferenceStage): Record<string, unknown> {
+	const { response, selection } = inference;
+	return {
+		observer_tier: selection.tier,
+		observer_tier_reasons: selection.tierReasons,
+		observer_requested_provider: selection.requestedProvider,
+		observer_requested_model: selection.requestedModel,
+		observer_requested_runtime: selection.requestedRuntime,
+		observer_requested_openai_responses: selection.requestedOpenAIResponses,
+		observer_provider: response.provider,
+		observer_model: response.model,
+		observer_runtime: inference.observerStatus.runtime,
+		observer_openai_responses: selection.observer.openaiUseResponses,
+		observer_fallback_applied: selection.fallbackApplied,
+		observer_fallback_reason: selection.fallbackReason,
+		...inference.outputMetadata,
+	};
+}
+
+type SummaryCandidate = { summary: ParsedSummary; request: string; body: string };
+
+interface CaptureRoutingStage {
+	candidateCount: number;
+	observations: CaptureRoutedObservation[];
+	suppressedCount: number;
+}
+
+interface OutputDispositionStage {
+	sessionClass: ReturnType<typeof classifySessionForInjection>;
+	sessionMetadata: Record<string, unknown>;
+	softSkip: boolean;
+	summary: SummaryCandidate | null;
+}
+
+function filterObservationsForPersistence(
+	stage: IngestSessionStage,
+	parsed: ObserverInferenceStage["response"]["parsed"],
+): CaptureRoutedObservation[] {
+	if (!stage.storeTyped || !hasMeaningfulObservation(parsed.observations)) return [];
+	const observations: CaptureRoutedObservation[] = [];
+	for (const observation of parsed.observations) {
+		const kind = observation.kind.trim().toLowerCase();
+		if (!ALLOWED_KINDS.has(kind)) continue;
+		if (!observation.title && !observation.narrative) continue;
+		if (
+			isLowSignalObservation(observation.title) ||
+			isLowSignalObservation(observation.narrative)
+		) {
+			continue;
+		}
+		observation.filesRead = normalizePaths(observation.filesRead, stage.cwd);
+		observation.filesModified = normalizePaths(observation.filesModified, stage.cwd);
+		observations.push(observation);
+	}
+	return observations;
+}
+
+function prepareSummaryForPersistence(
+	stage: IngestSessionStage,
+	parsed: ObserverInferenceStage["response"]["parsed"],
+): SummaryCandidate | null {
+	if (!stage.storeSummary || !parsed.summary || parsed.skipSummaryReason) return null;
+	const summary = parsed.summary;
+	const hasContent =
+		summary.request ||
+		summary.investigated ||
+		summary.learned ||
+		summary.completed ||
+		summary.nextSteps ||
+		summary.notes;
+	if (!hasContent) return null;
+	summary.filesRead = normalizePaths(summary.filesRead, stage.cwd);
+	summary.filesModified = normalizePaths(summary.filesModified, stage.cwd);
+	let request = summary.request;
+	if (isTrivialRequest(request)) request = deriveRequest(summary) || request;
+	const body = summaryBody(summary);
+	if (!body || isLowSignalObservation(firstSentence(body))) return null;
+	return { summary, request, body };
+}
+
+function logCaptureSuppressions(count: number, reasons: string[]): void {
+	if (count === 0 || process.env.CODEMEM_DEBUG !== "1") return;
+	const reasonText = [...new Set(reasons)].join(", ") || "unknown";
+	for (let i = 0; i < count; i += 1) {
+		console.error(
+			`[codemem] capture routing suppressed telemetry observation (reasons=${reasonText})`,
+		);
+	}
+}
+
+function applyCaptureRouting(
+	stage: IngestSessionStage,
+	observations: CaptureRoutedObservation[],
+): CaptureRoutingStage {
+	if (!stage.captureRoutingEnabled) {
+		return { candidateCount: 0, observations, suppressedCount: 0 };
+	}
+	const routed = routeObservationsForCapture(observations, {
+		project: stage.project,
+		sessionMinutes:
+			typeof stage.sessionContext.durationMs === "number"
+				? stage.sessionContext.durationMs / 60000
+				: null,
+	});
+	const candidateCount = routed.kept.filter(
+		(observation) => observation.derivation?.candidate === true,
+	).length;
+	logCaptureSuppressions(routed.suppressedTelemetry.count, routed.suppressedTelemetry.reasons);
+	return {
+		candidateCount,
+		observations: routed.kept,
+		suppressedCount: routed.suppressedTelemetry.count,
+	};
+}
+
+function shouldSoftSkipRawOutput(
+	stage: IngestSessionStage,
+	prepared: PreparedIngestStage,
+	inference: ObserverInferenceStage,
+	capture: CaptureRoutingStage,
+	summary: SummaryCandidate | null,
+): boolean {
+	const parsed = inference.response.parsed;
+	const pureLowSignalSkip =
+		parsed.skipSummaryReason?.trim().toLowerCase() === "low-signal" &&
+		parsed.observations.length === 0 &&
+		parsed.summary === null;
+	const locallySuppressedSummaryOnlyMicro =
+		parsed.observations.length === 0 &&
+		parsed.summary !== null &&
+		shouldSuppressSummaryOnlyOutput({
+			sessionContext: stage.sessionContext,
+			observationsCount: 0,
+			hasSummaryCandidate: true,
+			latestPrompt: prepared.latestPrompt,
+			toolEventCount: prepared.toolEvents.length,
+			hasAssistantMessage: Boolean(prepared.lastAssistantMessage),
+			hasDelegatedTask: prepared.hasDelegatedTask,
+			skipSummaryReason: parsed.skipSummaryReason,
+		});
+	const captureSuppressedTelemetryOnly =
+		stage.captureRoutingEnabled &&
+		capture.suppressedCount > 0 &&
+		parsed.observations.length > 0 &&
+		capture.suppressedCount === parsed.observations.length &&
+		summary == null;
+	return pureLowSignalSkip || locallySuppressedSummaryOnlyMicro || captureSuppressedTelemetryOnly;
+}
+
+function resolveOutputDisposition(
+	stage: IngestSessionStage,
+	prepared: PreparedIngestStage,
+	inference: ObserverInferenceStage,
+	capture: CaptureRoutingStage,
+	summaryCandidate: SummaryCandidate | null,
+): OutputDispositionStage {
+	const parsed = inference.response.parsed;
+	const sessionClass = classifySessionForInjection({
+		sessionContext: stage.sessionContext,
+		latestPrompt: prepared.latestPrompt,
+		toolEventCount: prepared.toolEvents.length,
+		hasAssistantMessage: Boolean(prepared.lastAssistantMessage),
+		observationsCount: capture.observations.length,
+		hasSummaryCandidate: summaryCandidate != null,
+		hasDelegatedTask: prepared.hasDelegatedTask,
+	});
+	let summary = summaryCandidate;
+	let summaryDisposition: "stored" | "suppressed" | "none" = summary ? "stored" : "none";
+	const suppressSummary = shouldSuppressSummaryOnlyOutput({
+		sessionContext: stage.sessionContext,
+		observationsCount: capture.observations.length,
+		hasSummaryCandidate: summary != null,
+		latestPrompt: prepared.latestPrompt,
+		toolEventCount: prepared.toolEvents.length,
+		hasAssistantMessage: Boolean(prepared.lastAssistantMessage),
+		hasDelegatedTask: prepared.hasDelegatedTask,
+		skipSummaryReason: parsed.skipSummaryReason,
+	});
+	if (suppressSummary) {
+		summary = null;
+		summaryDisposition = "suppressed";
+	}
+	if (
+		stage.sessionContext.flusher === "raw_events" &&
+		capture.observations.length === 0 &&
+		summary &&
+		prepared.toolEvents.length === 0 &&
+		!prepared.lastAssistantMessage
+	) {
+		summary = null;
+	}
+	const sessionMetadata = {
+		session_class: sessionClass,
+		summary_disposition: summaryDisposition,
+		...(stage.captureRoutingEnabled ? { capture_suppressed_count: capture.suppressedCount } : {}),
+	};
+	if (
+		stage.sessionContext.flusher !== "raw_events" ||
+		capture.observations.length + (summary ? 1 : 0) > 0
+	) {
+		return { sessionClass, sessionMetadata, softSkip: false, summary };
+	}
+	if (shouldSoftSkipRawOutput(stage, prepared, inference, capture, summary)) {
+		return { sessionClass, sessionMetadata, softSkip: true, summary };
+	}
+	throw new RawEventObserverOutputError(
+		"observer produced no storable output for raw-event flush",
+		"unstorable_observer_output",
+		inference.selection.observer,
+		{ observerStatus: inference.response.status },
+	);
+}
+
+function flushBatchMetadata(stage: IngestSessionStage): SessionContext["flushBatch"] | null {
+	if (!stage.sessionContext.flushBatch || typeof stage.sessionContext.flushBatch !== "object") {
+		return null;
+	}
+	return stage.sessionContext.flushBatch;
+}
+
+function planObservationMemory(
+	observation: CaptureRoutedObservation,
+	prepared: PreparedIngestStage,
+	sessionClass: ReturnType<typeof classifySessionForInjection>,
+	sharedMetadata: Record<string, unknown>,
+	flushBatch: SessionContext["flushBatch"] | null,
+): PlannedMemory {
+	const kind = observation.kind.trim().toLowerCase();
+	const bodyParts: string[] = [];
+	if (observation.narrative) bodyParts.push(observation.narrative);
+	if (observation.facts.length > 0) {
+		bodyParts.push(observation.facts.map((fact) => `- ${fact}`).join("\n"));
+	}
+	const title = observation.title || observation.narrative;
+	return {
+		bodyText: bodyParts.join("\n\n"),
+		confidence: 0.5,
+		kind,
+		metadata: {
+			...(observation.derivation ? { derivation: observation.derivation } : {}),
+			subtitle: observation.subtitle,
+			narrative: observation.narrative,
+			facts: observation.facts,
+			concepts: observation.concepts,
+			files_read: observation.filesRead,
+			files_modified: observation.filesModified,
+			prompt_number: prepared.promptNumber,
+			session_class: sessionClass,
+			source: "observer",
+			...sharedMetadata,
+			flush_batch: flushBatch,
+		},
+		tags: deriveTags({
+			kind,
+			title,
+			concepts: observation.concepts,
+			filesRead: observation.filesRead,
+			filesModified: observation.filesModified,
+		}),
+		title,
+	};
+}
+
+function planSummaryMemory(
+	candidate: SummaryCandidate,
+	prepared: PreparedIngestStage,
+	sessionClass: ReturnType<typeof classifySessionForInjection>,
+	sharedMetadata: Record<string, unknown>,
+	flushBatch: SessionContext["flushBatch"] | null,
+): PlannedMemory {
+	const { summary, request, body } = candidate;
+	const title = request || "Session summary";
+	return {
+		bodyText: body,
+		confidence: 0.3,
+		kind: "session_summary",
+		metadata: {
+			is_summary: true,
+			request,
+			investigated: summary.investigated,
+			learned: summary.learned,
+			completed: summary.completed,
+			next_steps: summary.nextSteps,
+			notes: summary.notes,
+			prompt_number: prepared.promptNumber,
+			session_class: sessionClass,
+			...sharedMetadata,
+			files_read: summary.filesRead,
+			files_modified: summary.filesModified,
+			source: "observer_summary",
+			flush_batch: flushBatch,
+		},
+		tags: deriveTags({
+			kind: "session_summary",
+			title,
+			filesRead: summary.filesRead,
+			filesModified: summary.filesModified,
+		}),
+		title,
+	};
+}
+
+function buildObserverCallMetadata(
+	stage: IngestSessionStage,
+	prepared: PreparedIngestStage,
+	inference: ObserverInferenceStage,
+	capture: CaptureRoutingStage,
+	disposition: OutputDispositionStage,
+): Record<string, unknown> {
+	const { response, selection } = inference;
+	const sessionUsageTokens = prepared.assistantUsageEvents.reduce(
+		(sum, event) => sum + (event.total_tokens ?? 0),
+		0,
+	);
+	return {
+		project: stage.project,
+		token_usage: observerTokenUsageMetadata(
+			inference.usage,
+			observerOutputAttemptCount(inference.output),
+		),
+		observation_count: capture.observations.length,
+		has_summary: disposition.summary != null,
+		...captureMetadata(
+			stage.captureRoutingEnabled,
+			capture.suppressedCount,
+			capture.candidateCount,
+		),
+		...disposition.sessionMetadata,
+		observer_tier: selection.tier,
+		observer_tier_reasons: selection.tierReasons,
+		requested_provider: selection.requestedProvider,
+		requested_model: selection.requestedModel,
+		requested_runtime: selection.requestedRuntime,
+		requested_openai_responses: selection.requestedOpenAIResponses,
+		provider: response.provider,
+		model: response.model,
+		runtime: inference.observerStatus.runtime,
+		openai_responses: selection.observer.openaiUseResponses,
+		fallback_applied: selection.fallbackApplied,
+		fallback_reason: selection.fallbackReason,
+		...inference.outputMetadata,
+		session_usage_tokens: sessionUsageTokens,
+	};
+}
+
+function completedObserverUsageRecord(
+	stage: IngestSessionStage,
+	prepared: PreparedIngestStage,
+	inference: ObserverInferenceStage,
+): ObserverUsageRecord {
+	const { response, selection } = inference;
+	const sessionUsageTokens = prepared.assistantUsageEvents.reduce(
+		(sum, event) => sum + (event.total_tokens ?? 0),
+		0,
+	);
+	return {
+		recorded: false,
+		tokens: normalizedObserverTokenCounts(inference.usage, response.provider),
+		metadata: {
+			project: stage.project,
+			token_usage: observerTokenUsageMetadata(
+				inference.usage,
+				observerOutputAttemptCount(inference.output),
+			),
+			observation_count: 0,
+			has_summary: false,
+			...captureMetadata(stage.captureRoutingEnabled, 0, 0),
+			observer_tier: selection.tier,
+			observer_tier_reasons: selection.tierReasons,
+			requested_provider: selection.requestedProvider,
+			requested_model: selection.requestedModel,
+			requested_runtime: selection.requestedRuntime,
+			requested_openai_responses: selection.requestedOpenAIResponses,
+			provider: response.provider,
+			model: response.model,
+			runtime: inference.observerStatus.runtime,
+			openai_responses: selection.observer.openaiUseResponses,
+			fallback_applied: selection.fallbackApplied,
+			fallback_reason: selection.fallbackReason,
+			...inference.outputMetadata,
+			session_usage_tokens: sessionUsageTokens,
+		},
+	};
+}
+
+function completedSessionMetadata(
+	disposition: OutputDispositionStage,
+	inference: ObserverInferenceStage,
+): Record<string, unknown> {
+	const { response, selection } = inference;
+	return {
+		...disposition.sessionMetadata,
+		observer_tier: selection.tier,
+		observer_tier_reasons: selection.tierReasons,
+		observer_requested_provider: selection.requestedProvider,
+		observer_requested_model: selection.requestedModel,
+		observer_requested_runtime: selection.requestedRuntime,
+		observer_requested_openai_responses: selection.requestedOpenAIResponses,
+		observer_provider: response.provider,
+		observer_model: response.model,
+		observer_runtime: inference.observerStatus.runtime,
+		observer_openai_responses: selection.observer.openaiUseResponses,
+		observer_fallback_applied: selection.fallbackApplied,
+		observer_fallback_reason: selection.fallbackReason,
+		...inference.outputMetadata,
+	};
+}
+
+function buildPlannedMemories(
+	prepared: PreparedIngestStage,
+	inference: ObserverInferenceStage,
+	capture: CaptureRoutingStage,
+	disposition: OutputDispositionStage,
+	flushBatch: SessionContext["flushBatch"] | null,
+): { memories: PlannedMemory[]; summaryIndex: number | null } {
+	const sharedMetadata = observerMemoryMetadata(inference);
+	const memories = capture.observations.map((observation) =>
+		planObservationMemory(
+			observation,
+			prepared,
+			disposition.sessionClass,
+			sharedMetadata,
+			flushBatch,
+		),
+	);
+	const summaryIndex = disposition.summary ? memories.length : null;
+	if (disposition.summary) {
+		memories.push(
+			planSummaryMemory(
+				disposition.summary,
+				prepared,
+				disposition.sessionClass,
+				sharedMetadata,
+				flushBatch,
+			),
+		);
+	}
+	return { memories, summaryIndex };
+}
+
+function buildIngestPersistencePlan(
+	stage: IngestSessionStage,
+	prepared: PreparedIngestStage,
+	inference: ObserverInferenceStage,
+): IngestPersistencePlan {
+	const parsed = inference.response.parsed;
+	const filtered = filterObservationsForPersistence(stage, parsed);
+	const capture = applyCaptureRouting(stage, filtered);
+	const summaryCandidate = prepareSummaryForPersistence(stage, parsed);
+	const disposition = resolveOutputDisposition(
+		stage,
+		prepared,
+		inference,
+		capture,
+		summaryCandidate,
+	);
+	const observerCallMetadata = buildObserverCallMetadata(
+		stage,
+		prepared,
+		inference,
+		capture,
+		disposition,
+	);
+	if (disposition.softSkip) {
+		return {
+			action: "skip",
+			plan: { observerCallMetadata, sessionMetadata: disposition.sessionMetadata },
+		};
+	}
+	const flushBatch = flushBatchMetadata(stage);
+	const { memories, summaryIndex } = buildPlannedMemories(
+		prepared,
+		inference,
+		capture,
+		disposition,
+		flushBatch,
+	);
+	return {
+		action: "persist",
+		plan: {
+			memories,
+			observerCallMetadata,
+			observerTokenCounts: normalizedObserverTokenCounts(
+				inference.usage,
+				inference.response.provider,
+			),
+			sessionMetadata: completedSessionMetadata(disposition, inference),
+			summaryIndex,
+		},
+	};
+}
+
+function persistIngestPlan(
+	store: MemoryStore,
+	stage: IngestSessionStage,
+	plan: PersistIngestPlan,
+	usageRecord: ObserverUsageRecord,
+): Array<{ memoryId: number; title: string; bodyText: string }> {
+	const vectorWriteInputs: Array<{ memoryId: number; title: string; bodyText: string }> = [];
+	store.db.transaction(() => {
+		for (const [index, memory] of plan.memories.entries()) {
+			let supersededIds: number[] = [];
+			if (index === plan.summaryIndex) {
+				supersededIds = supersedePriorObserverSummaries(store, stage.d, stage.sessionId);
+			}
+			const memoryId = store.remember(
+				stage.sessionId,
+				memory.kind,
+				memory.title,
+				memory.bodyText,
+				memory.confidence,
+				memory.tags,
+				memory.metadata,
+			);
+			if (supersededIds.length > 0) markSupersededBy(stage.d, supersededIds, memoryId);
+			vectorWriteInputs.push({
+				memoryId,
+				title: memory.title,
+				bodyText: memory.bodyText,
+			});
+		}
+		recordObserverUsage(
+			store,
+			stage.sessionId,
+			plan.observerTokenCounts,
+			plan.observerCallMetadata,
+		);
+	})();
+	usageRecord.recorded = true;
+	return vectorWriteInputs;
+}
+
+async function storeVectorInputs(
+	store: MemoryStore,
+	inputs: Array<{ memoryId: number; title: string; bodyText: string }>,
+): Promise<void> {
+	for (const input of inputs) {
+		try {
+			await storeVectors(store.db, input.memoryId, input.title, input.bodyText);
+		} catch {
+			// Non-fatal — ingestion should not fail when embeddings are unavailable
+		}
+	}
+}
+
+function endIngestSession(
+	store: MemoryStore,
+	stage: IngestSessionStage,
+	metadata: Record<string, unknown> = {},
+): void {
+	endSession(store, stage.sessionId, stage.events.length, stage.sessionContext, metadata);
+}
+
+function handleUnprocessableInput(
+	store: MemoryStore,
+	stage: IngestSessionStage,
+	prepared: PreparedIngestStage,
+	observer: ObserverClient,
+): boolean {
+	if (prepared.shouldProcess) return false;
+	if (stage.sessionContext.flusher === "raw_events") {
+		throw new RawEventObserverOutputError(
+			"observer produced no storable output for raw-event flush",
+			"no_processable_input",
+			observer,
+			{ includeObserverError: false },
+		);
+	}
+	endIngestSession(store, stage);
+	return true;
+}
+
+function handleObserverOutput(
+	store: MemoryStore,
+	stage: IngestSessionStage,
+	inference: ObserverInferenceStage,
+): boolean {
+	if (!inference.response.raw) {
+		if (stage.sessionContext.flusher === "raw_events") {
+			throw new RawEventObserverOutputError(
+				"observer failed during raw-event flush",
+				"empty_observer_output",
+				inference.selection.observer,
+				{ observerStatus: inference.response.status },
+			);
+		}
+		const status = inference.selection.observer.getStatus();
+		console.warn(
+			`[codemem] Observer returned no output (provider=${inference.response.provider}, model=${inference.response.model}` +
+				`${status.lastError ? `, error=${status.lastError}` : ""}). No memories will be created for this session.`,
+		);
+		endIngestSession(store, stage);
+		return false;
+	}
+	const parsed = inference.response.parsed;
+	const lossyRawOutput =
+		stage.sessionContext.flusher === "raw_events" &&
+		inference.output.diagnostics.failureReason === "legacy_xml_lossy" &&
+		(parsed.observations.length > 0 ||
+			parsed.summary !== null ||
+			parsed.skipSummaryReason !== null);
+	if (!lossyRawOutput) return true;
+	throw new RawEventObserverOutputError(
+		"observer repair remained lossy during raw-event flush",
+		"lossy_repair",
+		inference.selection.observer,
+		{ observerStatus: observerOutputFailureStatus(inference.output) },
+	);
+}
+
+async function processIngestSession(
+	store: MemoryStore,
+	stage: IngestSessionStage,
+	options: IngestOptions,
+): Promise<void> {
+	const prepared = prepareIngestInput(stage);
+	if (handleUnprocessableInput(store, stage, prepared, options.observer)) return;
+	const inference = await runObserverInference(store, stage, prepared, options);
+	const usageRecord = completedObserverUsageRecord(stage, prepared, inference);
+	try {
+		if (!handleObserverOutput(store, stage, inference)) {
+			recordCompletedObserverUsage(store, stage.sessionId, usageRecord);
+			return;
+		}
+		const persistence = buildIngestPersistencePlan(stage, prepared, inference);
+		usageRecord.metadata = persistence.plan.observerCallMetadata;
+		if (persistence.action === "skip") {
+			recordCompletedObserverUsage(store, stage.sessionId, usageRecord);
+			endIngestSession(store, stage, persistence.plan.sessionMetadata);
+			return;
+		}
+		const vectorWriteInputs = persistIngestPlan(store, stage, persistence.plan, usageRecord);
+		await storeVectorInputs(store, vectorWriteInputs);
+		endIngestSession(store, stage, persistence.plan.sessionMetadata);
+	} catch (error) {
+		try {
+			recordCompletedObserverUsage(store, stage.sessionId, usageRecord);
+		} catch {
+			// Failure telemetry is best-effort and must not replace the ingest cause.
+		}
+		throw error;
+	}
 }
 
 /**
@@ -361,602 +1458,13 @@ export async function ingest(
 	store: MemoryStore,
 	options: IngestOptions,
 ): Promise<void> {
-	const cwd = payload.cwd ?? process.cwd();
-	const events = payload.events ?? [];
-	if (!Array.isArray(events) || events.length === 0) return;
-
-	const sessionContext = payload.sessionContext ?? {};
-	const storeSummary = options.storeSummary ?? true;
-	const storeTyped = options.storeTyped ?? true;
-	const maxChars = options.maxChars ?? 12_000;
-	const observerMaxChars = options.observerMaxChars ?? 12_000;
-	const captureRoutingEnabled = process.env.CODEMEM_CAPTURE_ROUTING === "1";
-
-	const d = drizzle(store.db, { schema });
-	const now = new Date().toISOString();
-	const project = normalizeProjectLabel(payload.project) ?? resolveProject(cwd) ?? null;
-
-	const sessionMetadata = {
-		source: "plugin",
-		event_count: events.length,
-		started_at: payload.startedAt,
-		session_context: sessionContextForStorage(sessionContext),
-	};
-	const sessionId =
-		sessionContext.flusher === "raw_events" && sessionContext.opencodeSessionId
-			? store.getOrCreateSessionForOpencodeSession({
-					opencodeSessionId: sessionContext.opencodeSessionId,
-					source: sessionContext.source,
-					cwd,
-					project,
-					metadata: sessionMetadata,
-					startedAt: payload.startedAt ?? now,
-					toolVersion: "raw_events",
-				})
-			: (() => {
-					const rows = d
-						.insert(schema.sessions)
-						.values({
-							started_at: now,
-							cwd,
-							project,
-							user: process.env.USER ?? "unknown",
-							tool_version: "plugin-ts",
-							metadata_json: toJson(sessionMetadata),
-						})
-						.returning({ id: schema.sessions.id })
-						.all();
-					const id = rows[0]?.id;
-					if (id == null) throw new Error("session insert returned no id");
-					return id;
-				})();
-
+	const stage = createIngestSession(payload, store, options);
+	if (!stage) return;
 	try {
-		// ------------------------------------------------------------------
-		// Extract data from events
-		// ------------------------------------------------------------------
-		const normalizedEvents = normalizeAdapterEvents(events);
-		const prompts = extractPrompts(normalizedEvents);
-		const promptNumber =
-			prompts.length > 0 ? (prompts[prompts.length - 1]?.promptNumber ?? prompts.length) : null;
-
-		// Tool events — handle adapter projection
-		let toolEvents = normalizeEventsForToolExtraction(events, maxChars);
-
-		// Budget tool events
-		const toolBudget = Math.max(2000, Math.min(8000, observerMaxChars - 5000));
-		toolEvents = budgetToolEvents(toolEvents, toolBudget, 30);
-
-		// Assistant messages
-		const assistantMessages = extractAssistantMessages(normalizedEvents);
-		const assistantUsageEvents = extractAssistantUsage(normalizedEvents);
-		const lastAssistantMessage = assistantMessages.at(-1) ?? null;
-
-		// Latest prompt
-		const latestPrompt =
-			sessionContext.firstPrompt ??
-			(prompts.length > 0 ? prompts[prompts.length - 1]?.promptText : null) ??
-			null;
-
-		// ------------------------------------------------------------------
-		// Should we process?
-		// ------------------------------------------------------------------
-		let shouldProcess =
-			toolEvents.length > 0 ||
-			Boolean(latestPrompt) ||
-			(storeSummary && Boolean(lastAssistantMessage));
-
-		if (
-			latestPrompt &&
-			isTrivialRequest(latestPrompt) &&
-			toolEvents.length === 0 &&
-			!lastAssistantMessage
-		) {
-			shouldProcess = false;
-		}
-
-		if (!shouldProcess) {
-			if (sessionContext?.flusher === "raw_events") {
-				throw new RawEventObserverOutputError(
-					"observer produced no storable output for raw-event flush",
-					"no_processable_input",
-					options.observer,
-					{ includeObserverError: false },
-				);
-			}
-			endSession(store, sessionId, events.length, sessionContext);
-			return;
-		}
-
-		// ------------------------------------------------------------------
-		// Build transcript
-		// ------------------------------------------------------------------
-		const transcript = buildTranscript(normalizedEvents);
-
-		// ------------------------------------------------------------------
-		// Build observer prompt
-		// ------------------------------------------------------------------
-		const sessionSummaryParts: string[] = [];
-		if ((sessionContext.promptCount ?? 0) > 1) {
-			sessionSummaryParts.push(`Session had ${sessionContext.promptCount} prompts`);
-		}
-		if ((sessionContext.toolCount ?? 0) > 0) {
-			sessionSummaryParts.push(`${sessionContext.toolCount} tool executions`);
-		}
-		if ((sessionContext.durationMs ?? 0) > 0) {
-			const durationMin = (sessionContext.durationMs ?? 0) / 60000;
-			sessionSummaryParts.push(`~${durationMin.toFixed(1)} minutes of work`);
-		}
-		if (sessionContext.filesModified?.length) {
-			sessionSummaryParts.push(`Modified: ${sessionContext.filesModified.slice(0, 5).join(", ")}`);
-		}
-		if (sessionContext.filesRead?.length) {
-			sessionSummaryParts.push(`Read: ${sessionContext.filesRead.slice(0, 5).join(", ")}`);
-		}
-		const sessionInfoText = sessionSummaryParts.join("; ");
-
-		let observerPrompt = latestPrompt ?? "";
-		if (sessionInfoText) {
-			observerPrompt = observerPrompt
-				? `${observerPrompt}\n\n[Session context: ${sessionInfoText}]`
-				: `[Session context: ${sessionInfoText}]`;
-		}
-
-		const transcriptBudget = Math.max(1500, Math.min(5000, Math.floor(observerMaxChars * 0.4)));
-		const observerContext: ObserverContext = {
-			delegatedBriefs: priorDelegatedBriefsForObserver(sessionContext),
-			project,
-			userPrompt: observerPrompt,
-			promptNumber,
-			transcript: truncateObserverTranscript(transcript, transcriptBudget),
-			toolEvents,
-			lastAssistantMessage: storeSummary ? lastAssistantMessage : null,
-			includeSummary: storeSummary,
-			diffSummary: "",
-			recentFiles: "",
-		};
-
-		let selectedObserver = options.observer;
-		let selectedTier: "simple" | "rich" | null = null;
-		let selectedTierReasons: string[] = [];
-		let requestedObserverProvider: string | null = null;
-		let requestedObserverModel: string | null = null;
-		let requestedObserverRuntime: string | null = null;
-		let requestedObserverOpenAIResponses: boolean | null = null;
-		let observerFallbackApplied = false;
-		let observerFallbackReason: string | null = null;
-		if (options.observer.tierRoutingEnabled) {
-			const flushBatchId =
-				sessionContext.flushBatch &&
-				typeof sessionContext.flushBatch === "object" &&
-				"batch_id" in sessionContext.flushBatch
-					? Number((sessionContext.flushBatch as Record<string, unknown>).batch_id ?? 0)
-					: 0;
-			const decision = decideExtractionReplayTier({
-				batchId: Number.isFinite(flushBatchId) ? flushBatchId : 0,
-				sessionId,
-				eventSpan: events.length,
-				promptCount: sessionContext.promptCount ?? 0,
-				toolCount: sessionContext.toolCount ?? 0,
-				transcriptLength: transcript.length,
-			});
-			selectedTier = decision.tier;
-			selectedTierReasons = decision.reasons;
-			const tierSelection = buildTieredObserverSelection(options.observer.toConfig(), decision);
-			const tierConfig = tierSelection.observer;
-			requestedObserverProvider = tierSelection.metadata.requestedProvider;
-			requestedObserverModel = tierSelection.metadata.requestedModel;
-			requestedObserverRuntime = tierSelection.metadata.requestedRuntime;
-			requestedObserverOpenAIResponses = tierSelection.metadata.requestedOpenAIResponses;
-			observerFallbackApplied = tierSelection.metadata.fallbackApplied;
-			observerFallbackReason = tierSelection.metadata.fallbackReason;
-			selectedObserver = options.createTierObserver
-				? options.createTierObserver(tierConfig)
-				: new ObserverClientImpl(tierConfig);
-		}
-
-		const outputCapability = resolveObserverOutputCapability(selectedObserver);
-		const { system, user } = buildObserverPrompt(observerContext, {
-			outputMode: outputCapability.actualMode,
-		});
-
-		// ------------------------------------------------------------------
-		// Call observer LLM
-		// ------------------------------------------------------------------
-		const output = await observeRawEventOutput(selectedObserver, system, user, outputCapability);
-		const response = output.final;
-		const outputMetadata = observerOutputMetadata(output);
-
-		if (!response.raw) {
-			// Raw-event flushes must be lossless: if the observer returns no output,
-			// fail the flush so we do NOT advance last_flushed_event_seq.
-			if (sessionContext?.flusher === "raw_events") {
-				throw new RawEventObserverOutputError(
-					"observer failed during raw-event flush",
-					"empty_observer_output",
-					selectedObserver,
-				);
-			}
-
-			// Surface the failure for normal ingest paths.
-			const status = selectedObserver.getStatus();
-			console.warn(
-				`[codemem] Observer returned no output (provider=${response.provider}, model=${response.model}` +
-					`${status.lastError ? `, error=${status.lastError}` : ""}). No memories will be created for this session.`,
-			);
-			endSession(store, sessionId, events.length, sessionContext);
-			return;
-		}
-
-		// ------------------------------------------------------------------
-		// Parse response
-		// ------------------------------------------------------------------
-		const rawText = response.raw;
-		const parsed = response.parsed;
-		if (
-			sessionContext?.flusher === "raw_events" &&
-			output.diagnostics.failureReason === "legacy_xml_lossy" &&
-			(parsed.observations.length > 0 ||
-				parsed.summary !== null ||
-				parsed.skipSummaryReason !== null)
-		) {
-			throw new RawEventObserverOutputError(
-				"observer repair remained lossy during raw-event flush",
-				"lossy_repair",
-				selectedObserver,
-			);
-		}
-		const observerStatus = selectedObserver.getStatus();
-
-		let observationsToStore: CaptureRoutedObservation[] = [];
-		if (storeTyped && hasMeaningfulObservation(parsed.observations)) {
-			for (const obs of parsed.observations) {
-				const kind = obs.kind.trim().toLowerCase();
-				if (!ALLOWED_KINDS.has(kind)) continue;
-				if (!obs.title && !obs.narrative) continue;
-				if (isLowSignalObservation(obs.title) || isLowSignalObservation(obs.narrative)) {
-					continue;
-				}
-
-				obs.filesRead = normalizePaths(obs.filesRead, cwd);
-				obs.filesModified = normalizePaths(obs.filesModified, cwd);
-				observationsToStore.push(obs);
-			}
-		}
-
-		let summaryToStore: { summary: ParsedSummary; request: string; body: string } | null = null;
-		if (storeSummary && parsed.summary && !parsed.skipSummaryReason) {
-			const summary = parsed.summary;
-			if (
-				summary.request ||
-				summary.investigated ||
-				summary.learned ||
-				summary.completed ||
-				summary.nextSteps ||
-				summary.notes
-			) {
-				summary.filesRead = normalizePaths(summary.filesRead, cwd);
-				summary.filesModified = normalizePaths(summary.filesModified, cwd);
-
-				let request = summary.request;
-				if (isTrivialRequest(request)) {
-					const derived = deriveRequest(summary);
-					if (derived) request = derived;
-				}
-
-				const body = summaryBody(summary);
-				if (body && !isLowSignalObservation(firstSentence(body))) {
-					summaryToStore = { summary, request, body };
-				}
-			}
-		}
-
-		let captureSuppressedCount = 0;
-		let captureCandidateCount = 0;
-		if (captureRoutingEnabled) {
-			const routed = routeObservationsForCapture(observationsToStore, {
-				project,
-				sessionMinutes:
-					typeof sessionContext.durationMs === "number" ? sessionContext.durationMs / 60000 : null,
-			});
-			observationsToStore = routed.kept;
-			captureSuppressedCount = routed.suppressedTelemetry.count;
-			captureCandidateCount = observationsToStore.filter(
-				(obs) => obs.derivation?.candidate === true,
-			).length;
-			if (captureSuppressedCount > 0 && process.env.CODEMEM_DEBUG === "1") {
-				const reasonText = [...new Set(routed.suppressedTelemetry.reasons)].join(", ") || "unknown";
-				for (let i = 0; i < captureSuppressedCount; i += 1) {
-					console.error(
-						`[codemem] capture routing suppressed telemetry observation (reasons=${reasonText})`,
-					);
-				}
-			}
-		}
-
-		const sessionClass = classifySessionForInjection({
-			sessionContext,
-			latestPrompt,
-			toolEventCount: toolEvents.length,
-			hasAssistantMessage: Boolean(lastAssistantMessage),
-			observationsCount: observationsToStore.length,
-			hasSummaryCandidate: summaryToStore != null,
-		});
-		let summaryDisposition: "stored" | "suppressed" | "none" = summaryToStore ? "stored" : "none";
-
-		if (
-			shouldSuppressSummaryOnlyOutput({
-				sessionContext,
-				observationsCount: observationsToStore.length,
-				hasSummaryCandidate: summaryToStore != null,
-				latestPrompt,
-				toolEventCount: toolEvents.length,
-				hasAssistantMessage: Boolean(lastAssistantMessage),
-				skipSummaryReason: parsed.skipSummaryReason,
-			})
-		) {
-			summaryToStore = null;
-			summaryDisposition = "suppressed";
-		}
-
-		const promptOnlyRawEventSummary =
-			sessionContext?.flusher === "raw_events" &&
-			observationsToStore.length === 0 &&
-			summaryToStore != null &&
-			toolEvents.length === 0 &&
-			!lastAssistantMessage;
-		if (promptOnlyRawEventSummary) {
-			summaryToStore = null;
-		}
-
-		if (sessionContext?.flusher === "raw_events") {
-			const storableCount = observationsToStore.length + (summaryToStore ? 1 : 0);
-			if (storableCount === 0) {
-				const pureLowSignalSkip =
-					parsed.skipSummaryReason?.trim().toLowerCase() === "low-signal" &&
-					parsed.observations.length === 0 &&
-					parsed.summary === null;
-				const locallySuppressedSummaryOnlyMicro =
-					parsed.observations.length === 0 &&
-					parsed.summary !== null &&
-					shouldSuppressSummaryOnlyOutput({
-						sessionContext,
-						observationsCount: 0,
-						hasSummaryCandidate: true,
-						latestPrompt,
-						toolEventCount: toolEvents.length,
-						hasAssistantMessage: Boolean(lastAssistantMessage),
-						skipSummaryReason: parsed.skipSummaryReason,
-					});
-				// Only soft-skip when capture routing suppressed EVERY observation
-				// (and there was no summary). If something else zeroed the batch,
-				// fall through to the throw so a real losslessness bug isn't masked.
-				const captureSuppressedTelemetryOnly =
-					captureRoutingEnabled &&
-					captureSuppressedCount > 0 &&
-					parsed.observations.length > 0 &&
-					captureSuppressedCount === parsed.observations.length &&
-					summaryToStore == null;
-				if (
-					pureLowSignalSkip ||
-					locallySuppressedSummaryOnlyMicro ||
-					captureSuppressedTelemetryOnly
-				) {
-					endSession(store, sessionId, events.length, sessionContext, {
-						session_class: sessionClass,
-						summary_disposition: summaryDisposition,
-						// Only emit capture-routing telemetry when the gate is on, so
-						// default-off session metadata stays byte-identical to pre-feature.
-						...(captureRoutingEnabled ? { capture_suppressed_count: captureSuppressedCount } : {}),
-					});
-					return;
-				}
-				throw new RawEventObserverOutputError(
-					"observer produced no storable output for raw-event flush",
-					"unstorable_observer_output",
-					selectedObserver,
-				);
-			}
-		}
-
-		const vectorWriteInputs: Array<{ memoryId: number; title: string; bodyText: string }> = [];
-		const flushBatchMetadata =
-			sessionContext.flushBatch && typeof sessionContext.flushBatch === "object"
-				? sessionContext.flushBatch
-				: null;
-
-		// Persist all observations, summary, and usage atomically
-		store.db.transaction(() => {
-			// ------------------------------------------------------------------
-			// Filter and persist observations
-			// ------------------------------------------------------------------
-			for (const obs of observationsToStore) {
-				const kind = obs.kind.trim().toLowerCase();
-
-				const bodyParts: string[] = [];
-				if (obs.narrative) bodyParts.push(obs.narrative);
-				if (obs.facts.length > 0) {
-					bodyParts.push(obs.facts.map((f) => `- ${f}`).join("\n"));
-				}
-				const bodyText = bodyParts.join("\n\n");
-
-				const memoryTitle = obs.title || obs.narrative;
-				const tags = deriveTags({
-					kind,
-					title: memoryTitle,
-					concepts: obs.concepts,
-					filesRead: obs.filesRead,
-					filesModified: obs.filesModified,
-				});
-				const memoryId = store.remember(sessionId, kind, memoryTitle, bodyText, 0.5, tags, {
-					...(obs.derivation ? { derivation: obs.derivation } : {}),
-					subtitle: obs.subtitle,
-					narrative: obs.narrative,
-					facts: obs.facts,
-					concepts: obs.concepts,
-					files_read: obs.filesRead,
-					files_modified: obs.filesModified,
-					prompt_number: promptNumber,
-					session_class: sessionClass,
-					source: "observer",
-					observer_tier: selectedTier,
-					observer_tier_reasons: selectedTierReasons,
-					observer_requested_provider: requestedObserverProvider,
-					observer_requested_model: requestedObserverModel,
-					observer_requested_runtime: requestedObserverRuntime,
-					observer_requested_openai_responses: requestedObserverOpenAIResponses,
-					observer_provider: response.provider,
-					observer_model: response.model,
-					observer_runtime: observerStatus.runtime,
-					observer_openai_responses: selectedObserver.openaiUseResponses,
-					observer_fallback_applied: observerFallbackApplied,
-					observer_fallback_reason: observerFallbackReason,
-					...outputMetadata,
-					flush_batch: flushBatchMetadata,
-				});
-				vectorWriteInputs.push({ memoryId, title: memoryTitle, bodyText });
-			}
-
-			// ------------------------------------------------------------------
-			// Persist session summary
-			// ------------------------------------------------------------------
-			if (summaryToStore) {
-				const { summary, request, body } = summaryToStore;
-				const summaryTitle = request || "Session summary";
-				const summaryTags = deriveTags({
-					kind: "session_summary",
-					title: summaryTitle,
-					filesRead: summary.filesRead,
-					filesModified: summary.filesModified,
-				});
-				// Enforce one live observer summary per session: supersede any
-				// prior active observer_summary rows for this session BEFORE the
-				// new row is persisted, otherwise `store.remember`'s title dedupe
-				// could return a stale prior summary's id instead of inserting.
-				// Long-running durable sessions would otherwise accumulate one
-				// summary per flush batch.
-				const supersededIds = supersedePriorObserverSummaries(store, d, sessionId);
-				const memoryId = store.remember(
-					sessionId,
-					"session_summary",
-					summaryTitle,
-					body,
-					0.3,
-					summaryTags,
-					{
-						is_summary: true,
-						request,
-						investigated: summary.investigated,
-						learned: summary.learned,
-						completed: summary.completed,
-						next_steps: summary.nextSteps,
-						notes: summary.notes,
-						prompt_number: promptNumber,
-						session_class: sessionClass,
-						observer_tier: selectedTier,
-						observer_tier_reasons: selectedTierReasons,
-						observer_requested_provider: requestedObserverProvider,
-						observer_requested_model: requestedObserverModel,
-						observer_requested_runtime: requestedObserverRuntime,
-						observer_requested_openai_responses: requestedObserverOpenAIResponses,
-						observer_provider: response.provider,
-						observer_model: response.model,
-						observer_runtime: observerStatus.runtime,
-						observer_openai_responses: selectedObserver.openaiUseResponses,
-						observer_fallback_applied: observerFallbackApplied,
-						observer_fallback_reason: observerFallbackReason,
-						...outputMetadata,
-						files_read: summary.filesRead,
-						files_modified: summary.filesModified,
-						source: "observer_summary",
-						flush_batch: flushBatchMetadata,
-					},
-				);
-				markSupersededBy(d, supersededIds, memoryId);
-				vectorWriteInputs.push({ memoryId, title: summaryTitle, bodyText: body });
-			}
-
-			// ------------------------------------------------------------------
-			// Record observer usage
-			// ------------------------------------------------------------------
-			const usageTokenTotal = assistantUsageEvents.reduce(
-				(sum, e) => sum + (e.total_tokens ?? 0),
-				0,
-			);
-			d.insert(schema.usageEvents)
-				.values({
-					session_id: sessionId,
-					event: "observer_call",
-					tokens_read: rawText.length,
-					tokens_written: transcript.length,
-					created_at: new Date().toISOString(),
-					metadata_json: toJson({
-						project,
-						observation_count: observationsToStore.length,
-						has_summary: summaryToStore != null,
-						// Only emit capture-routing telemetry when the gate is on, so
-						// default-off output stays byte-identical to pre-feature.
-						...(captureRoutingEnabled
-							? {
-									capture_suppressed_count: captureSuppressedCount,
-									capture_candidate_count: captureCandidateCount,
-									capture_routing_enabled: true,
-								}
-							: {}),
-						session_class: sessionClass,
-						summary_disposition: summaryDisposition,
-						observer_tier: selectedTier,
-						observer_tier_reasons: selectedTierReasons,
-						requested_provider: requestedObserverProvider,
-						requested_model: requestedObserverModel,
-						requested_runtime: requestedObserverRuntime,
-						requested_openai_responses: requestedObserverOpenAIResponses,
-						provider: response.provider,
-						model: response.model,
-						runtime: observerStatus.runtime,
-						openai_responses: selectedObserver.openaiUseResponses,
-						fallback_applied: observerFallbackApplied,
-						fallback_reason: observerFallbackReason,
-						...outputMetadata,
-						session_usage_tokens: usageTokenTotal,
-					}),
-				})
-				.run();
-		})();
-
-		for (const input of vectorWriteInputs) {
-			try {
-				await storeVectors(store.db, input.memoryId, input.title, input.bodyText);
-			} catch {
-				// Non-fatal — ingestion should not fail when embeddings are unavailable
-			}
-		}
-
-		// ------------------------------------------------------------------
-		// End session
-		// ------------------------------------------------------------------
-		endSession(store, sessionId, events.length, sessionContext, {
-			session_class: sessionClass,
-			summary_disposition: summaryDisposition,
-			...(captureRoutingEnabled ? { capture_suppressed_count: captureSuppressedCount } : {}),
-			observer_tier: selectedTier,
-			observer_tier_reasons: selectedTierReasons,
-			observer_requested_provider: requestedObserverProvider,
-			observer_requested_model: requestedObserverModel,
-			observer_requested_runtime: requestedObserverRuntime,
-			observer_requested_openai_responses: requestedObserverOpenAIResponses,
-			observer_provider: response.provider,
-			observer_model: response.model,
-			observer_runtime: observerStatus.runtime,
-			observer_openai_responses: selectedObserver.openaiUseResponses,
-			observer_fallback_applied: observerFallbackApplied,
-			observer_fallback_reason: observerFallbackReason,
-			...outputMetadata,
-		});
+		await processIngestSession(store, stage, options);
 	} catch (err) {
-		// End session even on error
 		try {
-			endSession(store, sessionId, events.length, sessionContext);
+			endIngestSession(store, stage);
 		} catch {
 			// ignore cleanup errors
 		}
@@ -1030,4 +1538,88 @@ export async function main(store: MemoryStore, observer: ObserverClient): Promis
 	}
 
 	await ingest(payload, store, { observer });
+}
+function observerTokenUsageMetadata(
+	usage: ObserverTokenUsage | null,
+	attemptCount: number,
+): Record<string, unknown> {
+	return {
+		unit: "tokens",
+		source: usage ? "provider" : "unavailable",
+		input_direction: "observer_input",
+		output_direction: "observer_output",
+		attempt_count: attemptCount,
+	};
+}
+
+function observerDiagnosticsAttemptCount(diagnostics: {
+	repairAttempted: boolean;
+	retryAttempted: boolean;
+}): number {
+	return diagnostics.repairAttempted || diagnostics.retryAttempted ? 2 : 1;
+}
+
+function normalizedObserverTokenCounts(
+	usage: ObserverTokenUsage | null,
+	provider: string,
+): {
+	inputTokens: number | null;
+	outputTokens: number | null;
+} {
+	if (!usage) return { inputTokens: null, outputTokens: null };
+	if (provider !== "anthropic") return usage;
+	return {
+		inputTokens:
+			usage.inputTokens + (usage.cacheReadInputTokens ?? 0) + (usage.cacheCreationInputTokens ?? 0),
+		outputTokens: usage.outputTokens,
+	};
+}
+
+interface ObserverUsageRecord {
+	recorded: boolean;
+	tokens: { inputTokens: number | null; outputTokens: number | null };
+	metadata: Record<string, unknown>;
+}
+
+function recordCompletedObserverUsage(
+	store: MemoryStore,
+	sessionId: number,
+	record: ObserverUsageRecord | null,
+): void {
+	if (!record || record.recorded) return;
+	recordObserverUsage(store, sessionId, record.tokens, record.metadata);
+	record.recorded = true;
+}
+
+function recordObserverUsage(
+	store: MemoryStore,
+	sessionId: number,
+	tokens: { inputTokens: number | null; outputTokens: number | null },
+	metadata: Record<string, unknown>,
+): void {
+	store.db
+		.prepare(
+			`INSERT INTO usage_events(session_id, event, tokens_read, tokens_written, created_at, metadata_json)
+			 VALUES (?, 'observer_call', ?, ?, ?, ?)`,
+		)
+		.run(
+			sessionId,
+			tokens.inputTokens,
+			tokens.outputTokens,
+			new Date().toISOString(),
+			toJson(metadata),
+		);
+}
+
+function captureMetadata(
+	enabled: boolean,
+	suppressedCount: number,
+	candidateCount: number,
+): Record<string, unknown> {
+	if (!enabled) return {};
+	return {
+		capture_suppressed_count: suppressedCount,
+		capture_candidate_count: candidateCount,
+		capture_routing_enabled: true,
+	};
 }

@@ -6,23 +6,110 @@ This page covers advanced plugin behavior, environment variables, and stream rel
 
 <img src="images/codemem-settings.png" alt="codemem observer settings" width="520" />
 
-## Running OpenCode 1 with the plugin
+## Running OpenCode with the plugin
 
-OpenCode 1 supports the capture and recall behavior below. The experimental OpenCode 2 beta entrypoint captures user and assistant messages, terminal usage, tool results, and session lifecycle events. It exposes manual `mem-status`, `mem-recent`, and `mem-stats` tools through `tool.transform` with `codemode: false`, but automatic recall remains disabled because the V2 context hook has no request kind or request ID.
+One `@codemem/opencode-plugin` package serves OpenCode 1.18.29+ through its
+`server()` entrypoint and OpenCode 2 through its `setup()` entrypoint. OpenCode 2
+support is validated against the exact stable `@opencode/cli@2.0.2` and
+`@opencode/plugin@2.0.2` releases; Codemem labels its OpenCode 2 integration
+beta. OpenCode 1 supports the capture and recall behavior below. On OpenCode 2
+the plugin captures user and assistant messages, terminal usage, tool results,
+and session lifecycle events. Its automatic recall uses `session.context` only:
+the latest user-message ID is required, missing identity skips safely, and
+retries or tool continuations replay retained context byte-for-byte.
+Compaction, title, and generate hooks remain isolated. Both the default message
+surface and legacy system surface work.
 
-1. Start OpenCode inside this repo (or make the plugin global so it globs in everywhere).
+1. Install the configured npm plugin on either host. OpenCode 1 contributors can instead remove that entry temporarily and start OpenCode inside this repo to load the checkout-local V1 source.
 2. Every tooling session creates memory artifacts in SQLite.
 3. Prompt-time memory injection appends volatile recall output to the latest user message by default, preserving the stable system/history prefix for provider prompt caches.
 4. Use `codemem stats` and `codemem recent` to confirm ingestion.
 5. Browse the viewer at the printed URL.
 
-OpenCode 1 loads configured npm plugins and project-local `.opencode/plugins/` files as separate sources. If both resolve to Codemem for the same project, the first registration remains active and later registrations skip all hooks with a warning. Remove the configured npm entry when testing checkout-local plugin changes so the local copy initializes first.
+OpenCode loads configured npm plugins and project-local `.opencode/plugins/` files as separate sources. In this repository, the local wrapper loads the V1 source but is a no-op on OpenCode 2. For OpenCode 1 source testing, temporarily remove the configured npm entry before launching from the checkout so the local wrapper cannot lose the first-registration race. For OpenCode 2 source testing, add this checkout's `packages/opencode-plugin` directory to the host's `cli.json` `plugins` list, temporarily remove the npm entry, and restart the TUI. Restore the npm entry after testing; removing it without adding the package directory leaves Codemem inactive on OpenCode 2.
+
+### OpenCode host support, troubleshooting, and rollback
+
+Host support at a glance:
+
+| Host | Requirement | Status |
+| --- | --- | --- |
+| OpenCode 1 | 1.18.29 or newer (`engines.opencode`) | Supported |
+| OpenCode 2 | validated on exact `@opencode/cli@2.0.2` and `@opencode/plugin@2.0.2` | Beta integration |
+
+Install on either host with `codemem setup --opencode-only` (or `npx -y codemem setup --opencode-only`). Setup writes the singular `plugin` key on purpose: OpenCode 1 requires it, and OpenCode 2 translates it into its native `plugins` configuration, so one entry serves both hosts. The manual `mem-status`, `mem-recent`, and `mem-stats` tools keep their hyphenated IDs on both hosts.
+
+Troubleshooting:
+
+- **No automatic recall on OpenCode 2.** Recall runs through `session.context` and requires a non-empty, non-whitespace latest user-message ID. When the ID is missing or blank, that turn skips recall rather than guessing identity; capture and the manual tools continue. Retries and tool continuations replay retained context and do not retrieve again, so a repeated turn without new context is expected.
+- **No notifications on OpenCode 2.** OpenCode 2 loads `@codemem/opencode-plugin/tui` automatically beside the server plugin. The companion subscribes to the server plugin's location-scoped RPC notices and replays notices emitted during startup. Restart the TUI after installing or upgrading the plugin; notification delivery is best-effort and does not affect capture or recall.
+- **Duplicate registration warning.** `codemem duplicate plugin registration skipped` in `~/.codemem/plugin.log` means OpenCode loaded Codemem twice for one project, usually a configured npm entry plus a checkout-local copy. Remove one of them. The first server registration owns notifications as well as capture and recall.
+- **Capture looks stalled on either host.** Run `codemem db raw-events-status` and follow the [post-restart config sanity checklist](#post-restart-config-sanity-checklist); both hosts share the same raw-event pipeline and spool behavior.
+
+Rollback:
+
+- **Stop the OpenCode 2 path.** Set `CODEMEM_PLUGIN_IGNORE=1` in the environment that launches OpenCode 2, or remove the Codemem plugin entry from that host's config. OpenCode 1 keeps working from the same installed package.
+- **Return to OpenCode 1.** Launch OpenCode 1.18.29+ with the same config. Both hosts write one raw-event stream and one SQLite database, so switching hosts in either direction needs no storage migration.
+- **Pin changes.** Codemem only moves its OpenCode 2 pin in a dedicated change that reruns the [pinned contract](opencode-v2-contract.md) and packed-host smoke tests; see [versioning](versioning.md#opencode-host-compatibility).
 
 ### Repository-only lint feedback
 
-When OpenCode runs from a codemem source checkout, the root `opencode.jsonc` loads `packages/opencode-plugin/src/lint-feedback.ts`; that repository-owned entrypoint runs the installed Biome launcher through Node without a shell. The hook checks JavaScript and TypeScript paths included by `biome.json` when handled by `edit`, `write`, or `apply_patch`, including move destinations; paths outside that configured Biome scope are ignored. It appends at most 10 new or worsened diagnostics and leaves the edit intact when Biome fails or exceeds its 10-second timeout. Existing diagnostics are a warning-level ratchet rather than a cleanup mandate.
+When OpenCode runs from a codemem source checkout, `.opencode/plugins/lint-feedback.js` auto-loads repository-owned OpenCode 1 and OpenCode 2 adapters backed by `packages/opencode-plugin/src/lint-feedback-core.ts`. Both run the installed Biome launcher through Node without a shell and check JavaScript or TypeScript paths included by `biome.json` when handled by `edit`, `write`, `apply_patch`, or `patch`, including move destinations; paths outside that configured Biome scope are ignored. They append at most 10 new or worsened diagnostics and leave the edit intact when Biome fails or exceeds its 10-second timeout. Existing diagnostics are a warning-level ratchet rather than a cleanup mandate.
 
-This hook is contributor tooling only. Neither the root OpenCode config nor `src/lint-feedback.ts` is included in the published `@codemem/opencode-plugin` package, so installing codemem does not activate it. Restart OpenCode after changing the checkout's plugin configuration.
+OpenCode 2 support is pinned and host-tested against 2.0.2. Its tool hooks make feedback visible in the successful tool result and isolate overlapping calls by session and call ID. OpenCode 2 exposes no shell post-execution hook, so shell-driven file changes bypass immediate feedback; run `pnpm lint:delta -- --base <ref>` at a stable checkpoint. Hook limitations never replace or disable the required CI ratchet.
+
+This hook is contributor tooling only. Neither the repository wrapper nor `src/lint-feedback.ts` is included in the published `@codemem/opencode-plugin` package, so installing codemem does not activate it. Restart OpenCode after changing the checkout's plugin configuration.
+
+The Biome pilot is the repository's bounded lint experiment. It covers package `src` trees, the canonical published OpenCode runtime under `packages/opencode-plugin/.opencode`, the two checkout plugin entrypoints, selected adapter hooks, package JSON, and root TypeScript configuration. The OpenCode runtime keeps its existing two-space formatting for package stability; Biome still applies lint rules, including the complexity-15 and 50-line production thresholds.
+
+The tracked JS/TS inventory at the 0.45.0 baseline is:
+
+| Source family | Files | Biome status |
+| --- | ---: | --- |
+| Existing package source and selected hooks/config | 770 | Covered |
+| Published OpenCode runtime and checkout entrypoints | 10 | Covered by this extension |
+| E2E harness | 36 | Excluded from this bounded pilot; exercised by E2E jobs |
+| Root scripts and configuration | 22 | Excluded except `scripts/ci-workflow.test.mjs` and `vitest.config.ts`; exercised by focused script tests |
+| Legacy CLI plugin harness | 18 | Excluded; compatibility tests run through the plugin smoke job |
+| Package support scripts, tests, and configuration | 12 | Excluded; package-specific checks remain authoritative |
+| Plugin package shims, smoke scripts, and contract fixture | 7 | Excluded; packed-artifact and host smoke tests remain authoritative |
+| Other adapter entrypoint | 1 | Excluded; adapter-normalizer tests remain authoritative |
+| Generated adapter bundles | 2 | Excluded; generated from `packages/core/src/claude-hooks.ts` and `codex-hooks.ts` |
+| Frozen evaluation snapshots | 2 | Excluded; immutable baseline fixtures |
+| Type declaration files | 4 | Excluded; checked by TypeScript/package contract tests |
+
+Generated normalizer bundles and frozen evaluation snapshots must not be lint-fixed directly. Change their source or regeneration workflow instead.
+
+Expanding coverage leaves the existing 1,592 warnings unchanged and exposes 63 warnings plus one informational diagnostic in the canonical runtime. The new diagnostics break down as follows:
+
+| Rule | Count |
+| --- | ---: |
+| `noExcessiveCognitiveComplexity` | 42 |
+| `noExcessiveLinesPerFunction` | 17 |
+| `noNestedTernary` | 2 |
+| `noUnusedFunctionParameters` | 1 |
+| `noPrototypeBuiltins` | 1 |
+| `noUselessEscapeInRegex` (information) | 1 |
+
+| Runtime path | Diagnostics |
+| --- | ---: |
+| `packages/opencode-plugin/.opencode/lib/runtime.js` | 50 |
+| `packages/opencode-plugin/.opencode/lib/opencode-v2-adapter.js` | 7 |
+| `packages/opencode-plugin/.opencode/lib/delegation-context.js` | 4 |
+| `packages/opencode-plugin/.opencode/lib/compat.js` | 2 |
+| `packages/opencode-plugin/.opencode/lib/raw-event-spool.js` | 1 |
+
+Run the same diagnostic comparison outside the editor with:
+
+```text
+pnpm lint:delta -- --base <git-ref> [--head <git-ref>] [--json]
+```
+
+`--base` is required. Pass `--head` for a committed ref-to-ref comparison; omit it to freeze the current working tree, including untracked files that are not ignored. The command materializes detached temporary worktrees and never stashes, resets, or checks out over the active worktree. It runs the pinned Biome binary with the head snapshot's policy against both sides, then compares diagnostics only for added, modified, renamed, or deleted paths.
+
+Exit code `0` means no new diagnostics or policy weakening, `1` means regressions were found, and `2` means the comparison could not be trusted. JSON output includes every regression; human output shows the first ten. Appending lint overrides is accepted only when every new override uses non-negated includes and adds error-only rules. Editing or removing existing overrides, adding exclusions or suppressions, weakening rule levels, removing includes, changing Git ignore policy, disabling linting, increasing thresholds, missing refs, tool failures, and malformed or incomplete Biome reports fail closed.
+
+Pull request CI runs this comparison inside the required `TypeScript Lint` job using the event's immutable base and tested merge commits. The silent CLI invocation uploads one valid, complete JSON report and emits at most ten annotations total; unchanged legacy debt passes. Because enforcement extends an existing required status, it needs no separate branch-protection setting. Comparison results are not cached, so revisions and tool or policy changes cannot reuse a stale result; dependency caching remains lockfile-keyed.
 
 OpenCode prompt-time pack construction and prompt-pack ledger transitions use the
 long-lived local viewer first. Retryable connection, timeout, endpoint-version,
@@ -366,6 +453,8 @@ Command/file token cache behavior:
 
 ## Stream-only mode (advanced)
 
+Raw events preserve captured activity independently of observer extraction.
+
 Stream contract:
 - Preflight availability: `GET /api/raw-events/status`
 - Event streaming: `POST /api/raw-events`
@@ -386,6 +475,102 @@ Stream contract:
 - Viewer mismatch notices expose only a fixed category and next action: restart Viewer from the same workspace/config for `database`, restart Codemem and OpenCode with the same environment for `identity`, update Codemem on the installed channel and restart OpenCode for `contract`, or check/restart Viewer for `connection`. Payloads, target values, subprocess output, paths, and addresses are omitted.
 - Corrupt spool entries are retained for recovery. The spool accepts at most `CODEMEM_RAW_EVENT_SPOOL_MAX_ENTRIES` `.json` entries and rejects a new event when full without evicting existing entries; an existing event ID remains idempotent. If a private spool write fails or the spool is full, OpenCode warns that the event remains only in the bounded in-memory queue rather than claiming durable preservation. OpenCode drains retained entries through the installed CLI, so repair or update that CLI and restart OpenCode; restarting Viewer alone does not recover this spool. If specific entries remain rejected, stop OpenCode and move `~/.codemem/opencode-raw-event-spool` to a backup location for manual recovery; do not delete it until the events are delivered or intentionally discarded.
 - `CODEMEM_RAW_EVENTS=0` pauses capture and every OpenCode spool drain. Existing spool files remain untouched until raw events are enabled again.
+
+### Delegated brief capture (OpenCode 1)
+
+A verified task brief is context for later work, not evidence of human approval or a new discovery.
+The OpenCode 1 adapter observes running `task` parts with `callID`,
+`state.input.{subagent_type,description,prompt}` and
+`state.metadata.{parentSessionId,sessionId}`. On the pinned OpenCode 1.18.30 host,
+`chat.message` receives the complete resolved message and parts before the host
+persists those parts individually.
+
+The production adapter requires that hook snapshot together with a matching live
+task binding. The snapshot must contain exactly one ordinary, non-ignored text part,
+with the exact task brief and requested child agent. It retains the original message
+and parts so later in-place hook changes are checked too.
+
+At the prompt-capture boundary, SDK reads cross-check the hook snapshot against the
+stored child session and message: parent/child IDs, message and part IDs, creation
+time, current agent and exact text must match. The child message must postdate the
+task start. A seemingly complete SDK read alone cannot qualify because it may show
+only partially persisted parts; missing snapshots or task metadata delivered after
+the hook leave provenance unknown.
+
+The parent assistant's agent is not used as the child's agent.
+
+The plugin freezes optional `capture_context` outside the event payload and ID seed.
+Spool replay preserves the same envelope. Ingress stores validated provenance in
+nullable `raw_events.capture_context_json`; the first accepted event wins on retries,
+including when it had no provenance. Invalid optional provenance stays unknown and
+does not reject valid raw data; existing identity validation remains strict. Old rows
+stay unknown, and access identity, project, visibility and memory kinds do not change.
+
+Classification revalidates the complete host report against the prompt's exact
+text and shape, including after adapter normalization. Removing private content
+can change the prompt hash: that mismatch safely yields unknown provenance, not
+proof of forgery. A host provenance report never grants access or proves human approval.
+
+A batch containing only proven briefs and harmless lifecycle bookkeeping completes
+without an observer request or durable memory. Raw events remain under the existing
+retention policy. Later tool or assistant findings use earlier briefs from the exact
+same source and stream as labeled observer context; they are not replayed as new
+events. A partial index supports bounded retrieval without scanning unrelated events.
+
+Recovered briefs follow all new evidence in the observer prompt. Their full text
+is sanitized before truncation, and the appended context block has a small aggregate
+cap including its label. Observer clipping can omit old context, but cannot displace
+the evidence prefix that would have been sent without it.
+
+The recovered `delegatedBriefs` list is transient observer context, not a duplicate
+stored in `sessions.metadata_json.session_context`. Other session-context fields
+remain intact, including a provenance-labeled `firstPrompt` when applicable.
+The context cap preserves complete XML entities and Unicode code points.
+
+Session-context backfill and extraction replay read the same validated raw-event
+sidecar as normal flushes. Replay refuses proven brief-only input before calling
+the observer (`ContextOnlyReplayError`, code `delegated_brief_context_only`),
+including batches without a local session mapping; mixed batches keep their labels
+and may recover earlier same-stream instructions. This refusal does not fabricate
+a successful extraction evaluation or alter the raw history.
+
+`memory extraction-replay` presents that context-only result as a non-error outcome
+with `status: "context_only"`, `code: "delegated_brief_context_only"`,
+`evaluated: false` and exit status zero. `memory extraction-benchmark` records it in
+`summary.contextOnlySkips`, increments `summary.contextOnlySkipped`, and continues
+the remaining batches and repetitions. The existing `runs`, output failures and
+all evaluation, stability, cost, latency and output-rate denominators exclude these
+skips; `summary.scheduledTotal` counts the full scheduled workload.
+
+The generated schema includes the nullable sidecar and its partial index. Existing
+database upgrades remain behind the normal compatibility gates; plain `connect()`
+does not add this column to an existing database. Legacy backfill/replay readers
+treat an absent column as unknown provenance without running a migration.
+
+| Bound | Limit |
+|---|---|
+| Observed task bindings, including replay guards | 128 per plugin instance |
+| Binding lifetime | 10 minutes |
+| Exact brief text | 64,000 characters |
+| Host metadata lookup at capture | 200 ms total; sibling failure and disposal abort outstanding reads |
+| Concurrent metadata lookups | At most the current binding-cache size; duplicate requests share a lookup |
+| Earlier instructions recovered for an observer batch | Latest 4 provenance-bearing events; at most 800 appended characters in aggregate, including label |
+
+Missing, late, expired, conflicting, synthetic or multipart provenance remains
+unknown; capture does not wait for a later metadata event. Replayed updates cannot
+bind a consumed task to a different message. Distinct later task calls can bind new
+messages in a reused child session; ambiguous simultaneous matches do not qualify.
+Restart and disposal discard live bindings but preserve already captured envelopes.
+Tasks that started before the plugin instance do not qualify. Disposal waits for
+capture preparation before checking durable delivery, and cancels active host
+lookups immediately rather than waiting for their timeout.
+Mixed batches continue normal extraction with proven instructions labeled as context.
+This is a host-specific provenance check, not a complete language classifier.
+OpenCode 2, Claude Code, Codex and Pi are unchanged; reviewer recall opt-out is a
+separate follow-up and is not enabled by this metadata. Restart OpenCode to load
+an updated plugin.
+
+### Stream diagnostics and settings
 
 `GET /api/raw-events/status` also includes `transcript_diagnostics`, a per-Viewer-process, per-router-instance counter block scoped explicitly to `legacy_compatibility_routes`. It counts Claude and Codex compatibility-route transcript reads by the fixed outcomes `ok`, `not_provided`, `path_rejected`, `unreadable`, `no_complete_record`, and `no_assistant_record`. These counters are not persisted, do not include paths or transcript content, and do not describe the normal generated-adapter path through `POST /api/raw-events`. A skipped legacy `Stop` response keeps `skip_reason: "transcript_unavailable"` and may include one of the non-`ok` outcomes as `skip_detail`; other mapping skips remain `skip_reason: "unsupported_hook"`.
 
@@ -477,7 +662,7 @@ If you run multiple adapters for the same project (for example OpenCode + Claude
 | `CODEMEM_INSTALL_KIND` | Internal/advanced release-guidance detection override (`npm-global`, `pnpm-global`, `mise`, `npx`, `docker`, `repo-dev`, `pinned`, or `unknown`). Markers do not prove ownership or enable installation. |
 | `CODEMEM_CODEX_ENDPOINT` | Override Codex OAuth endpoint. |
 | `CODEMEM_PLUGIN_DEBUG` | Set to `1`, `true`, or `yes` to log plugin lifecycle events. |
-| `CODEMEM_PLUGIN_IGNORE` | Skip all plugin behavior for this process. |
+| `CODEMEM_PLUGIN_IGNORE` | Skip all plugin behavior for this process on either OpenCode host. |
 | `CODEMEM_INJECT_CONTEXT` | Set to `0` to disable memory pack injection (default on). |
 | `CODEMEM_INJECT_SURFACE` | OpenCode injection surface: `message` by default; set `system` for the legacy system-prompt transform. |
 | `CODEMEM_INJECT_LIMIT` | Max memory items in injected pack (default `8`). |
@@ -502,7 +687,7 @@ If you run multiple adapters for the same project (for example OpenCode + Claude
 | `CODEMEM_OBSERVER_MAX_CHARS` | Max observer prompt characters (default `12000`). |
 | `CODEMEM_RAW_EVENTS_BACKOFF_MS` | Backoff window after stream failure before retrying stream POSTs (default `10000`). |
 | `CODEMEM_RAW_EVENTS_STATUS_CHECK_MS` | Minimum interval between stream availability preflight checks (default `30000`). |
-| `CODEMEM_RAW_EVENTS_HARD_MAX` | Hard upper bound for in-memory plugin queue under sustained failure pressure (default `2000`). |
+| `CODEMEM_RAW_EVENTS_HARD_MAX` | Hard upper bound for queued or in-flight raw-event deliveries under sustained failure pressure (default `2000`). Events rejected at delivery capacity remain in the bounded in-memory queue for flush or disposal retry instead of adding promise or detached-batch work. |
 | `CODEMEM_RAW_EVENT_SPOOL_DRAIN_LIMIT` | Max valid saved envelopes attempted per spool drain; corrupt entries do not consume this limit (default `20`). |
 | `CODEMEM_RAW_EVENT_SPOOL_MAX_ENTRIES` | Max `.json` entries in the OpenCode raw-event spool (default `2000`). A full spool rejects new event IDs without evicting existing entries; the failed write remains only in the bounded in-memory queue. |
 | `CODEMEM_RAW_EVENTS_AUTO_FLUSH` | Set to `1` to enable viewer-side debounced flush of streamed raw events (default off). |

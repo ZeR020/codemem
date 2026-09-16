@@ -10,9 +10,8 @@
 
 import { extractApplyPatchPaths, MUTATING_TOOL_NAMES } from "./apply-patch.js";
 import {
-	boundedDelegatedBriefs,
-	isDelegatedBrief,
 	isDelegatedBriefOnlyBatch,
+	partitionDelegatedBriefEvents,
 	promptContextText,
 } from "./capture-context.js";
 import { extractAdapterEvent, projectAdapterToolEvent } from "./ingest-events.js";
@@ -67,6 +66,9 @@ function summarizeObserverOutputFailure(exc: Error, providerTitle: string): stri
 		if (exc.code === "observer_auth_missing") {
 			return `${providerTitle} authentication is not configured for raw-event processing.`;
 		}
+		if (exc.code === "observer_timeout") {
+			return `${providerTitle} request timed out during raw-event processing.`;
+		}
 		return `${providerTitle} request failed during raw-event processing.`;
 	}
 	if (!(exc instanceof ObserverOutputError)) return null;
@@ -79,31 +81,29 @@ function summarizeObserverOutputFailure(exc: Error, providerTitle: string): stri
 	return `${providerTitle} structured response could not be processed.`;
 }
 
+function summarizeRawEventObserverFailure(
+	exc: RawEventObserverOutputError,
+	providerTitle: string,
+): string {
+	if (exc.reason === "lossy_repair") {
+		return `${providerTitle} returned structurally incomplete output that could not be repaired.`;
+	}
+	return `${providerTitle} returned no usable output for raw-event processing.`;
+}
+
 function summarizeFlushFailure(exc: Error, provider: string | null | undefined): string {
 	const providerTitle = providerDisplayName(provider);
-	const rawMessage = String(exc.message ?? "")
-		.trim()
-		.toLowerCase();
 
 	if (exc instanceof ObserverAuthError) {
 		return `${providerTitle} authentication failed. Refresh credentials and retry.`;
 	}
+	if (exc instanceof RawEventObserverOutputError) {
+		return summarizeRawEventObserverFailure(exc, providerTitle);
+	}
 	const observerOutputSummary = summarizeObserverOutputFailure(exc, providerTitle);
 	if (observerOutputSummary) return observerOutputSummary;
-	if (exc.name === "TimeoutError" || rawMessage.includes("timeout")) {
+	if (exc.name === "TimeoutError") {
 		return `${providerTitle} request timed out during raw-event processing.`;
-	}
-	if (
-		rawMessage === "observer failed during raw-event flush" ||
-		rawMessage === "observer produced no storable output for raw-event flush"
-	) {
-		return `${providerTitle} returned no usable output for raw-event processing.`;
-	}
-	if (rawMessage === "observer repair remained lossy during raw-event flush") {
-		return `${providerTitle} returned structurally incomplete output that could not be repaired.`;
-	}
-	if (/parse|xml|json/i.test(rawMessage)) {
-		return `${providerTitle} response could not be processed.`;
 	}
 	return `${providerTitle} processing failed during raw-event ingestion.`;
 }
@@ -151,16 +151,21 @@ function shouldRediagnoseLegacyNoOutputMicrobatch(
  *
  * Port of build_session_context() from raw_event_flush.py.
  */
-export function buildSessionContext(events: Record<string, unknown>[]): SessionContext {
+export function buildSessionContext(
+	events: Record<string, unknown>[],
+	{ contentEvents = events }: { contentEvents?: Record<string, unknown>[] } = {},
+): SessionContext {
 	let promptCount = 0;
 	let toolCount = 0;
 
-	for (const e of events) {
+	for (const e of contentEvents) {
 		if (e.type === "user_prompt") promptCount++;
 		if (e.type === "tool.execute.after") toolCount++;
 	}
 
 	const tsValues: number[] = [];
+	// Duration covers the complete event range even when delegated prompt content
+	// is excluded from the content-derived fields below.
 	for (const e of events) {
 		const ts = e.timestamp_wall_ms;
 		if (ts == null) continue;
@@ -186,7 +191,7 @@ export function buildSessionContext(events: Record<string, unknown>[]): SessionC
 
 	const filesModified = new Set<string>();
 	const filesRead = new Set<string>();
-	for (const e of events) {
+	for (const e of contentEvents) {
 		if (e.type !== "tool.execute.after") continue;
 		const tool = String(e.tool ?? "").toLowerCase();
 		const args = e.args;
@@ -225,7 +230,7 @@ export function buildSessionContext(events: Record<string, unknown>[]): SessionC
 	}
 
 	let firstPrompt: string | undefined;
-	for (const e of events) {
+	for (const e of contentEvents) {
 		if (e.type !== "user_prompt") continue;
 		const text = e.prompt_text;
 		if (typeof text === "string" && text.trim()) {
@@ -285,7 +290,6 @@ function isTerminalLowSignalSession(
 // ---------------------------------------------------------------------------
 
 function buildFlushSessionContext(
-	store: MemoryStore,
 	events: Record<string, unknown>[],
 	{
 		opencodeSessionId,
@@ -301,7 +305,9 @@ function buildFlushSessionContext(
 		batchId: number;
 	},
 ): SessionContext {
-	const context = buildSessionContext(normalizeEventsForSessionContext(events));
+	const normalizedEvents = normalizeEventsForSessionContext(events);
+	const { primaryEvents } = partitionDelegatedBriefEvents(normalizedEvents);
+	const context = buildSessionContext(normalizedEvents, { contentEvents: primaryEvents });
 	context.opencodeSessionId = opencodeSessionId;
 	context.source = source;
 	context.streamId = opencodeSessionId;
@@ -310,14 +316,8 @@ function buildFlushSessionContext(
 		batch_id: batchId,
 		start_event_seq: startEventSeq,
 		end_event_seq: lastEventSeq,
+		extractor_version: EXTRACTOR_VERSION,
 	};
-	const priorBriefs = boundedDelegatedBriefs(
-		store
-			.priorDelegatedBriefEvents(opencodeSessionId, source, startEventSeq)
-			.filter(isDelegatedBrief)
-			.map((event) => String(event.prompt_text)),
-	);
-	if (priorBriefs.length) context.delegatedBriefs = priorBriefs;
 	return context;
 }
 
@@ -476,7 +476,7 @@ export async function flushRawEvents(
 		return { flushed: 0, updatedState: 0 };
 	}
 
-	const sessionContext = buildFlushSessionContext(store, events, {
+	const sessionContext = buildFlushSessionContext(events, {
 		opencodeSessionId,
 		source,
 		startEventSeq,

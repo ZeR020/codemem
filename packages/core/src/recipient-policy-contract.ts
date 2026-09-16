@@ -2,6 +2,112 @@ export const RECIPIENT_POLICY_CONTRACT_VERSION = 1 as const;
 
 export type RecipientPolicyContractVersion = typeof RECIPIENT_POLICY_CONTRACT_VERSION;
 
+export const RECIPIENT_POLICY_TEAM_RENAME_ERROR_CODES = [
+	"team_name_invalid",
+	"team_not_found",
+	"team_rename_stale",
+	"team_link_stale",
+	"team_link_ambiguous",
+	"team_coordinator_rename_failed",
+	"team_local_rename_pending",
+	"team_rename_failed",
+] as const;
+
+export type RecipientPolicyTeamRenameErrorCode =
+	(typeof RECIPIENT_POLICY_TEAM_RENAME_ERROR_CODES)[number];
+
+export interface RecipientPolicyTeamRenameResultV1 {
+	version: 1;
+	teamId: string;
+	displayName: string;
+	revision: string;
+	linkedCoordinatorGroupRenamed: boolean;
+}
+
+export type RecipientPolicyEdgeRecipientRefV1 =
+	| { recipientKind: "identity"; identityId: string }
+	| { recipientKind: "team"; teamId: string };
+
+export interface RecipientPolicyEdgeChangeV1 {
+	canonicalProjectIdentity: string;
+	recipient: RecipientPolicyEdgeRecipientRefV1;
+	action: "add" | "remove";
+}
+
+export interface RecipientPolicyEdgePreviewRequestV1 {
+	version: 1;
+	changes: RecipientPolicyEdgeChangeV1[];
+}
+
+export interface RecipientPolicyEdgeCommitRequestV1 extends RecipientPolicyEdgePreviewRequestV1 {
+	reviewedPolicyDigest: string;
+}
+
+export interface RecipientPolicyEdgePreviewProjectV1 {
+	canonicalProjectIdentity: string;
+	displayName: string;
+	existingMemoryCount: number;
+	futureMemoriesShared: true;
+}
+
+export interface RecipientPolicyEdgeIdentitySummaryV1 {
+	identityId: string;
+	displayName: string;
+	verification: "local";
+}
+
+export type RecipientPolicyEdgeSelectedRecipientV1 =
+	| ({ recipientKind: "identity" } & RecipientPolicyEdgeIdentitySummaryV1)
+	| {
+			recipientKind: "team";
+			teamId: string;
+			displayName: string;
+			currentMembers: RecipientPolicyEdgeIdentitySummaryV1[];
+			futureMembersInherit: true;
+	  };
+
+export interface RecipientPolicyEdgeEffectiveDeviceV1 {
+	canonicalProjectIdentity: string;
+	identityId: string;
+	deviceId: string;
+	displayName: string;
+}
+
+export interface RecipientPolicyEdgePreviewResponseV1 {
+	version: 1;
+	normalizedChanges: RecipientPolicyEdgeChangeV1[];
+	outcomes: RecipientPolicyEdgeCommitOutcomeV1[];
+	projects: RecipientPolicyEdgePreviewProjectV1[];
+	selectedRecipients: RecipientPolicyEdgeSelectedRecipientV1[];
+	effectiveDevices: RecipientPolicyEdgeEffectiveDeviceV1[];
+	unchangedProjects: RecipientPolicyEdgePreviewProjectV1[];
+	reviewedPolicyDigest: string;
+	addCount: number;
+	removeCount: number;
+	netWriteCount: number;
+}
+
+export type RecipientPolicyEdgeOutcomeV1 =
+	| "added"
+	| "removed"
+	| "already_present"
+	| "already_absent";
+
+export interface RecipientPolicyEdgeCommitOutcomeV1 {
+	change: RecipientPolicyEdgeChangeV1;
+	outcome: RecipientPolicyEdgeOutcomeV1;
+}
+
+export interface RecipientPolicyEdgeCommitResultV1 {
+	version: 1;
+	status: "applied" | "stale" | "invalid" | "not_found" | "conflict";
+	reviewedPolicyDigest: string;
+	errorCode: string | null;
+	outcomes: RecipientPolicyEdgeCommitOutcomeV1[];
+	writeCount: number;
+	idempotent: boolean;
+}
+
 export type RecipientPolicyIdentityKindV1 = "personal" | "work" | "other";
 export type RecipientPolicyIdentityStatusV1 = "active" | "pending" | "merged";
 

@@ -1,9 +1,9 @@
-import { appendFile, mkdir } from "node:fs/promises";
-import { existsSync, readFileSync } from "node:fs";
-import { basename, dirname, join, posix, resolve, win32 } from "node:path";
-import { homedir } from "node:os";
+import { execSync, spawn as nodeSpawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { spawn as nodeSpawn, execSync } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
+import { appendFile, mkdir } from "node:fs/promises";
+import { homedir } from "node:os";
+import { basename, dirname, join, posix, resolve, win32 } from "node:path";
 import {
   isVersionAtLeast,
   parseBackendUpdatePolicy,
@@ -11,11 +11,12 @@ import {
   resolveAutoUpdatePlan,
   resolveUpgradeGuidance,
 } from "./compat.js";
+import { V2_ADAPTER_DIAGNOSTICS } from "./host-contract.js";
 import {
   DEFAULT_DRAIN_LIMIT,
   DEFAULT_MAX_ENTRIES,
-  RAW_EVENT_SPOOL_FULL_CODE,
   loadRawEventSpoolEntries,
+  RAW_EVENT_SPOOL_FULL_CODE,
   removeRawEventSpoolEntry,
   resolveSpoolDirectory,
   writeRawEventSpoolEntry,
@@ -23,7 +24,7 @@ import {
 
 const TRUTHY_VALUES = ["1", "true", "yes"];
 const DISABLED_VALUES = ["0", "false", "off"];
-const PINNED_BACKEND_VERSION = "0.44.0";
+const PINNED_BACKEND_VERSION = "0.45.0";
 const COMPAT_CHECK_DELAY_MS = 1500;
 const COMPAT_CHECK_CACHE_TTL_MS = 5 * 60 * 1000;
 const MAX_UPDATE_STATUS_BYTES = 16 * 1024;
@@ -33,6 +34,7 @@ const RELEASE_VERSION =
   /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
 const CODEMEM_CONTEXT_PART_ID_PREFIX = "codemem-context-";
 const MAX_MESSAGE_INJECTION_CACHE_SESSIONS = 20;
+const MAX_MESSAGE_INJECTION_CACHE_ENTRIES = 100;
 const COMPACTION_INJECTION_SKIP_TTL_MS = 30 * 1000;
 const MAX_WORKING_SET_PATH_CHARS = 400;
 const VIEWER_HEALTH_CHECK_INTERVAL_MS = 60_000;
@@ -46,15 +48,7 @@ const CODEMEM_CONTEXT_PREFIX = "[codemem context]\n";
 const DEFAULT_EMBEDDING_MODEL = "Xenova/bge-small-en-v1.5";
 const DEFAULT_EMBEDDING_REVISION = "ea104dacec62c0de699686887e3f920caeb4f3e3";
 const PLUGIN_REGISTRATIONS_KEY = Symbol.for("codemem.opencode-plugin.registrations");
-const ADAPTER_DIAGNOSTIC_CODES = new Set([
-  "v2_event_capture_failed",
-  "v2_event_stream_cleanup_timeout",
-  "v2_event_stream_ended_unexpectedly",
-  "v2_event_stream_failed",
-  "v2_registration_cleanup_timeout",
-  "v2_runtime_cleanup_timeout",
-  "v2_tool_capture_failed",
-]);
+const ADAPTER_DIAGNOSTIC_CODES = new Set(Object.values(V2_ADAPTER_DIAGNOSTICS));
 
 let compatCheckCache = null;
 const notifiedReleaseVersions = new Set();
@@ -255,7 +249,7 @@ const resolveInjectSurface = (value) => {
   return "message";
 };
 
-const hasOwn = (value, key) => Object.prototype.hasOwnProperty.call(value || {}, key);
+const hasOwn = (value, key) => Object.hasOwn(value || {}, key);
 
 const deterministicUuid = (namespace, components) => {
   const hex = createHash("sha256")
@@ -338,7 +332,7 @@ const classifyFallbackCommandResult = (result) => {
   if (structured.code === "validation_error" || /invalid raw event|session id required/i.test(diagnostic)) {
     return { retryable: false, cause: "enqueue-raw-event validation failed" };
   }
-  if (/unknown command ['\"]?enqueue-raw-event|command not found|\bENOENT\b/i.test(diagnostic)) {
+  if (/unknown command ['"]?enqueue-raw-event|command not found|\bENOENT\b/i.test(diagnostic)) {
     return { retryable: false, cause: "enqueue-raw-event command unavailable" };
   }
   const exitCode = result?.exitCode ?? "unknown";
@@ -394,7 +388,7 @@ const clearCompatCheckCache = () => {
 const parseReleaseVersion = (value) => {
   if (typeof value !== "string" || value.length > MAX_UPDATE_VERSION_CHARS) return null;
   const match = RELEASE_VERSION.exec(value);
-  if (!match || !match.slice(1, 4).map(Number).every(Number.isSafeInteger)) return null;
+  if (!match?.slice(1, 4).map(Number).every(Number.isSafeInteger)) return null;
   const prerelease = match[4]?.split(".") || [];
   if (prerelease.some((identifier) => /^0\d+$/.test(identifier))) return null;
   return { core: match.slice(1, 4).map(Number), prerelease };
@@ -510,7 +504,7 @@ const createLogLine = (logPath) => async (line) => {
   try {
     await mkdir(dirname(logPath), { recursive: true });
     await appendFile(logPath, `${new Date().toISOString()} ${line}\n`);
-  } catch (err) {
+  } catch {
     // ignore logging failures
   }
 };
@@ -550,7 +544,7 @@ const createDebugLogger = ({ debug, host, logTimeoutMs, getLogLine, getErrorLogL
       if (timedOut) {
         await getLogLine()("debug log timed out");
       }
-    } catch (err) {
+    } catch {
       // ignore debug logging failures
     }
   };
@@ -717,7 +711,7 @@ const buildPackArgs = ({ query, filesModified, injectLimit, injectTokenBudget, i
 };
 
 const parsePackText = (stdout) => {
-  if (!stdout || !stdout.trim()) {
+  if (!stdout?.trim()) {
     return "";
   }
   try {
@@ -729,7 +723,7 @@ const parsePackText = (stdout) => {
 };
 
 const parsePackMetrics = (stdout) => {
-  if (!stdout || !stdout.trim()) {
+  if (!stdout?.trim()) {
     return null;
   }
   try {
@@ -923,11 +917,11 @@ const classifyPromptTransportFailure = ({ kind, compatibleProfile = false }) => 
 };
 
 const isViewerPolicyOrAuthFailurePayload = (payload) => {
-  const code = isRecord(payload) && isRecord(payload.error)
-    ? payload.error.code
-    : isRecord(payload)
-    ? payload.error
-    : null;
+  let code = null;
+  if (isRecord(payload)) {
+    if (isRecord(payload.error)) code = payload.error.code;
+    else code = payload.error;
+  }
   return typeof code === "string" && [
     "authorization_failed",
     "forbidden",
@@ -1240,7 +1234,52 @@ const getSessionMessageInjectionCache = (messageInjectionCache, sessionID) => {
   return sessionCache;
 };
 
-const normalizeInjectedMessageParts = (messages, sessionCache, { pruneAbsent = true } = {}) => {
+const setSessionMessageInjectionCacheEntry = (
+  sessionCache,
+  messageID,
+  value,
+  { preserveMessageIDs = new Set(), evictionSnapshot = null } = {},
+) => {
+  sessionCache.delete(messageID);
+  sessionCache.set(messageID, value);
+  while (sessionCache.size > MAX_MESSAGE_INJECTION_CACHE_ENTRIES) {
+    // Protect host-visible blocks and entries published after this transform began.
+    const oldestMessageID = [...sessionCache.keys()].find((id) =>
+      !preserveMessageIDs.has(id)
+      && (!evictionSnapshot || (evictionSnapshot.has(id) && evictionSnapshot.get(id) === sessionCache.get(id))),
+    );
+    if (!oldestMessageID) break;
+    sessionCache.delete(oldestMessageID);
+  }
+};
+
+const commitImmediateDelivery = (commit) => commit();
+
+const createSessionFinalizationMutex = () => {
+  const tails = new Map();
+  return async (sessionID) => {
+    if (!sessionID) return () => {};
+    const key = String(sessionID);
+    const previous = tails.get(key) || Promise.resolve();
+    let releaseOwner = () => {};
+    const owner = new Promise((resolve) => { releaseOwner = resolve; });
+    tails.set(key, owner);
+    await previous;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      releaseOwner();
+      if (tails.get(key) === owner) tails.delete(key);
+    };
+  };
+};
+
+const normalizeInjectedMessageParts = (
+  messages,
+  sessionCache,
+  { pruneAbsent = true, evictionSnapshot = null, commitDelivery = commitImmediateDelivery } = {},
+) => {
   const presentIds = new Set(messages.map(resolveEntryMessageId).filter(Boolean));
   for (const id of sessionCache?.keys() || []) {
     if (pruneAbsent && !presentIds.has(id)) sessionCache.delete(id);
@@ -1255,16 +1294,21 @@ const normalizeInjectedMessageParts = (messages, sessionCache, { pruneAbsent = t
     const parts = entry.parts.filter(isCodememContextPart);
     if (parts.length && sessionCache && messageId) {
       const cached = sessionCache.get(messageId);
-      sessionCache.set(messageId, {
-        ...cached,
-        text: parts[0].text,
-        parts: parts.map((part) => {
-          const recall = retainedPartRecall(part, cached?.parts);
-          return recall
-            ? { ...part, metadata: { ...part.metadata, codemem: recall } }
-            : { ...part };
-        }),
-      });
+      commitDelivery(() => setSessionMessageInjectionCacheEntry(
+        sessionCache,
+        messageId,
+        {
+          ...cached,
+          text: parts[0].text,
+          parts: parts.map((part) => {
+            const recall = retainedPartRecall(part, cached?.parts);
+            return recall
+              ? { ...part, metadata: { ...part.metadata, codemem: recall } }
+              : { ...part };
+          }),
+        },
+        { preserveMessageIDs: presentIds, evictionSnapshot },
+      ));
     }
   }
 };
@@ -1290,6 +1334,7 @@ const appendCachedInjectedContextParts = async (
   options = {},
 ) => {
   let appended = 0;
+  const presentMessageIDs = new Set(messages.map(resolveEntryMessageId).filter(Boolean));
   for (let index = 0; index < messages.length; index += 1) {
     const entry = messages[index];
     if (!isUserMessageEntry(entry) || !Array.isArray(entry.parts)) {
@@ -1304,6 +1349,17 @@ const appendCachedInjectedContextParts = async (
     if (!text) {
       continue;
     }
+    const commitDelivery = options.commitDelivery || commitImmediateDelivery;
+    commitDelivery(() => {
+      const current = sessionCache.get(messageId);
+      if (!current) return;
+      setSessionMessageInjectionCacheEntry(
+        sessionCache,
+        messageId,
+        current,
+        { preserveMessageIDs: presentMessageIDs, evictionSnapshot: options.evictionSnapshot },
+      );
+    });
     let attemptId = cached?.attemptId || null;
     let cacheReuseReady = null;
     if (
@@ -1364,6 +1420,7 @@ const applyInjectedContextToMessages = async ({
   resolveInjectQuery,
   buildInjectedContext,
   messageInjectionCache,
+  emptyRecallCache,
   compactionInjectionSkips,
   confirmDelivery,
   recordCacheReuse,
@@ -1372,6 +1429,12 @@ const applyInjectedContextToMessages = async ({
   retainedTokenBudget = DEFAULT_RETAINED_TOKEN_BUDGET,
   workingSet = [],
   recordMeasurement,
+  commitDelivery = commitImmediateDelivery,
+  beginFinalization = async () => {},
+  pruneAbsentCacheEntries = true,
+  requireLatestUserMessageID = false,
+  cacheSuccessfulEmpty = false,
+  surface = "message",
 }) => {
   const hasMessages = Array.isArray(output?.messages);
   const hookSessionID = input?.sessionID || null;
@@ -1381,9 +1444,12 @@ const applyInjectedContextToMessages = async ({
   // Both transforms use the hook session when an entry omits session identity.
   const messages = scopeMessagesToSession(hookMessages, sessionID);
   const report = (reason, newTokens = 0, duplicates = 0) => {
+    const systemPart = latestUser?.entry.parts?.find(isCodememContextPart);
     const measurement = {
       new_tokens: newTokens,
-      retained_tokens: countRetainedInjectionTokens(messages),
+      retained_tokens: surface === "system"
+        ? estimateTokens(systemPart?.text || "")
+        : countRetainedInjectionTokens(messages),
       duplicates_omitted: duplicates,
       reason,
     };
@@ -1400,7 +1466,11 @@ const applyInjectedContextToMessages = async ({
   }
   if (consumeCompactionInjectionSkip(compactionInjectionSkips, sessionID)) {
     const cache = getSessionMessageInjectionCache(messageInjectionCache, sessionID);
-    normalizeInjectedMessageParts(messages, cache, { pruneAbsent: false });
+    normalizeInjectedMessageParts(messages, cache, {
+      pruneAbsent: false,
+      evictionSnapshot: cache ? new Map(cache) : null,
+      commitDelivery,
+    });
     recordSkipped?.("compaction_skipped", sessionID);
     report("compaction_skipped");
     return false;
@@ -1411,22 +1481,35 @@ const applyInjectedContextToMessages = async ({
     return false;
   }
 
-  const sessionCache = getSessionMessageInjectionCache(messageInjectionCache, sessionID);
-  normalizeInjectedMessageParts(messages, sessionCache);
-
   const latestMessageId = resolveEntryMessageId(latestUser.entry);
+  const sessionCache = getSessionMessageInjectionCache(messageInjectionCache, sessionID);
+  const emptySessionCache = cacheSuccessfulEmpty
+    ? getSessionMessageInjectionCache(emptyRecallCache, sessionID)
+    : null;
+  const evictionSnapshot = sessionCache ? new Map(sessionCache) : null;
+  const emptyEvictionSnapshot = emptySessionCache ? new Map(emptySessionCache) : null;
+  normalizeInjectedMessageParts(messages, sessionCache, {
+    pruneAbsent: pruneAbsentCacheEntries, evictionSnapshot, commitDelivery,
+  });
+
   const canReplay = Boolean(sessionCache && latestMessageId);
   const latestCached = canReplay ? sessionCache.get(latestMessageId) : null;
+  const latestWasEmpty = Boolean(latestMessageId && emptySessionCache?.has(latestMessageId));
   const latestWasCached = Boolean(latestCached) || latestUser.entry.parts?.some(isCodememContextPart);
   if (sessionCache) {
     try {
       await appendCachedInjectedContextParts(messages, sessionCache, sessionID, {
-        latestMessageId, confirmDelivery, recordCacheReuse,
+        latestMessageId, confirmDelivery, recordCacheReuse, evictionSnapshot, commitDelivery,
       });
     } catch (error) {
       report("delivery_failed");
       throw error;
     }
+  }
+  if (requireLatestUserMessageID && !latestMessageId) {
+    recordSkipped?.("missing_message_identity", sessionID);
+    report("missing_message_identity");
+    return false;
   }
   const retainedTokens = countRetainedInjectionTokens(messages);
   const fullBudget = Math.min(injectTokenBudget, Math.max(0, retainedTokenBudget - retainedTokens));
@@ -1434,7 +1517,7 @@ const applyInjectedContextToMessages = async ({
   let newlyDelivered = 0;
   let duplicates = 0;
   let reason = latestWasCached ? "replay" : "no_context";
-  if (!latestWasCached) {
+  if (!latestWasCached && !latestWasEmpty) {
     if (reserveContextPrefixBudget(fullBudget) === null) {
       if (reserveContextPrefixBudget(injectTokenBudget) !== null) {
         recordSkipped?.("allowance_exhausted", sessionID);
@@ -1448,22 +1531,30 @@ const applyInjectedContextToMessages = async ({
       firstPrompt: firstUser ? extractMessageText(firstUser.entry) : null,
       lastPromptText: extractMessageText(latestUser.entry),
     });
-    const injected = await buildInjectedContext(query, {
+    let injected = await buildInjectedContext(query, {
       sessionID,
       requestKey: latestMessageId || fallbackEntryMessageId(latestUser.entry, latestUser.index),
       fallbackTurn: sessionID && latestMessageId ? null : latestUser.index,
-      surface: "message",
+      surface,
       tokenBudget: fullBudget,
       retainedItems: retainedMemoryFingerprints(messages, sessionCache),
       retainedMetadata: retainedMetadataGaps(messages, sessionCache),
       workingContext,
       continuationOnly: isContinuationOnly(extractMessageText(latestUser.entry), messages, workingContext, sessionCache),
     });
+    await beginFinalization(sessionID);
     // Another transform may have delivered while retrieval was awaiting I/O.
     if (sessionCache) {
       await appendCachedInjectedContextParts(messages, sessionCache, sessionID, {
-        latestMessageId, confirmDelivery, recordCacheReuse,
+        latestMessageId, confirmDelivery, recordCacheReuse, evictionSnapshot, commitDelivery,
       });
+    }
+    if (injected?.refilter) {
+      const { refilter, ...retrieval } = injected;
+      injected = {
+        ...retrieval,
+        ...refilter(retainedMemoryFingerprints(messages, sessionCache, evictionSnapshot)),
+      };
     }
     if (latestUser.entry.parts?.some(isCodememContextPart)) {
       duplicates = injected?.duplicates || 0;
@@ -1502,29 +1593,42 @@ const applyInjectedContextToMessages = async ({
           confirmDelivery?.(injected.attemptId, "handed_off", injected.evaluation);
         }
         if (canReplay) {
-          sessionCache.set(latestMessageId, {
-            ...injected,
-            parts: latestUser.entry.parts.filter(isCodememContextPart).map((part) => ({ ...part })),
-            reuseCount: 0,
-          });
+          commitDelivery(() => setSessionMessageInjectionCacheEntry(
+            sessionCache,
+            latestMessageId,
+            {
+              ...injected,
+              parts: latestUser.entry.parts.filter(isCodememContextPart).map((part) => ({ ...part })),
+              reuseCount: 0,
+            },
+            {
+              preserveMessageIDs: new Set(messages.map(resolveEntryMessageId).filter(Boolean)),
+              evictionSnapshot,
+            },
+          ));
         }
       }
 
       const toastKey = sessionID || latestMessageId || "unknown";
-      if (!injectionToastShown.has(toastKey) && showToast) {
+      await commitDelivery(async () => {
+        if (injectionToastShown.has(toastKey) || !showToast) return;
         injectionToastShown.add(toastKey);
         try {
           await showToast(buildInjectionToastMessage(injected.metrics));
         } catch {
-          // best-effort only
+          return;
         }
-      }
+      });
     } else if (injected?.skipReason) {
       // The retrieval already has an attempt. Withheld output is not a second retrieval.
       if (injected.attemptId) confirmDelivery?.(injected.attemptId, "unknown", injected.evaluation);
     } else if (injected?.text) {
       reason = "budget_rejected";
       if (injected.attemptId) confirmDelivery?.(injected.attemptId, "failed", injected.evaluation);
+    } else if (emptySessionCache && latestMessageId && injected?.cacheableEmpty) {
+      commitDelivery(() => setSessionMessageInjectionCacheEntry(
+        emptySessionCache, latestMessageId, true, { evictionSnapshot: emptyEvictionSnapshot },
+      ));
     }
   }
   report(reason, newlyDelivered, duplicates);
@@ -1590,17 +1694,26 @@ const isContinuationOnly = (prompt, messages, workingContext, sessionCache) => {
   return false;
 };
 
-const retainedMemoryFingerprints = (messages, sessionCache) => {
+const retainedMemoryFingerprints = (messages, sessionCache, evictionSnapshot = null) => {
   const retained = new Set();
-  for (const entry of messages) {
-    for (const part of (entry.parts || []).filter(isCodememContextPart)) {
-      const recall = retainedPartRecall(part, sessionCache?.get(resolveEntryMessageId(entry))?.parts);
+  const collect = (parts, cachedParts = []) => {
+    for (const part of (parts || []).filter(isCodememContextPart)) {
+      const recall = retainedPartRecall(part, cachedParts);
       if (recall?.v !== 1 || recall.digest !== injectionDigest(String(part.text || ""))) continue;
       for (const item of Array.isArray(recall.items) ? recall.items : []) {
         if (isRecord(item) && Number.isSafeInteger(item.id) && item.id > 0 && /^[a-f0-9]{64}$/.test(item.fingerprint)) {
           retained.add(`${item.id}:${item.fingerprint}`);
         }
       }
+    }
+  };
+  for (const entry of messages) {
+    collect(entry.parts, sessionCache?.get(resolveEntryMessageId(entry))?.parts);
+  }
+  if (evictionSnapshot) {
+    for (const [messageID, cached] of sessionCache?.entries() || []) {
+      if (evictionSnapshot.get(messageID) === cached) continue;
+      collect(cached?.parts, cached?.parts);
     }
   }
   return retained;
@@ -1886,6 +1999,7 @@ const buildRawEventEnvelope = ({
   nowMs,
   nowMono,
   nextEventId,
+  captureContext,
 }) => ({
   session_stream_id: sessionID,
   session_id: sessionID,
@@ -1898,6 +2012,7 @@ const buildRawEventEnvelope = ({
   cwd,
   project,
   started_at: startedAt,
+  ...(captureContext ? { capture_context: captureContext } : {}),
 });
 
 const trimEventQueue = ({ events, maxEvents, hardMaxEvents, onUnsentPressure, onForcedDrop }) => {
@@ -1941,7 +2056,7 @@ const attachAdapterEvent = ({ sessionID, event }) => {
   let adapterEvent = null;
   try {
     adapterEvent = buildOpencodeAdapterEvent({ sessionID, event });
-  } catch (err) {
+  } catch {
     return event;
   }
   if (!adapterEvent) {
@@ -2054,18 +2169,6 @@ const detectRunner = ({ cwd, envRunner }) => {
   return "npx";
 };
 
-/**
- * Check if the TS CLI is available at the given path.
- * Used by the "node" runner to verify the built CLI exists.
- */
-const tsCliAvailable = (cliPath) => {
-  try {
-    return require("fs").existsSync(cliPath);
-  } catch {
-    return false;
-  }
-};
-
 // When an explicit npx override targets the codemem package, pair it with the
 // matching @codemem/embeddings spec so the detached Viewer can resolve the
 // optional runtime instead of silently falling back to lexical search. Returns
@@ -2124,6 +2227,12 @@ export const createCodememRuntime = async ({ location, host }) => {
   const hostNotify = typeof host?.notify === "function" ? host.notify : null;
   const events = [];
   const flushingBatches = new Set();
+  // Session boundaries retain distinct owners but share one serialized drain.
+  const pendingBoundaryBatches = [];
+  let boundaryDrain = null;
+  let deferredFlush = null;
+  const queuedEventOrder = new WeakMap();
+  let nextQueuedEventOrder = 0;
   const maxEvents = parsePositiveInt(process.env.CODEMEM_PLUGIN_MAX_EVENTS, 200);
   const maxChars = Number.parseInt(
     process.env.CODEMEM_PLUGIN_MAX_EVENT_CHARS || "8000",
@@ -2235,6 +2344,8 @@ export const createCodememRuntime = async ({ location, host }) => {
   }
   const injectionToastShown = new Set();
   const messageInjectionCache = new Map();
+  const emptyRecallCache = new Map();
+  const acquireSessionFinalization = createSessionFinalizationMutex();
   const compactionInjectionSkips = new Map();
   const disabledInjectionRecorded = new Set();
   const latestPolicySkips = new Map();
@@ -2242,6 +2353,7 @@ export const createCodememRuntime = async ({ location, host }) => {
   const promptPackRetryCounts = new Map();
   const successfulPromptPackArtifacts = new Map();
   let sessionStartedAt = null;
+  let sessionStartSessionID = null;
   let activeSessionID = null;
   let viewerStarted = false;
   let viewerStartInFlight = false;
@@ -2259,8 +2371,6 @@ export const createCodememRuntime = async ({ location, host }) => {
   const messageRoles = new Map();
   const messageTexts = new Map();
   const promptPartsByMessage = new Map();
-  let debugLogCount = 0;
-
   const rawEventsEnabled = envNotDisabled(
     process.env.CODEMEM_RAW_EVENTS || "1"
   );
@@ -2285,6 +2395,7 @@ export const createCodememRuntime = async ({ location, host }) => {
     process.env.CODEMEM_RAW_EVENTS_HARD_MAX || "2000",
     2000
   );
+  const rawEventQueueCapacity = Math.max(maxEvents, rawEventsHardMax);
   const rawEventSpoolDrainLimit = parsePositiveInt(
     process.env.CODEMEM_RAW_EVENT_SPOOL_DRAIN_LIMIT,
     DEFAULT_DRAIN_LIMIT,
@@ -2298,6 +2409,14 @@ export const createCodememRuntime = async ({ location, host }) => {
   // Memoize the exact serialized envelope by queued-object identity so retries
   // cannot drift in timestamp, ID, property order, or bytes.
   const rawEventEnvelopes = new WeakMap();
+  const rawEventCaptureContexts = new WeakMap();
+  const rawEventPreparations = new WeakMap();
+  const rawEventDeliveries = new WeakMap();
+  const rawEventStartedAts = new WeakMap();
+  const capacityDeferredEvents = new Set();
+  let rawEventDeliveryCount = 0;
+  let rawEventDeliveryTail = Promise.resolve();
+  let flushDeliveryTail = Promise.resolve();
   let streamUnavailableUntil = 0;
   let spoolPersistenceFailureNoted = null;
   let spoolLoadFailureNoted = false;
@@ -2521,13 +2640,14 @@ export const createCodememRuntime = async ({ location, host }) => {
     return args;
   };
 
-  const emitRawEvent = async ({ sessionID, type, payload }) => {
+  const deliverRawEvent = async ({ sessionID, type, payload }) => {
     if (!rawEventsEnabled) {
       return true;
     }
     if (!sessionID || !type) {
       return false;
     }
+    if (payload?._raw_enqueued) return true;
     const now = Date.now();
     let cachedEnvelope = payload && typeof payload === "object"
       ? rawEventEnvelopes.get(payload)
@@ -2539,13 +2659,16 @@ export const createCodememRuntime = async ({ location, host }) => {
         payload,
         cwd,
         project: resolveProjectName(project, cwd),
-        startedAt: sessionStartedAt,
+        startedAt: rawEventStartedAts.has(payload)
+          ? rawEventStartedAts.get(payload)
+          : sessionStartedAt,
         nowMs: now,
         nowMono:
           typeof performance !== "undefined" && performance.now
             ? performance.now()
             : null,
         nextEventId,
+        captureContext: rawEventCaptureContexts.get(payload),
       });
       const serialized = JSON.stringify(builtEnvelope);
       cachedEnvelope = { body: JSON.parse(serialized), serialized };
@@ -2662,22 +2785,37 @@ export const createCodememRuntime = async ({ location, host }) => {
   };
 
   // Session context tracking for comprehensive memories
-  const sessionContext = {
+  const createSessionContext = () => ({
     firstPrompt: null,
     promptCount: 0,
     toolCount: 0,
     startTime: null,
     filesModified: new Set(),
     filesRead: new Set(),
-  };
+  });
+  let sessionContext = createSessionContext();
 
   const resetSessionContext = () => {
-    sessionContext.firstPrompt = null;
-    sessionContext.promptCount = 0;
-    sessionContext.toolCount = 0;
-    sessionContext.startTime = null;
-    sessionContext.filesModified = new Set();
-    sessionContext.filesRead = new Set();
+    sessionContext = createSessionContext();
+  };
+
+  const mergeSessionContext = (detachedContext) => {
+    const detachedStartedFirst = detachedContext.startTime != null
+      && (sessionContext.startTime == null || detachedContext.startTime <= sessionContext.startTime);
+    if (detachedContext.firstPrompt && (!sessionContext.firstPrompt || detachedStartedFirst)) {
+      sessionContext.firstPrompt = detachedContext.firstPrompt;
+    }
+    if (detachedStartedFirst) {
+      sessionContext.startTime = detachedContext.startTime;
+    }
+    sessionContext.promptCount += detachedContext.promptCount;
+    sessionContext.toolCount += detachedContext.toolCount;
+    for (const path of detachedContext.filesModified) {
+      sessionContext.filesModified.add(path);
+    }
+    for (const path of detachedContext.filesRead) {
+      sessionContext.filesRead.add(path);
+    }
   };
 
   // Check if we should force flush immediately (threshold-based)
@@ -2740,14 +2878,16 @@ export const createCodememRuntime = async ({ location, host }) => {
     }
   };
 
-  const clearPromptSession = (sessionID) => {
+  const clearPromptSession = (sessionID, { preserveCapturedPrompts = false } = {}) => {
     if (!sessionID) {
       return;
     }
     const prefix = `${sessionID}:`;
-    for (const key of capturedPrompts) {
-      if (key.startsWith(prefix)) {
-        capturedPrompts.delete(key);
+    if (!preserveCapturedPrompts) {
+      for (const key of capturedPrompts) {
+        if (key.startsWith(prefix)) {
+          capturedPrompts.delete(key);
+        }
       }
     }
     for (const key of pendingPrompts.keys()) {
@@ -2930,7 +3070,7 @@ export const createCodememRuntime = async ({ location, host }) => {
   };
 
   const extractAssistantUsage = (event) => {
-    if (!event || event.type !== "message.updated" || !event.messageInfo) {
+    if (event?.type !== "message.updated" || !event.messageInfo) {
       return null;
     }
     const info = event.messageInfo;
@@ -3309,12 +3449,12 @@ export const createCodememRuntime = async ({ location, host }) => {
     return identity.attemptId;
   };
 
-  const recordCachedPromptPack = (cached, { messageId, sessionID } = {}) => {
+  const recordCachedPromptPack = (cached, { messageId, sessionID, surface = "message" } = {}) => {
     cached.reuseCount = (cached.reuseCount || 0) + 1;
     const identity = promptPackIdentity({
       sessionID: sessionID || "unknown",
       requestKey: `${messageId || "unknown"}:cache:${cached.reuseCount}`,
-      surface: "message",
+      surface,
       promptNumber: cached.promptNumber || promptCounter,
       queryHash: cached.queryHash || hashPromptPackQuery(""),
     });
@@ -3350,6 +3490,71 @@ export const createCodememRuntime = async ({ location, host }) => {
     }).catch(() => {});
   };
 
+  const createTransformDelivery = (deferred) => {
+    const recordMeasurement = (measurement) => logLine(`inject.recall ${JSON.stringify(measurement)}`);
+    if (!deferred) {
+      return {
+        complete: undefined,
+        finish: async () => {},
+        beginFinalization: async () => {},
+        confirm: confirmPromptPackDelivery,
+        recordMeasurement,
+      };
+    }
+    let completion = null;
+    let finalizationReady = null;
+    let releaseFinalization = null;
+    const pending = [];
+    const commits = [];
+    const measurements = [];
+    const dispatch = ([attemptId, status, evaluation]) => {
+      const deliveryStatus = completion === "failed" && (!status || status === "handed_off")
+        ? "failed"
+        : status;
+      confirmPromptPackDelivery(attemptId, deliveryStatus, evaluation);
+    };
+    const beginFinalization = async (sessionID) => {
+      if (!finalizationReady) {
+        finalizationReady = acquireSessionFinalization(sessionID).then((release) => {
+          releaseFinalization = release;
+        });
+      }
+      await finalizationReady;
+    };
+    const finish = async (status = "handed_off") => {
+      if (completion) return;
+      completion = status;
+      const tasks = [];
+      try {
+        for (const commit of commits.splice(0)) {
+          if (status === "handed_off") tasks.push(commit());
+        }
+        for (const confirmation of pending.splice(0)) dispatch(confirmation);
+        for (const measurement of measurements.splice(0)) {
+          const finalized = status === "handed_off" ? measurement : {
+            ...measurement, reason: "delivery_failed", new_tokens: 0, retained_tokens: 0,
+          };
+          tasks.push(recordMeasurement(finalized));
+        }
+        await Promise.all(tasks);
+      } finally {
+        releaseFinalization?.();
+        releaseFinalization = null;
+      }
+    };
+    return {
+      commit: (commit) => { commits.push(commit); },
+      recordMeasurement: (measurement) => { measurements.push(measurement); },
+      beginFinalization,
+      finish,
+      complete: finish,
+      confirm: (...confirmation) => {
+        if (completion) dispatch(confirmation);
+        else pending.push(confirmation);
+      },
+    };
+  };
+
   const showToast = async (message, variant = "warning") => {
     if (backendUpdatePolicy === "off") {
       return;
@@ -3359,7 +3564,7 @@ export const createCodememRuntime = async ({ location, host }) => {
     }
     try {
       await hostNotify({ message, variant });
-    } catch (toastErr) {
+    } catch {
       // best-effort only
     }
   };
@@ -3396,7 +3601,7 @@ export const createCodememRuntime = async ({ location, host }) => {
     }
 
     const versionResult = await runCli(["version"]);
-    if (!versionResult || versionResult.exitCode !== 0) {
+    if (versionResult?.exitCode !== 0) {
       await logLine(
         `compat.version_check_failed exit=${versionResult?.exitCode ?? "unknown"} stderr=${
           versionResult?.stderr ? redactLog(versionResult.stderr.trim()) : ""
@@ -3736,7 +3941,7 @@ export const createCodememRuntime = async ({ location, host }) => {
       };
     }
     const runPack = async () => {
-      let packArgs = buildPackArgs({
+      const packArgs = buildPackArgs({
         query,
         filesModified: sessionContext.filesModified,
         injectLimit,
@@ -3923,7 +4128,7 @@ export const createCodememRuntime = async ({ location, host }) => {
           // recorded that terminal outcome; do not misclassify it as a decode
           // failure or fall back to stale non-empty context.
           injectedIdentity = identity;
-        } else if (!result || result.exitCode !== 0 || !packText) {
+        } else if (result?.exitCode !== 0 || !packText) {
           const malformedSuccess = result?.exitCode === 0;
           const exitCode = result?.exitCode ?? "unknown";
           const stderr = redactLog(result?.stderr ? result.stderr.trim() : "");
@@ -3966,7 +4171,7 @@ export const createCodememRuntime = async ({ location, host }) => {
         }
       }
     }
-    if (!result || result.exitCode !== 0) {
+    if (result?.exitCode !== 0) {
       const exitCode = result?.exitCode ?? "unknown";
       const stderr = redactLog(result?.stderr ? result.stderr.trim() : "");
       const stdout = redactLog(result?.stdout ? result.stdout.trim() : "");
@@ -4023,6 +4228,7 @@ export const createCodememRuntime = async ({ location, host }) => {
       }
       return {
         text: "",
+        cacheableEmpty: itemCount === 0,
         attemptId: identity.attemptId,
         requestId: identity.requestId,
         queryHash,
@@ -4044,47 +4250,40 @@ export const createCodememRuntime = async ({ location, host }) => {
         artifactFingerprint || promptPackArtifactFingerprint(result.stdout, packText)
       );
     }
-    const filtered = context.surface === "message"
-      ? filterRetainedPack(result.stdout, packText, context.retainedItems)
-      : { text: packText, items: [], duplicates: 0 };
-    const text = filtered.text ? wrapInjectedContext(filtered.text) : "";
-    const evaluation = surface === "message"
-      ? evaluationFields(
-          packText,
-          filtered.text,
-          itemCount,
-          filtered.duplicates,
-          filtered.packMetadata,
-          artifactFingerprint,
-        )
-      : undefined;
-    const recall = filtered.items.length
-      ? { v: 1, digest: injectionDigest(text), items: filtered.items, workingContext: context.workingContext }
-      : undefined;
-    let skipReason = null;
-    if (!text && filtered.duplicates > 0) {
-      skipReason = context.continuationOnly ? "continuation_only" : "unchanged_memories";
-    }
-    if (metrics) {
+    const refilter = (retainedItems) => {
+      const filtered = context.surface === "message"
+        ? filterRetainedPack(result.stdout, packText, retainedItems)
+        : { text: packText, items: [], duplicates: 0 };
+      const text = filtered.text ? wrapInjectedContext(filtered.text) : "";
+      const evaluation = surface === "message"
+        ? evaluationFields(
+            packText,
+            filtered.text,
+            itemCount,
+            filtered.duplicates,
+            filtered.packMetadata,
+            artifactFingerprint,
+          )
+        : undefined;
+      const recall = filtered.items.length
+        ? { v: 1, digest: injectionDigest(text), items: filtered.items, workingContext: context.workingContext }
+        : undefined;
+      let skipReason = null;
+      if (!text && filtered.duplicates > 0) {
+        skipReason = context.continuationOnly ? "continuation_only" : "unchanged_memories";
+      }
       return {
         text,
         recall,
         duplicates: filtered.duplicates,
         evaluation,
         skipReason,
-        metrics,
-        attemptId: injectedIdentity?.attemptId || null,
-        requestId: injectedIdentity?.requestId || null,
-        queryHash,
-        promptNumber: promptCounter,
       };
-    }
+    };
     return {
-      text,
-      recall,
-      duplicates: filtered.duplicates,
-      evaluation,
-      skipReason,
+      ...refilter(context.retainedItems),
+      refilter,
+      ...(metrics ? { metrics } : {}),
       attemptId: injectedIdentity?.attemptId || null,
       requestId: injectedIdentity?.requestId || null,
       queryHash,
@@ -4123,7 +4322,7 @@ export const createCodememRuntime = async ({ location, host }) => {
       // not a git repo. The catch below leaves version as "unknown".
       stdio: ["ignore", "pipe", "ignore"],
     }).trim();
-  } catch (err) {
+  } catch {
     // Ignore - version will remain 'unknown'
   }
 
@@ -4173,17 +4372,16 @@ export const createCodememRuntime = async ({ location, host }) => {
     }
     try {
       return JSON.stringify(value);
-    } catch (err) {
+    } catch {
       return String(value);
     }
   };
 
-  const recordEvent = (event) => {
-    events.push(event);
+  const trimRetainedEvents = (retainedEvents) => {
     trimEventQueue({
-      events,
+      events: retainedEvents,
       maxEvents,
-      hardMaxEvents: Math.max(maxEvents, rawEventsHardMax),
+      hardMaxEvents: rawEventQueueCapacity,
       onUnsentPressure: (queuedCount, cap) => {
         void logLine(`queue.pressure unsent_preserved queued=${queuedCount} max_events=${cap}`);
       },
@@ -4203,7 +4401,74 @@ export const createCodememRuntime = async ({ location, host }) => {
     });
   };
 
-  const captureCodememEvent = (sessionID, event) => {
+  const trimRetainedEventQueues = () => {
+    // The currently delivering batch is unavoidable; cap all mutable retained storage together.
+    const retainedEvents = [
+      ...pendingBoundaryBatches.flatMap((batch) => batch.events),
+      ...events,
+    ].sort(
+      (left, right) =>
+        (queuedEventOrder.get(left) ?? Number.MAX_SAFE_INTEGER) -
+        (queuedEventOrder.get(right) ?? Number.MAX_SAFE_INTEGER)
+    );
+    trimRetainedEvents(retainedEvents);
+    const retained = new Set(retainedEvents);
+    const liveEvents = events.filter((event) => retained.has(event));
+    events.splice(0, events.length, ...liveEvents);
+    for (let index = pendingBoundaryBatches.length - 1; index >= 0; index--) {
+      const batch = pendingBoundaryBatches[index];
+      batch.events = batch.events.filter((event) => retained.has(event));
+      if (batch.events.length) continue;
+      pendingBoundaryBatches.splice(index, 1);
+      flushingBatches.delete(batch);
+      batch.completion.resolve();
+    }
+    const trackedEvents = new Set(retainedEvents);
+    for (const batch of flushingBatches) {
+      for (const event of batch.events) trackedEvents.add(event);
+    }
+    for (const deferredEvent of capacityDeferredEvents) {
+      if (!trackedEvents.has(deferredEvent)) capacityDeferredEvents.delete(deferredEvent);
+    }
+  };
+
+  const recordEvent = (event) => {
+    queuedEventOrder.set(event, nextQueuedEventOrder++);
+    events.push(event);
+    trimRetainedEventQueues();
+  };
+
+  // Reserve delivery in capture order. Flush/disposal reuse the same task, and
+  // preparation never waits on delivery, so neither can serialize early or cycle.
+  const emitRawEvent = (input) => {
+    const existing = rawEventDeliveries.get(input.payload);
+    if (existing) return existing;
+    const inputOrder = queuedEventOrder.get(input.payload) ?? Number.MAX_SAFE_INTEGER;
+    const olderDeferredEventExists = [...capacityDeferredEvents].some((event) =>
+      (queuedEventOrder.get(event) ?? Number.MAX_SAFE_INTEGER) < inputOrder);
+    if (runtimeActive && (rawEventDeliveryCount >= rawEventQueueCapacity
+      || olderDeferredEventExists)) {
+      capacityDeferredEvents.add(input.payload);
+      void logLine(
+        `delivery.pressure queued=${rawEventDeliveryCount} hard_max=${rawEventQueueCapacity}`
+      );
+      return Promise.resolve(false);
+    }
+    capacityDeferredEvents.delete(input.payload);
+    rawEventDeliveryCount++;
+    const delivery = rawEventDeliveryTail.then(async () => {
+      await rawEventPreparations.get(input.payload);
+      return deliverRawEvent(input);
+    });
+    rawEventDeliveries.set(input.payload, delivery);
+    rawEventDeliveryTail = delivery.catch(() => {}).finally(() => {
+      rawEventDeliveries.delete(input.payload);
+      rawEventDeliveryCount--;
+    });
+    return delivery;
+  };
+
+  const captureCodememEvent = (sessionID, event, prompt = null) => {
     const normalizedSessionID =
       typeof sessionID === "string" && sessionID.trim() ? sessionID.trim() : null;
     if (normalizedSessionID) {
@@ -4222,14 +4487,24 @@ export const createCodememRuntime = async ({ location, host }) => {
     });
     const rawEventId =
       adapterAnnotatedEvent?._adapter?.event_id ||
-      (adapterAnnotatedEvent && adapterAnnotatedEvent._raw_event_id) ||
+      adapterAnnotatedEvent?._raw_event_id ||
       nextEventId();
     const queuedEvent = {
       ...adapterAnnotatedEvent,
       _raw_event_id: rawEventId,
       _raw_session_id: resolvedSessionID,
     };
+    rawEventStartedAts.set(queuedEvent, sessionStartedAt);
     recordEvent(queuedEvent);
+    if (prompt && rawEventsEnabled && host.resolveCaptureContext) {
+      const preparation = Promise.resolve().then(() => host.resolveCaptureContext(prompt))
+        .then((context) => {
+          if (context) rawEventCaptureContexts.set(queuedEvent, context);
+        }).catch(() => {
+          // Optional provenance must never discard an otherwise valid prompt.
+        });
+      rawEventPreparations.set(queuedEvent, preparation);
+    }
     const deliveryTask = emitRawEvent({
       sessionID: resolvedSessionID,
       type: queuedEvent?.type || "unknown",
@@ -4239,14 +4514,16 @@ export const createCodememRuntime = async ({ location, host }) => {
     return deliveryTask;
   };
 
-  const capturePendingPrompts = async ({
+  const drainPendingPrompts = async ({
     exceptIdentity = null,
+    sessionID = null,
     skipFlush = false,
     awaitDurability = false,
   } = {}) => {
-    let durabilityFailed = false;
+    const deliveries = [];
     for (const [promptIdentity, prompt] of pendingPrompts) {
       if (!runtimeActive && !skipFlush) return true;
+      if (sessionID && prompt.sessionID !== sessionID) continue;
       if (promptIdentity === exceptIdentity) {
         continue;
       }
@@ -4259,8 +4536,8 @@ export const createCodememRuntime = async ({ location, host }) => {
       capturedPrompts.add(promptIdentity);
 
       if (!skipFlush && (prompt.text.trim() === "/new" || prompt.text.trim().startsWith("/new "))) {
-        await logLine("detected /new command, flushing events");
-        await flushEvents();
+        void logLine("detected /new command, flushing events");
+        void flushEvents();
       }
 
       promptCounter += 1;
@@ -4278,45 +4555,41 @@ export const createCodememRuntime = async ({ location, host }) => {
         prompt_text: prompt.text,
         timestamp: new Date().toISOString(),
       };
-      if (awaitDurability) {
-        try {
-          const durable = await captureCodememEvent(prompt.sessionID, promptEvent);
-          durabilityFailed ||= !durable;
-        } catch {
-          durabilityFailed = true;
-        }
-      } else {
-        captureCodememEvent(prompt.sessionID, promptEvent);
-      }
-      await logLine(
+      deliveries.push(captureCodememEvent(prompt.sessionID, promptEvent, prompt));
+      void logLine(
         `user_prompt captured #${promptCounter}: ${prompt.text.substring(0, 50)}`
       );
 
       if (!skipFlush && shouldForceFlush()) {
-        await logLine(`force flush triggered: tools=${sessionContext.toolCount}, prompts=${sessionContext.promptCount}, duration=${Math.round((Date.now() - (sessionContext.startTime || Date.now())) / 1000)}s`);
-        await flushEvents();
+        void logLine(`force flush triggered: tools=${sessionContext.toolCount}, prompts=${sessionContext.promptCount}, duration=${Math.round((Date.now() - (sessionContext.startTime || Date.now())) / 1000)}s`);
+        void flushEvents();
       }
     }
-    return !durabilityFailed;
+    if (!awaitDurability) return true;
+    const results = await Promise.allSettled(deliveries);
+    return results.every((result) => result.status === "fulfilled" && result.value);
   };
 
-  const flushEvents = async () => {
-    if (!runtimeActive) return;
-    if (!events.length) {
-      await drainRawEventSpool();
-      await logLine("flush.skip empty");
-      return;
-    }
+  const capturePendingPrompts = (options = {}) => drainPendingPrompts(options);
 
-    const batch = events.splice(0, events.length);
-    if (!batch.length) {
-      await logLine("flush.skip empty");
-      return;
+  const requeueDetachedBatch = (batch, failedEvents) => {
+    if (batch.restored || !failedEvents.length) return;
+    batch.restored = true;
+    events.push(...failedEvents);
+    events.sort(
+      (left, right) =>
+        (queuedEventOrder.get(left) ?? Number.MAX_SAFE_INTEGER) -
+        (queuedEventOrder.get(right) ?? Number.MAX_SAFE_INTEGER)
+    );
+    trimRetainedEventQueues();
+    if (batch.owner && batch.owner === activeSessionID) {
+      mergeSessionContext(batch.context);
     }
-    flushingBatches.add(batch);
+  };
 
-    const failed = [];
-    for (const queuedEvent of batch) {
+  const deliverDetachedBatch = async (batch) => {
+    const failedEvents = [];
+    for (const queuedEvent of batch.events) {
       if (queuedEvent && typeof queuedEvent === "object" && queuedEvent._raw_enqueued) {
         continue;
       }
@@ -4324,39 +4597,140 @@ export const createCodememRuntime = async ({ location, host }) => {
         queuedEvent?._raw_session_id ||
         queuedEvent?.properties?.sessionID ||
         null;
-      const ok = await emitRawEvent({
-        sessionID: queuedSessionID,
-        type: queuedEvent?.type || "unknown",
-        payload: queuedEvent,
-      });
-      if (!ok) {
-        failed.push(queuedEvent);
+      try {
+        const delivered = await emitRawEvent({
+          sessionID: queuedSessionID,
+          type: queuedEvent?.type || "unknown",
+          payload: queuedEvent,
+        });
+        if (!delivered) failedEvents.push(queuedEvent);
+      } catch {
+        failedEvents.push(queuedEvent);
       }
     }
-    if (failed.length) {
-      flushingBatches.delete(batch);
-      events.unshift(...failed);
-      await logLine(`flush.retry_deferred count=${failed.length}`);
-      await drainRawEventSpool();
+    requeueDetachedBatch(batch, failedEvents);
+    const durationMs = batch.context.startTime
+      ? Date.now() - batch.context.startTime
+      : 0;
+    try {
+      if (failedEvents.length) {
+        await logLine(`flush.retry_deferred count=${failedEvents.length}`);
+      } else {
+        await logLine(
+          `flush.stream_only finalize count=${batch.events.length} tools=${batch.context.toolCount} prompts=${batch.context.promptCount} duration=${Math.round(durationMs / 1000)}s`
+        );
+        await logLine(`flush.ok count=${batch.events.length} dropped=0`);
+      }
+      if (runtimeActive) await drainRawEventSpool();
+    } catch {
+      // Flush delivery and diagnostics must not reject into OpenCode hooks.
+    }
+  };
+
+  const resumeDeferredFlush = () => {
+    if (flushingBatches.size > 0 || !deferredFlush) return;
+    const pendingFlush = deferredFlush;
+    deferredFlush = null;
+    if (!runtimeActive || !events.length) {
+      pendingFlush.resolve();
       return;
     }
-    if (!runtimeActive) {
+    void flushEvents().then(pendingFlush.resolve, pendingFlush.resolve);
+  };
+
+  const scheduleDetachedBatch = (batch) => {
+    flushingBatches.add(batch);
+    const delivery = flushDeliveryTail.then(() => deliverDetachedBatch(batch));
+    const contained = delivery.catch(() => {
+      const undelivered = batch.events.filter((event) => !event?._raw_enqueued);
+      requeueDetachedBatch(batch, undelivered);
+    }).finally(() => {
       flushingBatches.delete(batch);
-      return;
+      resumeDeferredFlush();
+    });
+    flushDeliveryTail = contained;
+    return contained;
+  };
+
+  const flushEmptyQueue = async () => {
+    try {
+      await drainRawEventSpool();
+      await logLine("flush.skip empty");
+    } catch {
+      // Empty flushes follow the same non-rejecting hook contract.
+    }
+  };
+
+  const detachQueuedEvents = ({ owner }) => {
+    const batch = {
+      events: events.splice(0, events.length),
+      context: sessionContext,
+      owner,
+      restored: false,
+    };
+    resetSessionContext();
+    return batch;
+  };
+
+  const scheduleQueuedEvents = ({ owner }) => {
+    return scheduleDetachedBatch(detachQueuedEvents({ owner }));
+  };
+
+  const startBoundaryDrain = () => {
+    if (boundaryDrain) return;
+    // One drain consumes every queued owner batch without extending the promise tail per session.
+    const drain = flushDeliveryTail.then(async () => {
+      while (pendingBoundaryBatches.length) {
+        const batch = pendingBoundaryBatches.shift();
+        try {
+          await deliverDetachedBatch(batch);
+        } catch {
+          const undelivered = batch.events.filter((event) => !event?._raw_enqueued);
+          requeueDetachedBatch(batch, undelivered);
+        } finally {
+          flushingBatches.delete(batch);
+          batch.completion.resolve();
+        }
+      }
+    });
+    const contained = drain.catch(() => {}).finally(() => {
+      boundaryDrain = null;
+      if (pendingBoundaryBatches.length) {
+        startBoundaryDrain();
+        return;
+      }
+      resumeDeferredFlush();
+    });
+    boundaryDrain = contained;
+    flushDeliveryTail = contained;
+  };
+
+  const scheduleBoundaryBatch = (batch) => {
+    batch.completion = Promise.withResolvers();
+    pendingBoundaryBatches.push(batch);
+    flushingBatches.add(batch);
+    trimRetainedEventQueues();
+    startBoundaryDrain();
+    return batch.completion.promise;
+  };
+
+  const flushBoundaryEvents = ({ owner }) => {
+    if (!runtimeActive || !events.length) return Promise.resolve();
+    return scheduleBoundaryBatch(detachQueuedEvents({ owner }));
+  };
+
+  const flushEvents = () => {
+    if (!runtimeActive) return Promise.resolve();
+    if (flushingBatches.size > 0) {
+      if (!events.length) return flushDeliveryTail;
+      if (!deferredFlush) deferredFlush = Promise.withResolvers();
+      return deferredFlush.promise;
+    }
+    if (!events.length) {
+      return flushEmptyQueue();
     }
 
-    // Calculate session duration
-    const durationMs = sessionContext.startTime
-      ? Date.now() - sessionContext.startTime
-      : 0;
-    await logLine(
-      `flush.stream_only finalize count=${batch.length} tools=${sessionContext.toolCount} prompts=${sessionContext.promptCount} duration=${Math.round(durationMs / 1000)}s`
-    );
-    await logLine(`flush.ok count=${batch.length} dropped=0`);
-    flushingBatches.delete(batch);
-    sessionStartedAt = null;
-    resetSessionContext();
-    await drainRawEventSpool();
+    return scheduleQueuedEvents({ owner: activeSessionID });
   };
 
   void drainRawEventSpool();
@@ -4374,7 +4748,7 @@ export const createCodememRuntime = async ({ location, host }) => {
     let durable = true;
     const queuedEvents = new Set(events);
     for (const batch of flushingBatches) {
-      for (const queuedEvent of batch) {
+      for (const queuedEvent of batch.events) {
         queuedEvents.add(queuedEvent);
       }
     }
@@ -4383,17 +4757,23 @@ export const createCodememRuntime = async ({ location, host }) => {
         continue;
       }
       const queuedSessionID = queuedEvent?._raw_session_id || null;
-      const persisted = await emitRawEvent({
-        sessionID: queuedSessionID,
-        type: queuedEvent?.type || "unknown",
-        payload: queuedEvent,
-      });
+      let persisted = false;
+      try {
+        persisted = await emitRawEvent({
+          sessionID: queuedSessionID,
+          type: queuedEvent?.type || "unknown",
+          payload: queuedEvent,
+        });
+      } catch {
+        // Disposal must contain serialization and persistence failures.
+      }
       durable &&= persisted;
     }
     return durable;
   };
 
   return {
+    capturePendingPrompts,
     deactivate: deactivateRuntime,
     dispose: async () => {
       deactivateRuntime();
@@ -4402,6 +4782,8 @@ export const createCodememRuntime = async ({ location, host }) => {
         awaitDurability: true,
       });
       const deliveriesDurable = await ensureQueuedEventsDurable();
+      await rawEventDeliveryTail.catch(() => {});
+      await flushDeliveryTail.catch(() => {});
       if (!promptsDurable || !deliveriesDurable) {
         await errorLogLine("raw_events.dispose_durability_failed category=persistence");
       }
@@ -4419,6 +4801,26 @@ export const createCodememRuntime = async ({ location, host }) => {
       .filter((event) => event.type === "user_prompt")
       .map((event) => ({ number: event.prompt_number, text: event.prompt_text })),
     inspectQueuedEventTypes: () => events.map((event) => event.type),
+    inspectQueuedEvents: () => events.map((event) => ({
+      sessionID: event._raw_session_id,
+      toolCallID: event.tool_call_id ?? null,
+      type: event.type,
+    })),
+    inspectPendingBoundaryEvents: () =>
+      pendingBoundaryBatches.flatMap((batch) =>
+        batch.events.map((event) => ({
+          owner: batch.owner,
+          sessionID: event._raw_session_id,
+        }))),
+    inspectRawEventDeliveryCount: () => rawEventDeliveryCount,
+    inspectFlushingBatchCount: () => flushingBatches.size,
+    inspectSessionContext: () => ({
+      firstPrompt: sessionContext.firstPrompt,
+      promptCount: sessionContext.promptCount,
+      toolCount: sessionContext.toolCount,
+      filesModified: [...sessionContext.filesModified],
+      filesRead: [...sessionContext.filesRead],
+    }),
     inspectCapturedPromptCount: () => capturedPrompts.size,
     handleCompacting: async ({ sessionID: requestedSessionID } = {}) => {
       const sessionID = requestedSessionID || activeSessionID;
@@ -4429,9 +4831,10 @@ export const createCodememRuntime = async ({ location, host }) => {
         );
       }
     },
-    transformMessages: async (input, output) => {
-      if (injectSurface === "system") {
-        return;
+    transformMessages: async (input, output, options = {}) => {
+      const delivery = createTransformDelivery(options.deferDeliveryConfirmation === true);
+      if (injectSurface === "system" && options.enableSystemSurface !== true) {
+        return { applied: false, surface: injectSurface, completeDelivery: delivery.complete };
       }
       const hookMessages = Array.isArray(output?.messages)
         ? scopeMessagesToSession(output.messages, input?.sessionID || null)
@@ -4464,18 +4867,32 @@ export const createCodememRuntime = async ({ location, host }) => {
           resolveInjectQuery,
           buildInjectedContext,
           messageInjectionCache,
+          emptyRecallCache,
           injectTokenBudget,
-          retainedTokenBudget,
+          retainedTokenBudget: injectSurface === "system" ? Number.POSITIVE_INFINITY : retainedTokenBudget,
           workingSet: [...sessionContext.filesModified, ...sessionContext.filesRead],
-          recordMeasurement: (measurement) => logLine(`inject.recall ${JSON.stringify(measurement)}`),
+          recordMeasurement: delivery.recordMeasurement,
+          commitDelivery: delivery.commit,
+          beginFinalization: delivery.beginFinalization,
           compactionInjectionSkips,
-          confirmDelivery: confirmPromptPackDelivery,
-          recordCacheReuse: recordCachedPromptPack,
-          recordSkipped: (reason, sessionID) => recordSkippedPromptPack(
-            reason, sessionID, "message", latestUser ? resolveEntryMessageId(latestUser.entry) : null,
-          ),
+          confirmDelivery: delivery.confirm,
+          recordCacheReuse: (cached, context) => recordCachedPromptPack(cached, {
+            ...context,
+            surface: injectSurface,
+          }),
+          recordSkipped: (reason, sessionID) => {
+            const latestMessageID = latestUser ? resolveEntryMessageId(latestUser.entry) : null;
+            const requestKey = latestMessageID
+              || (reason === "missing_message_identity" ? "missing-identity" : null);
+            return recordSkippedPromptPack(reason, sessionID, injectSurface, requestKey);
+          },
+          pruneAbsentCacheEntries: options.pruneAbsentCacheEntries !== false,
+          requireLatestUserMessageID: options.requireLatestUserMessageID === true,
+          cacheSuccessfulEmpty: options.cacheSuccessfulEmpty === true,
+          surface: injectSurface,
         });
       } catch (err) {
+        await delivery.finish("failed");
         await logLine(
           `inject.messages_transform.error sessionID=${sessionID || "unknown"} message=${JSON.stringify(err instanceof Error ? err.message : String(err))}`
         );
@@ -4491,6 +4908,7 @@ export const createCodememRuntime = async ({ location, host }) => {
           `inject.messages_transform.result sessionID=${sessionID || "unknown"} applied=${Boolean(applied)} messages=${Array.isArray(output?.messages) ? output.messages.length : 0} parts=${partsCount}`
         );
       }
+      return { applied, surface: injectSurface, completeDelivery: delivery.complete };
     },
     transformSystem: async (input, output) => {
       if (injectSurface !== "system") {
@@ -4550,8 +4968,42 @@ export const createCodememRuntime = async ({ location, host }) => {
       if (!runtimeActive) return;
       const eventType = event?.type || "unknown";
       const sessionID = event?.sessionID || null;
+      const priorActiveSessionID = activeSessionID;
       const rawEvent = event?.raw;
-      await capturePendingPrompts({ exceptIdentity: promptIdentityForEvent(event) });
+      let sessionBoundaryDelivery = null;
+      if (eventType === "session.created") {
+        if (priorActiveSessionID) {
+          await capturePendingPrompts({ sessionID: priorActiveSessionID, skipFlush: true });
+        }
+        if (!runtimeActive) {
+          resetSessionContext();
+          return;
+        }
+        const hasBoundaryEvents = events.length > 0;
+        sessionBoundaryDelivery = hasBoundaryEvents
+          ? flushBoundaryEvents({ owner: priorActiveSessionID })
+          : Promise.resolve();
+        if (!hasBoundaryEvents) resetSessionContext();
+        activeSessionID = sessionID || null;
+        sessionStartSessionID = sessionID || null;
+        sessionStartedAt = new Date().toISOString();
+        promptCounter = 0;
+        fallbackEvaluationSessionId = nextEventId();
+        skippedAttemptCounter = 0;
+        disabledInjectionRecorded.delete("message:unknown");
+        disabledInjectionRecorded.delete("system:unknown");
+        lastPromptText = null;
+        if (sessionID) {
+          await capturePendingPrompts({
+            sessionID,
+            exceptIdentity: promptIdentityForEvent(event),
+            skipFlush: true,
+          });
+          clearPromptSession(sessionID, { preserveCapturedPrompts: true });
+        }
+      } else if (sessionID) {
+        await capturePendingPrompts({ sessionID, exceptIdentity: promptIdentityForEvent(event) });
+      }
       if (!runtimeActive) return;
 
       // Always log session-related events for debugging /new
@@ -4629,7 +5081,7 @@ export const createCodememRuntime = async ({ location, host }) => {
             || sessionID;
           lastPromptText = promptText;
           if (!capturedPrompts.has(promptIdentity)) {
-            pendingPrompts.set(promptIdentity, { sessionID: promptSessionID, text: promptText });
+            pendingPrompts.set(promptIdentity, { sessionID: promptSessionID, messageID: prompt.messageID, text: promptText });
           }
         }
 
@@ -4712,23 +5164,17 @@ export const createCodememRuntime = async ({ location, host }) => {
       }
 
       if (eventType === "session.created") {
-        if (events.length) {
-          await flushEvents();
-        }
-        activeSessionID = sessionID || null;
-        sessionStartedAt = new Date().toISOString();
-        promptCounter = 0;
-        fallbackEvaluationSessionId = nextEventId();
-        skippedAttemptCounter = 0;
-        disabledInjectionRecorded.delete("message:unknown");
-        disabledInjectionRecorded.delete("system:unknown");
-        lastPromptText = null;
-        clearPromptSession(sessionID);
-        resetSessionContext();
+        await sessionBoundaryDelivery;
         startViewer();
       }
       if (eventType === "session.deleted") {
-        activeSessionID = null;
+        if (!sessionID || sessionID === activeSessionID) {
+          activeSessionID = null;
+        }
+        if (!sessionID || sessionID === sessionStartSessionID) {
+          sessionStartedAt = null;
+          sessionStartSessionID = null;
+        }
         if (sessionID) {
           for (const key of lastToastAtBySession.keys()) {
             if (key.startsWith(`${sessionID}:`)) {
@@ -4737,6 +5183,7 @@ export const createCodememRuntime = async ({ location, host }) => {
           }
           injectionToastShown.delete(sessionID);
           messageInjectionCache.delete(sessionID);
+          emptyRecallCache.delete(sessionID);
           compactionInjectionSkips.delete(sessionID);
           disabledInjectionRecorded.delete(`message:${sessionID}`);
           disabledInjectionRecorded.delete(`system:${sessionID}`);
@@ -4755,7 +5202,8 @@ export const createCodememRuntime = async ({ location, host }) => {
     // V1 sends successes here and failures as ToolPart events; V2 sends both variants here.
     handleToolResult: async (input, output) => {
       if (!runtimeActive) return;
-      await capturePendingPrompts();
+      const sessionID = input.sessionID || activeSessionID;
+      if (sessionID) await capturePendingPrompts({ sessionID });
       if (!runtimeActive) return;
       const args = input.args ?? {};
       const result = output.output;
@@ -4855,6 +5303,8 @@ export const createCodememRuntime = async ({ location, host }) => {
 };
 
 export const __testUtils = {
+  adapterDiagnosticCodes: [...ADAPTER_DIAGNOSTIC_CODES],
+  MAX_MESSAGE_INJECTION_CACHE_ENTRIES,
   PINNED_BACKEND_VERSION,
   fetchRawEventsStatus,
   inferProjectFromCwd,
@@ -4909,6 +5359,7 @@ export const __testUtils = {
   filterRetainedPack,
   isContinuationOnly,
   resolveRetainedTokenBudget,
+  setSessionMessageInjectionCacheEntry,
   workingContextDigest,
   DEFAULT_INJECT_TOKEN_BUDGET,
   CODEMEM_CONTEXT_PREFIX,

@@ -190,9 +190,12 @@ export const resolveAutoUpdatePlan = ({
   }
 
   if (normalizedRunner === "uvx") {
+    let reason = "custom-source";
+    if (!source) reason = "missing-source";
+    else if (isPinnedGitSource(source)) reason = "pinned-source";
     return {
       allowed: false,
-      reason: !source ? "missing-source" : isPinnedGitSource(source) ? "pinned-source" : "custom-source",
+      reason,
       command: null,
       commandText: null,
     };

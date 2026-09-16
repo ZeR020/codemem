@@ -217,8 +217,9 @@ Command/file token caching notes:
 - Low-signal observations are filtered before writing.
 
 ## Automatic context injection
-- The OpenCode 1 plugin injects a memory pack next to the latest user message by default, keeping older prompt prefixes stable for provider prompt caches. The experimental OpenCode 2 beta entrypoint captures activity, manages lifecycle cleanup, and exposes manual `mem-status`, `mem-recent`, and `mem-stats` tools through `tool.transform` with `codemode: false`. It does not inject automatic recall because the V2 context hook has no request kind or request ID, so compaction and transient safety cannot be guaranteed.
-- Controls:
+- The OpenCode 1 plugin injects a memory pack next to the latest user message by default, keeping older prompt prefixes stable for provider prompt caches.
+- The OpenCode 2 entrypoint (beta integration, validated on the exact stable OpenCode 2.0.2 release) captures activity, manages lifecycle cleanup, and exposes manual `mem-status`, `mem-recent`, and `mem-stats` tools through `tool.transform` with `codemode: false`. On OpenCode 2.0.2, automatic recall runs through `session.context` when the latest user message has a non-empty ID. Each identified turn performs one fresh retrieval, while retries and tool continuations replay retained context; missing or blank identity skips safely. Auxiliary hooks remain isolated; see the [pinned contract](opencode-v2-contract.md). To stop the OpenCode 2 path or return to OpenCode 1.18.29+, follow [troubleshooting and rollback](plugin-reference.md#opencode-host-support-troubleshooting-and-rollback); no database migration is needed.
+- OpenCode 1 controls:
   - `CODEMEM_INJECT_CONTEXT=0` disables injection.
   - `CODEMEM_INJECT_SURFACE=system` uses the legacy OpenCode system-prompt injection surface.
   - `CODEMEM_INJECT_LIMIT` caps memory items (default 8).
@@ -229,6 +230,12 @@ Command/file token caching notes:
 - Retrieval, skipped injection after attempt creation, current-request cache reuse, and handoff status are recorded in the local evidence ledger. A positive token budget too small for the context prefix is rejected before an evidence-ledger attempt is recorded and reported once through the plugin's warning logs. Records contain bounded memory identity, diagnostic codes, and safe repository-relative working-set paths, never prompt text, pack text, memory content, or absolute paths. Reattaching historical cached context does not create attempts, and ledger failures do not block injection. If post-restart identity repair fails, usable fallback context is still injected without assigning its delivery to a stale or failed ledger attempt.
 - Reuse savings estimate discovery work versus pack read size.
 - Automatic message recall deduplicates unchanged retained item fingerprints. Narrow continuation prompts skip injection only after retrieval confirms no changed facts and file/tool context is unchanged. When local plugin logging is enabled, `inject.recall` JSON separates new and retained estimated tokens, duplicate counts, and bounded reasons without content or identifiers. See [lifecycle and evaluation details](opencode-retained-recall.md); these estimates do not measure answer usefulness or provider token usage.
+
+### Usage metric semantics
+
+`codemem stats --json` and the viewer usage API identify token units and provenance. Pack rows are estimates of tokens injected into context. Observer rows use provider-reported input tokens (`tokens_read`) and output tokens (`tokens_written`) across every attempted observer call; transports without usage telemetry record those values as unavailable instead of estimating them.
+
+Observer rows written before this provenance marker used UTF-16 text lengths, not tokens. Codemem keeps those rows for audit but excludes their values from token aggregates and reports them through `legacy_text_length_count`; the original token counts cannot be recovered. Health’s Injected, Savings, and Reduction cards use pack estimates only, so observer model usage is not mixed into pack-size metrics.
 
 ## Retrieval attribution diagnostics
 

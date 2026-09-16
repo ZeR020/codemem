@@ -6,6 +6,10 @@ export default defineConfig({
 		lib: {
 			entry: {
 				index: resolve(import.meta.dirname, "src/index.ts"),
+				"recipient-policy-contract": resolve(
+					import.meta.dirname,
+					"src/recipient-policy-contract.ts",
+				),
 				"internal/cloudflare-coordinator": resolve(
 					import.meta.dirname,
 					"src/internal/cloudflare-coordinator.ts",

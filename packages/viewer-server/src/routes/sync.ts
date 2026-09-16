@@ -124,6 +124,7 @@ import {
 	lookupCoordinatorPeers,
 	mergeAddresses,
 	migrateRecipientPolicyIntent,
+	mutateCodememConfigFile,
 	negotiateSyncCapability,
 	normalizeAddress,
 	normalizeHumanPresentationName,
@@ -179,7 +180,6 @@ import {
 	verifyDirectPeerSignature,
 	verifyRecipientReviewedIntent,
 	verifySignature,
-	writeCodememConfigFile,
 } from "@codemem/core";
 import { and, count, desc, eq, max, ne } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/better-sqlite3";
@@ -430,27 +430,41 @@ async function maybeGrantDefaultSpaceOnJoin(opts: {
 	});
 }
 
+function configuredGroups(config: Record<string, unknown>): string[] {
+	const rawGroups = config.sync_coordinator_groups;
+	if (Array.isArray(rawGroups)) {
+		return rawGroups.map((group) => String(group).trim()).filter(Boolean);
+	}
+	if (typeof rawGroups === "string") {
+		return rawGroups
+			.split(",")
+			.map((group) => group.trim())
+			.filter(Boolean);
+	}
+	if (typeof config.sync_coordinator_group === "string" && config.sync_coordinator_group.trim()) {
+		return [config.sync_coordinator_group.trim()];
+	}
+	return [];
+}
+
 function removeConfiguredCoordinatorGroup(groupId: string): string[] {
 	const targetGroup = groupId.trim();
 	if (!targetGroup) return [];
-	const config = readCodememConfigFile();
-	const rawGroups = config.sync_coordinator_groups;
-	const groups = Array.isArray(rawGroups)
-		? rawGroups.map((group) => String(group).trim()).filter(Boolean)
-		: typeof rawGroups === "string"
-			? rawGroups
-					.split(",")
-					.map((group) => group.trim())
-					.filter(Boolean)
-			: typeof config.sync_coordinator_group === "string" && config.sync_coordinator_group.trim()
-				? [config.sync_coordinator_group.trim()]
-				: [];
-	const nextGroups = groups.filter((group) => group !== targetGroup);
-	if (nextGroups.length === groups.length) return groups;
-	config.sync_coordinator_groups = nextGroups;
-	if (nextGroups.length) config.sync_coordinator_group = nextGroups[0];
-	else delete config.sync_coordinator_group;
-	writeCodememConfigFile(config);
+	let nextGroups: string[] = [];
+	mutateCodememConfigFile((config) => {
+		const groups = configuredGroups(config);
+		nextGroups = groups.filter((group) => group !== targetGroup);
+		const configuredGroup = String(config.sync_coordinator_group ?? "").trim();
+		const removesPluralGroup = nextGroups.length !== groups.length;
+		const removesSingularGroup = configuredGroup === targetGroup;
+		if (!removesPluralGroup && !removesSingularGroup) return undefined;
+		config.sync_coordinator_groups = nextGroups;
+		if (removesSingularGroup) {
+			if (nextGroups.length) config.sync_coordinator_group = nextGroups[0];
+			else delete config.sync_coordinator_group;
+		}
+		return config;
+	});
 	return nextGroups;
 }
 
@@ -3601,6 +3615,28 @@ function claimedLocalActorScopeStatus(
 		authorized: grant.authorized,
 		state: grant.state,
 		action_required: !grant.authorized,
+	};
+}
+
+function archivedCoordinatorGroupResponse(
+	groupId: string,
+	group: NonNullable<Awaited<ReturnType<typeof coordinatorArchiveGroupAction>>>,
+	status: ReturnType<typeof coordinatorAdminStatusPayload>,
+	groups: ReturnType<typeof removeConfiguredCoordinatorGroup>,
+) {
+	return { ok: true, group, status, disconnected_group_id: groupId, groups };
+}
+
+function missingArchivedCoordinatorGroupResponse(
+	groupId: string,
+	status: ReturnType<typeof coordinatorAdminStatusPayload>,
+	groups: ReturnType<typeof removeConfiguredCoordinatorGroup>,
+) {
+	return {
+		error: "group_not_found_or_already_archived",
+		status,
+		disconnected_group_id: groupId,
+		groups,
 	};
 }
 
@@ -7576,15 +7612,12 @@ export function syncRoutes(
 				remoteUrl: config.syncCoordinatorUrl || null,
 				adminSecret: config.syncCoordinatorAdminSecret || null,
 			});
-			if (!group) return c.json({ error: "group_not_found_or_already_archived", status }, 404);
 			const groups = removeConfiguredCoordinatorGroup(groupId);
-			return c.json({
-				ok: true,
-				group,
-				status: coordinatorAdminStatusPayload(),
-				disconnected_group_id: groupId,
-				groups,
-			});
+			const currentStatus = coordinatorAdminStatusPayload();
+			if (!group) {
+				return c.json(missingArchivedCoordinatorGroupResponse(groupId, currentStatus, groups), 404);
+			}
+			return c.json(archivedCoordinatorGroupResponse(groupId, group, currentStatus, groups));
 		} catch (error) {
 			return c.json({ error: error instanceof Error ? error.message : String(error), status }, 400);
 		}
