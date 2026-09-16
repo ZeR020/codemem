@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import type { Database } from "./db.js";
+import { managedProjectScopeId } from "./managed-project-scope.js";
 import {
 	isHumanPresentationName,
 	normalizeIdentityDisplayName,
@@ -13,6 +14,7 @@ import {
 import { commitDirectProjectSharePolicyInTransaction } from "./recipient-policy-onboarding.js";
 import { fingerprintPublicKey } from "./sync-fingerprint.js";
 
+export { managedProjectScopeId } from "./managed-project-scope.js";
 export type { AcceptedProjectIntent, ShareProjectIntent } from "./project-share-intent.js";
 export {
 	acceptedProjectIntentDigest,
@@ -74,13 +76,6 @@ export function normalizeTeammateName(value: string): string {
 	});
 	if (hasControlCharacter) throw new Error("teammate_name_invalid");
 	return normalized;
-}
-
-export function managedProjectScopeId(
-	coordinatorGroupId: string,
-	canonicalProjectIdentity: string,
-): string {
-	return `managed-project:${digest([coordinatorGroupId, canonicalProjectIdentity])}`;
 }
 
 function effect(operationId: string, step: string, identity?: string): string {
