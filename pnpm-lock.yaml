@@ -389,6 +389,9 @@ importers:
 
   packages/ui:
     dependencies:
+      '@codemem/core':
+        specifier: workspace:^
+        version: link:../core
       '@preact/signals':
         specifier: ^2.11.1
         version: 2.11.1(preact@10.29.8)

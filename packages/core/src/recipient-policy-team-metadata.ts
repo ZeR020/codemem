@@ -1,19 +1,18 @@
 import type { Database } from "./db.js";
 import { normalizeHumanPresentationName } from "./project-invite-identity.js";
+import type {
+	RecipientPolicyTeamRenameErrorCode,
+	RecipientPolicyTeamRenameResultV1,
+} from "./recipient-policy-contract.js";
 import {
 	deterministicPolicyTeamId,
 	recipientPolicyDigest,
 } from "./recipient-policy-identifiers.js";
 
-export type RecipientPolicyTeamRenameErrorCode =
-	| "team_name_invalid"
-	| "team_not_found"
-	| "team_rename_stale"
-	| "team_link_stale"
-	| "team_link_ambiguous"
-	| "team_coordinator_rename_failed"
-	| "team_local_rename_pending"
-	| "team_rename_failed";
+export type {
+	RecipientPolicyTeamRenameErrorCode,
+	RecipientPolicyTeamRenameResultV1,
+} from "./recipient-policy-contract.js";
 
 export class RecipientPolicyTeamRenameError extends Error {
 	constructor(readonly code: RecipientPolicyTeamRenameErrorCode) {
@@ -25,14 +24,6 @@ export class RecipientPolicyTeamRenameError extends Error {
 export interface ConfiguredCoordinatorGroupV1 {
 	coordinatorId: string;
 	groupId: string;
-}
-
-export interface RecipientPolicyTeamRenameResultV1 {
-	version: 1;
-	teamId: string;
-	displayName: string;
-	revision: string;
-	linkedCoordinatorGroupRenamed: boolean;
 }
 
 interface TeamRow {

@@ -778,6 +778,18 @@ export type {
 	RecipientPolicyAuthorityV1,
 	RecipientPolicyBlockedItemV1,
 	RecipientPolicyContractVersion,
+	RecipientPolicyEdgeChangeV1,
+	RecipientPolicyEdgeCommitOutcomeV1,
+	RecipientPolicyEdgeCommitRequestV1,
+	RecipientPolicyEdgeCommitResultV1,
+	RecipientPolicyEdgeEffectiveDeviceV1,
+	RecipientPolicyEdgeIdentitySummaryV1,
+	RecipientPolicyEdgeOutcomeV1,
+	RecipientPolicyEdgePreviewProjectV1,
+	RecipientPolicyEdgePreviewRequestV1,
+	RecipientPolicyEdgePreviewResponseV1,
+	RecipientPolicyEdgeRecipientRefV1,
+	RecipientPolicyEdgeSelectedRecipientV1,
 	RecipientPolicyEffectiveDeviceV1,
 	RecipientPolicyEnforcementV1,
 	RecipientPolicyIdentityDeviceV1,
@@ -798,23 +810,14 @@ export type {
 	RecipientPolicyReviewPreviewV1,
 	RecipientPolicyReviewResolutionV1,
 	RecipientPolicyTeamMembershipV1,
+	RecipientPolicyTeamRenameErrorCode,
+	RecipientPolicyTeamRenameResultV1,
 	RecipientPolicyTeamV1,
 } from "./recipient-policy-contract.js";
-export { RECIPIENT_POLICY_CONTRACT_VERSION } from "./recipient-policy-contract.js";
-export type {
-	RecipientPolicyEdgeChangeV1,
-	RecipientPolicyEdgeCommitOutcomeV1,
-	RecipientPolicyEdgeCommitRequestV1,
-	RecipientPolicyEdgeCommitResultV1,
-	RecipientPolicyEdgeEffectiveDeviceV1,
-	RecipientPolicyEdgeIdentitySummaryV1,
-	RecipientPolicyEdgeOutcomeV1,
-	RecipientPolicyEdgePreviewProjectV1,
-	RecipientPolicyEdgePreviewRequestV1,
-	RecipientPolicyEdgePreviewResponseV1,
-	RecipientPolicyEdgeRecipientRefV1,
-	RecipientPolicyEdgeSelectedRecipientV1,
-} from "./recipient-policy-edges.js";
+export {
+	RECIPIENT_POLICY_CONTRACT_VERSION,
+	RECIPIENT_POLICY_TEAM_RENAME_ERROR_CODES,
+} from "./recipient-policy-contract.js";
 export {
 	commitRecipientPolicyEdges,
 	parseRecipientPolicyEdgeCommitRequest,
@@ -933,11 +936,7 @@ export {
 	resolveRecipientPolicyReview,
 	resolveRecipientPolicyReviewBulk,
 } from "./recipient-policy-review.js";
-export type {
-	ConfiguredCoordinatorGroupV1,
-	RecipientPolicyTeamRenameErrorCode,
-	RecipientPolicyTeamRenameResultV1,
-} from "./recipient-policy-team-metadata.js";
+export type { ConfiguredCoordinatorGroupV1 } from "./recipient-policy-team-metadata.js";
 export {
 	claimRecipientPolicyActorMutations,
 	claimRecipientPolicyPublicationMutation,

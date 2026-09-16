@@ -4,6 +4,19 @@ import {
 	type PolicyTeamDeviceEligibilityBlock,
 	type PolicyTeamDeviceEligibilityIdentity,
 } from "./policy-team-device-eligibility.js";
+import type {
+	RecipientPolicyEdgeChangeV1,
+	RecipientPolicyEdgeCommitOutcomeV1,
+	RecipientPolicyEdgeCommitRequestV1,
+	RecipientPolicyEdgeCommitResultV1,
+	RecipientPolicyEdgeEffectiveDeviceV1,
+	RecipientPolicyEdgeIdentitySummaryV1,
+	RecipientPolicyEdgePreviewProjectV1,
+	RecipientPolicyEdgePreviewRequestV1,
+	RecipientPolicyEdgePreviewResponseV1,
+	RecipientPolicyEdgeRecipientRefV1,
+	RecipientPolicyEdgeSelectedRecipientV1,
+} from "./recipient-policy-contract.js";
 import {
 	isStrictRecipientPolicyId,
 	isStrictRecipientPolicyProjectIdentity,
@@ -12,89 +25,20 @@ import {
 import { canonicalWorkspaceIdentity } from "./scope-resolution.js";
 import { SYNC_BOOTSTRAP_CWD_PREFIX } from "./sync-bootstrap-constants.js";
 
-export type RecipientPolicyEdgeRecipientRefV1 =
-	| { recipientKind: "identity"; identityId: string }
-	| { recipientKind: "team"; teamId: string };
-
-export interface RecipientPolicyEdgeChangeV1 {
-	canonicalProjectIdentity: string;
-	recipient: RecipientPolicyEdgeRecipientRefV1;
-	action: "add" | "remove";
-}
-
-export interface RecipientPolicyEdgePreviewRequestV1 {
-	version: 1;
-	changes: RecipientPolicyEdgeChangeV1[];
-}
-
-export interface RecipientPolicyEdgeCommitRequestV1 extends RecipientPolicyEdgePreviewRequestV1 {
-	reviewedPolicyDigest: string;
-}
-
-export interface RecipientPolicyEdgePreviewProjectV1 {
-	canonicalProjectIdentity: string;
-	displayName: string;
-	existingMemoryCount: number;
-	futureMemoriesShared: true;
-}
-
-export interface RecipientPolicyEdgeIdentitySummaryV1 {
-	identityId: string;
-	displayName: string;
-	verification: "local";
-}
-
-export type RecipientPolicyEdgeSelectedRecipientV1 =
-	| ({ recipientKind: "identity" } & RecipientPolicyEdgeIdentitySummaryV1)
-	| {
-			recipientKind: "team";
-			teamId: string;
-			displayName: string;
-			currentMembers: RecipientPolicyEdgeIdentitySummaryV1[];
-			futureMembersInherit: true;
-	  };
-
-export interface RecipientPolicyEdgeEffectiveDeviceV1 {
-	canonicalProjectIdentity: string;
-	identityId: string;
-	deviceId: string;
-	displayName: string;
-}
-
-export interface RecipientPolicyEdgePreviewResponseV1 {
-	version: 1;
-	normalizedChanges: RecipientPolicyEdgeChangeV1[];
-	outcomes: RecipientPolicyEdgeCommitOutcomeV1[];
-	projects: RecipientPolicyEdgePreviewProjectV1[];
-	selectedRecipients: RecipientPolicyEdgeSelectedRecipientV1[];
-	effectiveDevices: RecipientPolicyEdgeEffectiveDeviceV1[];
-	unchangedProjects: RecipientPolicyEdgePreviewProjectV1[];
-	reviewedPolicyDigest: string;
-	addCount: number;
-	removeCount: number;
-	netWriteCount: number;
-}
-
-export type RecipientPolicyEdgeOutcomeV1 =
-	| "added"
-	| "removed"
-	| "already_present"
-	| "already_absent";
-
-export interface RecipientPolicyEdgeCommitOutcomeV1 {
-	change: RecipientPolicyEdgeChangeV1;
-	outcome: RecipientPolicyEdgeOutcomeV1;
-}
-
-export interface RecipientPolicyEdgeCommitResultV1 {
-	version: 1;
-	status: "applied" | "stale" | "invalid" | "not_found" | "conflict";
-	reviewedPolicyDigest: string;
-	errorCode: string | null;
-	outcomes: RecipientPolicyEdgeCommitOutcomeV1[];
-	writeCount: number;
-	idempotent: boolean;
-}
+export type {
+	RecipientPolicyEdgeChangeV1,
+	RecipientPolicyEdgeCommitOutcomeV1,
+	RecipientPolicyEdgeCommitRequestV1,
+	RecipientPolicyEdgeCommitResultV1,
+	RecipientPolicyEdgeEffectiveDeviceV1,
+	RecipientPolicyEdgeIdentitySummaryV1,
+	RecipientPolicyEdgeOutcomeV1,
+	RecipientPolicyEdgePreviewProjectV1,
+	RecipientPolicyEdgePreviewRequestV1,
+	RecipientPolicyEdgePreviewResponseV1,
+	RecipientPolicyEdgeRecipientRefV1,
+	RecipientPolicyEdgeSelectedRecipientV1,
+} from "./recipient-policy-contract.js";
 
 export class RecipientPolicyEdgeRequestError extends Error {
 	readonly status: "invalid" | "not_found";

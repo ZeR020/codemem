@@ -3,9 +3,43 @@
  * the manual sync-now trigger. Every request in this file hits
  * /api/sync/* or /api/sync/run/* on the viewer. */
 
+import {
+	RECIPIENT_POLICY_TEAM_RENAME_ERROR_CODES,
+	type RecipientPolicyEdgeChangeV1,
+	type RecipientPolicyEdgeCommitOutcomeV1,
+	type RecipientPolicyEdgeCommitRequestV1,
+	type RecipientPolicyEdgeCommitResultV1,
+	type RecipientPolicyEdgeEffectiveDeviceV1,
+	type RecipientPolicyEdgeIdentitySummaryV1,
+	type RecipientPolicyEdgeOutcomeV1,
+	type RecipientPolicyEdgePreviewProjectV1,
+	type RecipientPolicyEdgePreviewRequestV1,
+	type RecipientPolicyEdgePreviewResponseV1,
+	type RecipientPolicyEdgeRecipientRefV1,
+	type RecipientPolicyEdgeSelectedRecipientV1,
+	type RecipientPolicyTeamRenameErrorCode,
+	type RecipientPolicyTeamRenameResultV1,
+} from "@codemem/core/recipient-policy-contract";
 import type { ReadRequestOptions } from "../read-request";
 import { fetchJson, payloadError, readJsonPayload } from "./internal";
 import type { AcceptDiscoveredPeerResult, ImportInviteResult, SyncRunResponse } from "./types";
+
+export type {
+	RecipientPolicyEdgeChangeV1,
+	RecipientPolicyEdgeCommitOutcomeV1,
+	RecipientPolicyEdgeCommitRequestV1,
+	RecipientPolicyEdgeCommitResultV1,
+	RecipientPolicyEdgeEffectiveDeviceV1,
+	RecipientPolicyEdgeIdentitySummaryV1,
+	RecipientPolicyEdgeOutcomeV1,
+	RecipientPolicyEdgePreviewProjectV1,
+	RecipientPolicyEdgePreviewRequestV1,
+	RecipientPolicyEdgePreviewResponseV1,
+	RecipientPolicyEdgeRecipientRefV1,
+	RecipientPolicyEdgeSelectedRecipientV1,
+	RecipientPolicyTeamRenameErrorCode,
+	RecipientPolicyTeamRenameResultV1,
+};
 
 export type RecipientInvitationKind = "team_member" | "add_device";
 
@@ -69,24 +103,6 @@ export interface RecipientInvitePreviewResult {
 	preview: RecipientOnboardingPreviewV1;
 }
 
-export type RecipientPolicyTeamRenameErrorCode =
-	| "team_name_invalid"
-	| "team_not_found"
-	| "team_rename_stale"
-	| "team_link_stale"
-	| "team_link_ambiguous"
-	| "team_coordinator_rename_failed"
-	| "team_local_rename_pending"
-	| "team_rename_failed";
-
-export interface RecipientPolicyTeamRenameResultV1 {
-	version: 1;
-	teamId: string;
-	displayName: string;
-	revision: string;
-	linkedCoordinatorGroupRenamed: boolean;
-}
-
 export class RecipientPolicyTeamRenameApiError extends Error {
 	constructor(
 		readonly statusCode: number,
@@ -97,16 +113,9 @@ export class RecipientPolicyTeamRenameApiError extends Error {
 	}
 }
 
-const TEAM_RENAME_ERROR_CODES = new Set<RecipientPolicyTeamRenameErrorCode>([
-	"team_name_invalid",
-	"team_not_found",
-	"team_rename_stale",
-	"team_link_stale",
-	"team_link_ambiguous",
-	"team_coordinator_rename_failed",
-	"team_local_rename_pending",
-	"team_rename_failed",
-]);
+const TEAM_RENAME_ERROR_CODES = new Set<RecipientPolicyTeamRenameErrorCode>(
+	RECIPIENT_POLICY_TEAM_RENAME_ERROR_CODES,
+);
 
 export async function renameRecipientPolicyTeam(input: {
 	teamId: string;
@@ -779,10 +788,6 @@ export class RecipientPolicyReviewStaleError extends Error {
 		this.result = result;
 	}
 }
-
-export type RecipientPolicyEdgeRecipientRefV1 =
-	| { recipientKind: "identity"; identityId: string }
-	| { recipientKind: "team"; teamId: string };
 
 export interface RecipientPolicyIdentityV1 {
 	version: 1;
@@ -1672,86 +1677,6 @@ export interface RecipientPolicyReconciliationStatusV1 {
 		deliveredCopiesMayRemain: true;
 		revocationWarning: string;
 	}>;
-}
-
-export interface RecipientPolicyEdgeChangeV1 {
-	canonicalProjectIdentity: string;
-	recipient: RecipientPolicyEdgeRecipientRefV1;
-	action: "add" | "remove";
-}
-
-export interface RecipientPolicyEdgePreviewRequestV1 {
-	version: 1;
-	changes: RecipientPolicyEdgeChangeV1[];
-}
-
-export interface RecipientPolicyEdgeCommitRequestV1 extends RecipientPolicyEdgePreviewRequestV1 {
-	reviewedPolicyDigest: string;
-}
-
-export interface RecipientPolicyEdgePreviewProjectV1 {
-	canonicalProjectIdentity: string;
-	displayName: string;
-	existingMemoryCount: number;
-	futureMemoriesShared: true;
-}
-
-export interface RecipientPolicyEdgeIdentitySummaryV1 {
-	identityId: string;
-	displayName: string;
-	verification: "local";
-}
-
-export type RecipientPolicyEdgeSelectedRecipientV1 =
-	| ({ recipientKind: "identity" } & RecipientPolicyEdgeIdentitySummaryV1)
-	| {
-			recipientKind: "team";
-			teamId: string;
-			displayName: string;
-			currentMembers: RecipientPolicyEdgeIdentitySummaryV1[];
-			futureMembersInherit: true;
-	  };
-
-export interface RecipientPolicyEdgeEffectiveDeviceV1 {
-	canonicalProjectIdentity: string;
-	identityId: string;
-	deviceId: string;
-	displayName: string;
-}
-
-export interface RecipientPolicyEdgePreviewResponseV1 {
-	version: 1;
-	normalizedChanges: RecipientPolicyEdgeChangeV1[];
-	outcomes: RecipientPolicyEdgeCommitOutcomeV1[];
-	projects: RecipientPolicyEdgePreviewProjectV1[];
-	selectedRecipients: RecipientPolicyEdgeSelectedRecipientV1[];
-	effectiveDevices: RecipientPolicyEdgeEffectiveDeviceV1[];
-	unchangedProjects: RecipientPolicyEdgePreviewProjectV1[];
-	reviewedPolicyDigest: string;
-	addCount: number;
-	removeCount: number;
-	netWriteCount: number;
-}
-
-export type RecipientPolicyEdgeOutcomeV1 =
-	| "added"
-	| "removed"
-	| "already_present"
-	| "already_absent";
-
-export interface RecipientPolicyEdgeCommitOutcomeV1 {
-	change: RecipientPolicyEdgeChangeV1;
-	outcome: RecipientPolicyEdgeOutcomeV1;
-}
-
-export interface RecipientPolicyEdgeCommitResultV1 {
-	version: 1;
-	status: "applied" | "stale" | "invalid" | "not_found" | "conflict";
-	reviewedPolicyDigest: string;
-	errorCode: string | null;
-	outcomes: RecipientPolicyEdgeCommitOutcomeV1[];
-	writeCount: number;
-	idempotent: boolean;
 }
 
 export class RecipientPolicyEdgesStaleError extends Error {
