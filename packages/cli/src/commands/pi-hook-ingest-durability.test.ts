@@ -228,6 +228,97 @@ describe("pi-hook-ingest durability queued drain", () => {
 	});
 });
 
+describe("pi-hook-ingest boundary replay on recovered spool", () => {
+	let sandbox: ReturnType<typeof installPiIngestSandbox>;
+	beforeEach(() => {
+		sandbox = installPiIngestSandbox();
+	});
+	afterEach(() => {
+		sandbox.cleanup();
+	});
+
+	it("replays the boundary flush when a spooled session_before_compact is drained later", async () => {
+		// Original invocation: viewer down and DB down — boundary payload spools
+		// without any flush (both flush writes fail).
+		const spooled = await ingestPiHookPayload(
+			{ piEvent: "session_before_compact", sessionId: "sess-recover", tag: "boundary" },
+			{ host: "127.0.0.1", port: 38888 },
+			{
+				httpIngest: async () => ({ ok: false, inserted: 0, skipped: 0 }),
+				directIngest: () => {
+					throw new Error("db unavailable");
+				},
+				boundaryFlush: () => {
+					throw new Error("flush unavailable");
+				},
+				resolveDb: () => "/tmp/unreachable.sqlite",
+			},
+		);
+		expect(spooled.via).toBe("spool");
+
+		// Later invocation: viewer still down, DB healthy — drain must deliver AND
+		// replay the flush-only boundary, or the compact extraction is lost.
+		const flushes: Array<Record<string, unknown>> = [];
+		const directCalls: Array<Record<string, unknown>> = [];
+		const result = await ingestPiHookPayload(
+			{ piEvent: "session_start", sessionId: "sess-later", tag: "later" },
+			{ host: "127.0.0.1", port: 38888 },
+			{
+				httpIngest: async () => ({ ok: false, inserted: 0, skipped: 0 }),
+				directIngest: (payload) => {
+					directCalls.push(payload);
+					return { inserted: 1, skipped: 0 };
+				},
+				boundaryFlush: (payload) => {
+					flushes.push(payload);
+				},
+				resolveDb: () => "/tmp/healthy.sqlite",
+			},
+		);
+
+		expect(result.via).toBe("direct");
+		expect(readdirSync(sandbox.queueDir).filter((n) => n.endsWith(".json"))).toHaveLength(0);
+		// Delivery write-through (best-effort enqueue; skip for flush-only) plus
+		// the boundary's own write-through both hit the boundary payload, then
+		// the current event lands. Deduplication makes the double write safe.
+		expect(directCalls.map((p) => p.tag)).toEqual(["boundary", "boundary", "later"]);
+		expect(flushes.map((p) => p.tag)).toEqual(["boundary"]);
+	});
+
+	it("replays direct write-through + flush when a spooled session_shutdown drains over HTTP", async () => {
+		mkdirSync(sandbox.queueDir, { recursive: true });
+		writeFileSync(
+			join(sandbox.queueDir, "hook-0000000001-pid-1.json"),
+			JSON.stringify({ piEvent: "session_shutdown", sessionId: "sess-shut", tag: "boundary" }),
+			"utf8",
+		);
+
+		const flushes: Array<Record<string, unknown>> = [];
+		const directCalls: Array<Record<string, unknown>> = [];
+		const result = await ingestPiHookPayload(
+			{ piEvent: "session_start", sessionId: "sess-next", tag: "next" },
+			{ host: "127.0.0.1", port: 38888 },
+			{
+				httpIngest: async () => ({ ok: true, inserted: 1, skipped: 0 }),
+				directIngest: (payload) => {
+					directCalls.push(payload);
+					return { inserted: 1, skipped: 0 };
+				},
+				boundaryFlush: (payload) => {
+					flushes.push(payload);
+				},
+				resolveDb: () => "/tmp/test.sqlite",
+			},
+		);
+
+		expect(result.via).toBe("http");
+		expect(readdirSync(sandbox.queueDir)).toHaveLength(0);
+		// HTTP accepted the drained envelope; session_shutdown additionally gets
+		// the promised synchronous direct write + flush replay.
+		expect(directCalls.map((p) => p.tag)).toEqual(["boundary"]);
+		expect(flushes.map((p) => p.tag)).toEqual(["boundary"]);
+	});
+});
 describe("pi-hook-ingest durability boundary order", () => {
 	let sandbox: ReturnType<typeof installPiIngestSandbox>;
 	beforeEach(() => {

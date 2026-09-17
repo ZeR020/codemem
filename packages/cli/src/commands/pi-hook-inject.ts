@@ -9,7 +9,19 @@
  *   echo '{"prompt":"fix auth","cwd":"/path","project":"codemem"}' \
  *     | codemem pi-hook-inject
  */
-import { MemoryStore, resolveDbPath, resolveHookProject } from "@codemem/core";
+import { resolve } from "node:path";
+import {
+	arePromptTransportProtocolRangesCompatible,
+	buildViewerIdentityTarget,
+	classifyPromptTransportFailure,
+	MemoryStore,
+	normalizePromptTransportProtocolRange,
+	PROMPT_TRANSPORT_PROTOCOL_RANGE,
+	type PromptTransportDisposition,
+	resolveDbPath,
+	resolveHookProject,
+	type ViewerIdentityTarget,
+} from "@codemem/core";
 import { Command } from "commander";
 import { helpStyle } from "../help-style.js";
 import { addDbOption, type DbOpts, resolveDbOpt } from "../shared-options.js";
@@ -22,18 +34,16 @@ export type PiPackResult = {
 	packTokens: number;
 };
 
-type HttpPackResponse = {
-	pack_text?: string;
-	items?: unknown;
-	metrics?: { pack_tokens?: unknown };
-};
-
 type InjectDeps = {
 	buildLocalPack?: typeof buildLocalPack;
-	httpPack?: typeof tryHttpPack;
+	viewerPack?: typeof fetchViewerPack;
 	resolveDb?: typeof resolveDbPath;
+	fetchImpl?: typeof fetch;
 };
 
+type ViewerPackOutcome =
+	| { ok: true; pack: PiPackResult }
+	| { ok: false; disposition: PromptTransportDisposition };
 const EMPTY_PACK: PiPackResult = { packText: "", items: 0, packTokens: 0 };
 const DEFAULT_VIEWER_HOST = "127.0.0.1";
 const DEFAULT_VIEWER_PORT = 38888;
@@ -136,52 +146,263 @@ async function buildLocalPack(
 	}
 }
 
-async function tryHttpPack(
-	context: string,
-	project: string | null,
-	maxTimeMs = DEFAULT_HTTP_MAX_TIME_S * 1000,
-): Promise<PiPackResult> {
-	const host = process.env.CODEMEM_VIEWER_HOST || DEFAULT_VIEWER_HOST;
-	const port = parsePositiveInt(process.env.CODEMEM_VIEWER_PORT, DEFAULT_VIEWER_PORT);
-	const url = new URL(`http://${host}:${port}/api/pack`);
-	url.searchParams.set("context", context);
-	url.searchParams.set("limit", String(parsePositiveInt(process.env.CODEMEM_INJECT_LIMIT, 8)));
-	url.searchParams.set(
-		"token_budget",
-		String(parsePositiveInt(process.env.CODEMEM_INJECT_TOKEN_BUDGET, 800)),
-	);
-	if (project) url.searchParams.set("project", project);
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return value != null && typeof value === "object" && !Array.isArray(value);
+}
 
+function canonicalJson(value: unknown): string {
+	if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+	if (isRecord(value)) {
+		return `{${Object.keys(value)
+			.sort()
+			.map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`)
+			.join(",")}}`;
+	}
+	return JSON.stringify(value);
+}
+
+// Bind the viewer transport to the loopback interface the same way the codex
+// path does: a non-loopback host cannot prove it is the local viewer for this
+// database, so it is denied rather than trusted with the target identity.
+function viewerBaseUrl(): string | null {
+	const configuredHost = process.env.CODEMEM_VIEWER_HOST?.trim() || DEFAULT_VIEWER_HOST;
+	const host = configuredHost.toLowerCase().replace(/^\[(.*)\]$/, "$1");
+	const ipv4 = host.split(".");
+	const isIpv4Loopback =
+		ipv4.length === 4 &&
+		ipv4[0] === "127" &&
+		ipv4.every(
+			(part) => /^\d+$/.test(part) && String(Number(part)) === part && Number(part) <= 255,
+		);
+	let urlHost: string | null = null;
+	if (host === "localhost" || isIpv4Loopback) urlHost = host;
+	else if (host === "::1" || host === "0:0:0:0:0:0:0:1") urlHost = "[::1]";
+	if (!urlHost) return null;
+
+	const portText = process.env.CODEMEM_VIEWER_PORT?.trim() || String(DEFAULT_VIEWER_PORT);
+	const port = Number(portText);
+	const safePort =
+		/^\d+$/.test(portText) &&
+		Number.isSafeInteger(port) &&
+		port >= 1 &&
+		port <= 65535 &&
+		String(port) === portText
+			? port
+			: DEFAULT_VIEWER_PORT;
+	return `http://${urlHost}:${safePort}`;
+}
+
+async function responseJson(response: Response): Promise<unknown> {
+	try {
+		return await response.json();
+	} catch {
+		return null;
+	}
+}
+
+function errorCode(body: unknown): string | null {
+	return isRecord(body) && isRecord(body.error) && typeof body.error.code === "string"
+		? body.error.code
+		: null;
+}
+
+function classifyViewerHttpFailure(
+	status: number,
+	body: unknown,
+	compatibleProfile: boolean,
+): PromptTransportDisposition {
+	const code = errorCode(body);
+	if (code === "viewer_db_mismatch") {
+		return classifyPromptTransportFailure({ kind: "database_mismatch" });
+	}
+	if (code === "viewer_identity_mismatch") {
+		return classifyPromptTransportFailure({ kind: "runtime_identity_mismatch" });
+	}
+	if (code === "viewer_contract_unsupported") {
+		return classifyPromptTransportFailure({
+			kind: "viewer_contract_unsupported",
+			compatibleProfile,
+		});
+	}
+	if (
+		status === 401 ||
+		status === 403 ||
+		["authorization_failed", "forbidden", "unauthorized"].includes(code ?? "")
+	) {
+		return classifyPromptTransportFailure({ kind: "authorization_failure" });
+	}
+	if (code === "invalid_request") {
+		return classifyPromptTransportFailure({ kind: "invalid_request", compatibleProfile });
+	}
+	return "fallback";
+}
+
+async function targetedViewerPackPost(
+	baseUrl: string,
+	identity: ViewerIdentityTarget,
+	query: string,
+	project: string | null,
+	dbPath: string,
+	fetchImpl: typeof fetch,
+	signal: AbortSignal,
+): Promise<ViewerPackOutcome> {
+	let packResponse: Response;
+	try {
+		packResponse = await fetchImpl(`${baseUrl}/api/pack`, {
+			method: "POST",
+			redirect: "manual",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({
+				context: query,
+				limit: parsePositiveInt(process.env.CODEMEM_INJECT_LIMIT, 8),
+				token_budget: parsePositiveInt(process.env.CODEMEM_INJECT_TOKEN_BUDGET, 800),
+				...(project ? { project } : {}),
+				db_path: dbPath,
+				identity_target: identity,
+			}),
+			signal,
+		});
+	} catch {
+		return { ok: false, disposition: "fallback" };
+	}
+	const body = await responseJson(packResponse);
+	if (packResponse.status >= 300 && packResponse.status < 400) {
+		return { ok: false, disposition: "fallback" };
+	}
+	if (!packResponse.ok) {
+		return {
+			ok: false,
+			disposition: classifyViewerHttpFailure(packResponse.status, body, true),
+		};
+	}
+	const packText = isRecord(body) ? String(body.pack_text ?? "").trim() : "";
+	const metrics = isRecord(body) && isRecord(body.metrics) ? body.metrics : null;
+	const items = isRecord(body) && Array.isArray(body.items) ? body.items.length : 0;
+	return {
+		ok: true,
+		pack: {
+			packText,
+			items,
+			packTokens:
+				metrics && Number.isFinite(Number(metrics.pack_tokens)) ? Number(metrics.pack_tokens) : 0,
+		},
+	};
+}
+
+/** Validate the viewer's profile against the requested database and runtime identity. */
+async function fetchAndValidateViewerProfile(
+	baseUrl: string,
+	dbPath: string,
+	identity: ViewerIdentityTarget,
+	fetchImpl: typeof fetch,
+	signal: AbortSignal,
+): Promise<ViewerPackOutcome | "ok"> {
+	let profileResponse: Response;
+	try {
+		profileResponse = await fetchImpl(`${baseUrl}/api/prompt-pack-profile`, {
+			method: "GET",
+			redirect: "manual",
+			signal,
+		});
+	} catch {
+		return { ok: false, disposition: "fallback" };
+	}
+	const profile = await responseJson(profileResponse);
+	if (profileResponse.status >= 300 && profileResponse.status < 400) {
+		return { ok: false, disposition: "fallback" };
+	}
+	if (!profileResponse.ok) {
+		return {
+			ok: false,
+			disposition: classifyViewerHttpFailure(profileResponse.status, profile, false),
+		};
+	}
+	const viewerRange = isRecord(profile)
+		? normalizePromptTransportProtocolRange(
+				profile.protocol_version,
+				profile.min_supported_protocol_version,
+			)
+		: null;
+	if (
+		!isRecord(profile) ||
+		profile.service !== "codemem-viewer" ||
+		!viewerRange ||
+		!arePromptTransportProtocolRangesCompatible(PROMPT_TRANSPORT_PROTOCOL_RANGE, viewerRange)
+	) {
+		return { ok: false, disposition: "fallback" };
+	}
+	if (profile.db_path !== dbPath) {
+		return {
+			ok: false,
+			disposition: classifyPromptTransportFailure({ kind: "database_mismatch" }),
+		};
+	}
+	if (canonicalJson(profile.identity_target) !== canonicalJson(identity)) {
+		return {
+			ok: false,
+			disposition: classifyPromptTransportFailure({ kind: "runtime_identity_mismatch" }),
+		};
+	}
+	return "ok";
+}
+/**
+ * Fetch the pack from the viewer only when the viewer proves it serves this
+ * database and runtime identity: GET /api/prompt-pack-profile first, compare
+ * db_path + identity_target + protocol range, then POST /api/pack with the
+ * same paired target fields. Anything less (the unscoped legacy GET) could
+ * hand another database's memories to this turn, so those paths fail open.
+ */
+async function fetchViewerPack(
+	query: string,
+	project: string | null,
+	dbPath: string,
+	maxTimeMs: number,
+	deps: InjectDeps = {},
+): Promise<ViewerPackOutcome> {
+	const baseUrl = viewerBaseUrl();
+	if (!baseUrl) {
+		return {
+			ok: false,
+			disposition: classifyPromptTransportFailure({ kind: "policy_failure" }),
+		};
+	}
+	const fetchImpl = deps.fetchImpl ?? fetch;
 	const controller = new AbortController();
 	const timeout = setTimeout(() => controller.abort(), maxTimeMs);
+	const identity = buildViewerIdentityTarget();
 	try {
-		const res = await fetch(url, { signal: controller.signal });
-		if (!res.ok) return EMPTY_PACK;
-		const body = (await res.json()) as HttpPackResponse;
-		return {
-			packText: String(body.pack_text ?? "").trim(),
-			items: Array.isArray(body.items) ? body.items.length : 0,
-			packTokens: Number.isFinite(Number(body.metrics?.pack_tokens))
-				? Number(body.metrics?.pack_tokens)
-				: 0,
-		};
-	} catch {
-		return EMPTY_PACK;
+		const profileOutcome = await fetchAndValidateViewerProfile(
+			baseUrl,
+			dbPath,
+			identity,
+			fetchImpl,
+			controller.signal,
+		);
+		if (profileOutcome !== "ok") return profileOutcome;
+		return await targetedViewerPackPost(
+			baseUrl,
+			identity,
+			query,
+			project,
+			dbPath,
+			fetchImpl,
+			controller.signal,
+		);
 	} finally {
 		clearTimeout(timeout);
 	}
 }
-
 async function resolvePiInjectPack(
 	query: string,
 	project: string | null,
 	dbPath: string,
 	httpMaxTimeMs: number,
 	buildPack: typeof buildLocalPack,
-	httpPack: typeof tryHttpPack,
-): Promise<{ pack: PiPackResult; origin: "local" | "http" | "none" }> {
+	viewerPackFn: typeof fetchViewerPack,
+	deps: InjectDeps,
+): Promise<{ pack: PiPackResult; origin: "local" | "viewer" | "none"; blocked: boolean }> {
 	let pack: PiPackResult = EMPTY_PACK;
-	let origin: "local" | "http" | "none" = "none";
+	let origin: "local" | "viewer" | "none" = "none";
 	try {
 		pack = await buildPack(query, project, dbPath);
 		if (pack.packText) origin = "local";
@@ -191,17 +412,27 @@ async function resolvePiInjectPack(
 		);
 	}
 	if (!pack.packText && envNotDisabled(process.env.CODEMEM_INJECT_HTTP_FALLBACK || "1")) {
-		pack = await httpPack(query, project, httpMaxTimeMs);
-		if (pack.packText) origin = "http";
+		const viewer = await viewerPackFn(query, project, dbPath, httpMaxTimeMs, deps);
+		if (viewer.ok && viewer.pack.packText) {
+			pack = viewer.pack;
+			origin = "viewer";
+		} else if (!viewer.ok && viewer.disposition === "terminal") {
+			// The endpoint on this port answered but proved a different
+			// database/identity (or denied the contract). Local fallback cannot
+			// fix that mismatch — fail this turn's injection instead of risking
+			// another viewer's memories.
+			return { pack: EMPTY_PACK, origin: "none", blocked: true };
+		}
 	}
-	return { pack, origin };
+	return { pack, origin, blocked: false };
 }
 
 function logPiInjectMetrics(
-	origin: "local" | "http" | "none",
+	origin: "local" | "viewer" | "none",
 	pack: PiPackResult,
 	query: string,
 	project: string | null,
+	blocked: boolean,
 ): void {
 	const fields = [
 		"inject.pack.ok",
@@ -212,10 +443,10 @@ function logPiInjectMetrics(
 		`query_len=${query.length}`,
 		`empty=${pack.packText ? "false" : "true"}`,
 	];
+	if (blocked) fields.push("blocked=target_mismatch");
 	if (project) fields.push(`project=${JSON.stringify(project)}`);
 	logHookEvent(fields.join(" "));
 }
-
 /**
  * Build the formatted pi injection block (plain text).
  * Returns empty string on any disable/error/empty path (fail-open).
@@ -231,15 +462,24 @@ export async function buildPiHookInjection(
 	if (!promptText) return "";
 	const project = resolveInjectProject(payload);
 	const query = buildPiInjectQuery(promptText, project);
-	const { pack, origin } = await resolvePiInjectPack(
+	// Canonicalize like the codex path so the profile comparison cannot be
+	// defeated by an equivalent-but-unresolved --db spelling.
+	const dbPath = resolve((deps.resolveDb ?? resolveDbPath)(resolveDbOpt(opts)));
+	const { pack, origin, blocked } = await resolvePiInjectPack(
 		query,
 		project,
-		(deps.resolveDb ?? resolveDbPath)(resolveDbOpt(opts)),
+		dbPath,
 		parsePositiveInt(process.env.CODEMEM_INJECT_HTTP_MAX_TIME_S, DEFAULT_HTTP_MAX_TIME_S) * 1000,
 		deps.buildLocalPack ?? buildLocalPack,
-		deps.httpPack ?? tryHttpPack,
+		deps.viewerPack ?? fetchViewerPack,
+		deps,
 	);
-	logPiInjectMetrics(origin, pack, query, project);
+	if (blocked) {
+		logHookEvent(
+			"codemem pi-hook-inject viewer is running for a different database or identity; skipping injection",
+		);
+	}
+	logPiInjectMetrics(origin, pack, query, project, blocked);
 	return formatPiInjectionBlock(
 		pack.packText,
 		parsePositiveInt(process.env.CODEMEM_INJECT_MAX_CHARS, DEFAULT_MAX_CHARS),

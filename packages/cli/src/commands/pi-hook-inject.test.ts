@@ -77,8 +77,8 @@ describe("pi-hook-inject command", () => {
 					expect(dbPath).toBe("/tmp/test.sqlite");
 					return pack("## Summary\n[1] (decision) Auth fix", 1, 42);
 				},
-				httpPack: async () => {
-					throw new Error("http fallback should not run");
+				viewerPack: async () => {
+					throw new Error("viewer fallback should not run");
 				},
 				resolveDb: () => "/tmp/test.sqlite",
 			},
@@ -101,11 +101,14 @@ describe("pi-hook-inject command", () => {
 				buildLocalPack: async () => {
 					throw new Error("local failed");
 				},
-				httpPack: async (context, project, maxTimeMs) => {
+				viewerPack: async (context, project, _dbPath, maxTimeMs) => {
 					expect(context).toBe("continue sync work codemem");
 					expect(project).toBe("codemem");
 					expect(maxTimeMs).toBe(7000);
-					return pack("## Timeline\n[4] (feature) Sync continuation", 1, 53);
+					return {
+						ok: true as const,
+						pack: pack("## Timeline\n[4] (feature) Sync continuation", 1, 53),
+					};
 				},
 				resolveDb: () => "/tmp/test.sqlite",
 			},
@@ -120,7 +123,7 @@ describe("pi-hook-inject command", () => {
 			{},
 			{
 				buildLocalPack: async () => pack("## Summary\n[7] (session_summary) Shipped setup fix"),
-				httpPack: async () => pack(""),
+				viewerPack: async () => ({ ok: false as const, disposition: "fallback" as const }),
 				resolveDb: () => "/tmp/test.sqlite",
 			},
 		);
@@ -149,8 +152,8 @@ describe("pi-hook-inject disable paths", () => {
 				buildLocalPack: async () => {
 					throw new Error("should not build local pack");
 				},
-				httpPack: async () => {
-					throw new Error("should not call http fallback");
+				viewerPack: async () => {
+					throw new Error("should not call viewer fallback");
 				},
 				resolveDb: () => "/tmp/test.sqlite",
 			},
@@ -169,7 +172,7 @@ describe("pi-hook-inject disable paths", () => {
 					expect(project).toBe("api");
 					return pack("memory body", 1, 10);
 				},
-				httpPack: async () => pack(""),
+				viewerPack: async () => ({ ok: false as const, disposition: "fallback" as const }),
 				resolveDb: () => "/tmp/test.sqlite",
 			},
 		);
@@ -185,8 +188,8 @@ describe("pi-hook-inject disable paths", () => {
 				buildLocalPack: async () => {
 					throw new Error("should not build local pack");
 				},
-				httpPack: async () => {
-					throw new Error("should not call http fallback");
+				viewerPack: async () => {
+					throw new Error("should not call viewer fallback");
 				},
 				resolveDb: () => "/tmp/test.sqlite",
 			},
@@ -204,8 +207,8 @@ describe("pi-hook-inject disable paths", () => {
 				buildLocalPack: async () => {
 					throw new Error("should not build local pack");
 				},
-				httpPack: async () => {
-					throw new Error("should not call http fallback");
+				viewerPack: async () => {
+					throw new Error("should not call viewer fallback");
 				},
 				resolveDb: () => "/tmp/test.sqlite",
 			},
@@ -230,7 +233,7 @@ describe("pi-hook-inject formatting", () => {
 			{},
 			{
 				buildLocalPack: async () => pack("12345678901234567890"),
-				httpPack: async () => pack(""),
+				viewerPack: async () => ({ ok: false as const, disposition: "fallback" as const }),
 				resolveDb: () => "/tmp/test.sqlite",
 			},
 		);
@@ -247,7 +250,7 @@ describe("pi-hook-inject formatting", () => {
 			{},
 			{
 				buildLocalPack: async () => pack("12345678901234567890"),
-				httpPack: async () => pack(""),
+				viewerPack: async () => ({ ok: false as const, disposition: "fallback" as const }),
 				resolveDb: () => "/tmp/test.sqlite",
 			},
 		);
@@ -266,7 +269,7 @@ describe("pi-hook-inject formatting", () => {
 				buildLocalPack: async () => {
 					throw new Error("local failed");
 				},
-				httpPack: async () => pack(""),
+				viewerPack: async () => ({ ok: false as const, disposition: "fallback" as const }),
 				resolveDb: () => "/tmp/test.sqlite",
 			},
 		);
@@ -284,8 +287,8 @@ describe("pi-hook-inject formatting", () => {
 			{},
 			{
 				buildLocalPack: async () => pack("## Summary\nmemory pack body", 4, 137),
-				httpPack: async () => {
-					throw new Error("http fallback should not run");
+				viewerPack: async () => {
+					throw new Error("viewer fallback should not run");
 				},
 				resolveDb: () => "/tmp/test.sqlite",
 			},
@@ -299,6 +302,44 @@ describe("pi-hook-inject formatting", () => {
 		expect(line).toContain("items=4");
 		expect(line).toContain("pack_tokens=137");
 		expect(line).toContain('project="codemem"');
+	});
+	it("uses the profile-validated viewer pack when local is empty", async () => {
+		process.env.CODEMEM_INJECT_HTTP_FALLBACK = "1";
+		const result = await buildPiHookInjection(
+			{ prompt: "continue work", project: "codemem" },
+			{},
+			{
+				buildLocalPack: async () => pack(""),
+				viewerPack: async (_query, _project, dbPath) => {
+					expect(dbPath).toBe("/tmp/test.sqlite");
+					return { ok: true as const, pack: pack("viewer pack body", 2, 20) };
+				},
+				resolveDb: () => "/tmp/test.sqlite",
+			},
+		);
+
+		expect(result).toContain("viewer pack body");
+		const log = readFileSync(env.pluginLogPath, "utf8");
+		expect(log.trim().split("\n").pop()).toContain("origin=viewer");
+	});
+
+	it("fails open with no injection when the viewer proves a different target", async () => {
+		process.env.CODEMEM_INJECT_HTTP_FALLBACK = "1";
+		const result = await buildPiHookInjection(
+			{ prompt: "continue work", project: "codemem" },
+			{},
+			{
+				buildLocalPack: async () => pack(""),
+				viewerPack: async () => ({ ok: false as const, disposition: "terminal" as const }),
+				resolveDb: () => "/tmp/test.sqlite",
+			},
+		);
+
+		// Terminal viewer mismatch: no injection, and the reason is logged.
+		expect(result).toBe("");
+		const log = readFileSync(env.pluginLogPath, "utf8");
+		expect(log).toContain("different database or identity");
+		expect(log.trim().split("\n").pop()).toContain("blocked=target_mismatch");
 	});
 
 	it("formatPiInjectionBlock returns empty for blank pack text", () => {

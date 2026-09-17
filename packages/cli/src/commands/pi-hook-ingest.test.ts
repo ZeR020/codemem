@@ -31,21 +31,27 @@ describe("pi-hook-ingest command", () => {
 	});
 
 	it("returns HTTP result when viewer ingest succeeds", async () => {
+		const httpPayloads: Array<Record<string, unknown>> = [];
 		const result = await ingestPiHookPayload(
 			{ piEvent: "session_start", sessionId: "sess-http", cwd: "/tmp/demo" },
 			{ host: "127.0.0.1", port: 38888 },
 			{
-				httpIngest: async () => ({ ok: true, inserted: 2, skipped: 1 }),
+				httpIngest: async (payload) => {
+					httpPayloads.push(payload);
+					return { ok: true, inserted: 2, skipped: 1 };
+				},
 				directIngest: () => {
 					throw new Error("direct ingest should not be called");
 				},
-				resolveDb: () => {
-					throw new Error("resolveDb should not be called");
-				},
+				resolveDb: () => "/tmp/resolved.sqlite",
 			},
 		);
 
 		expect(result).toEqual({ inserted: 2, skipped: 1, via: "http" });
+		// P1 fix: HTTP payloads carry the requested db_path + identity_target.
+		expect(httpPayloads).toHaveLength(1);
+		expect(httpPayloads[0]?.db_path).toBe("/tmp/resolved.sqlite");
+		expect(httpPayloads[0]?.identity_target).toEqual(expect.any(Object));
 	});
 
 	it("falls back to direct ingest when HTTP path fails", async () => {
@@ -60,6 +66,26 @@ describe("pi-hook-ingest command", () => {
 		);
 
 		expect(result).toEqual({ inserted: 1, skipped: 0, via: "direct" });
+	});
+
+	it("goes straight to direct on a viewer target-conflict 409 without retrying HTTP", async () => {
+		let httpCalls = 0;
+		const result = await ingestPiHookPayload(
+			{ piEvent: "session_start", sessionId: "sess-mismatch", cwd: "/tmp/demo" },
+			{ host: "127.0.0.1", port: 38888 },
+			{
+				httpIngest: async () => {
+					httpCalls++;
+					return { ok: false, inserted: 0, skipped: 0, targetMismatch: true };
+				},
+				directIngest: () => ({ inserted: 1, skipped: 0 }),
+				resolveDb: () => "/tmp/resolved.sqlite",
+			},
+		);
+
+		expect(result).toEqual({ inserted: 1, skipped: 0, via: "direct" });
+		// First attempt + no locked second attempt once the target conflict is known.
+		expect(httpCalls).toBe(1);
 	});
 });
 
