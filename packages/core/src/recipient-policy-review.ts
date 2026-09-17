@@ -1,4 +1,4 @@
-import type { Database } from "./db.js";
+import { type Database, fromJson } from "./db.js";
 import {
 	isLegacyUmbrellaScopeKind,
 	type LegacyRecipientPolicyConditionCodeV1,
@@ -9,16 +9,19 @@ import {
 } from "./legacy-recipient-policy-projection.js";
 import { isLegacyTeamCandidateSelectable } from "./legacy-team-candidate.js";
 import { isMigratableLegacyTeamProjectIdentity } from "./legacy-team-project-policy.js";
+import { REPOSITORY_IDENTITY_METADATA_KEY } from "./project.js";
 import { isActiveUnmergedLocalActor } from "./recipient-policy-actor-eligibility.js";
 import {
 	isRecipientPolicyNoOpDecision,
 	RECIPIENT_POLICY_CONTRACT_VERSION,
 	type RecipientPolicyBlockedItemV1,
 	type RecipientPolicyContractVersion,
+	type RecipientPolicyReviewConditionCodeV1,
 	type RecipientPolicyReviewDecisionV1,
 	type RecipientPolicyReviewItemV1,
 	type RecipientPolicyReviewOptionV1,
 	type RecipientPolicyReviewPreviewV1,
+	type RecipientPolicyReviewProjectGroupV1,
 } from "./recipient-policy-contract.js";
 import {
 	canonicalRecipientPolicyJson,
@@ -155,6 +158,19 @@ function conditionPresentation(
 	return CONDITION_PRESENTATION[condition.code];
 }
 
+function actionableConditionCode(
+	code: LegacyRecipientPolicyConditionCodeV1,
+): RecipientPolicyReviewConditionCodeV1 {
+	if (
+		code === "suggest_local_identity" ||
+		code === "suggest_team_candidate" ||
+		code === "unassigned_effective_device"
+	) {
+		return code;
+	}
+	throw new Error(`Condition ${code} is not actionable.`);
+}
+
 const canonicalJson = canonicalRecipientPolicyJson;
 const digest = legacyRecipientPolicyDigest;
 
@@ -237,6 +253,42 @@ function memoryCountsByProject(db: Database): Map<string, number> {
 		counts.set(projectId, (counts.get(projectId) ?? 0) + 1);
 	}
 	return counts;
+}
+
+function repositoryIdentitiesByProject(db: Database): Map<string, string> {
+	const rows = db
+		.prepare(
+			`SELECT cwd, project, git_remote, git_branch, metadata_json
+			 FROM sessions
+			 WHERE COALESCE(tool_version, '') <> 'sync_replication'
+			 ORDER BY id`,
+		)
+		.all() as Array<{
+		cwd: string | null;
+		project: string | null;
+		git_remote: string | null;
+		git_branch: string | null;
+		metadata_json: string | null;
+	}>;
+	const evidence = new Map<string, string | null>();
+	for (const row of rows) {
+		const projectId = canonicalWorkspaceIdentity({
+			cwd: row.cwd,
+			project: row.project,
+			gitRemote: row.git_remote,
+			gitBranch: row.git_branch,
+		}).value;
+		const value = fromJson(row.metadata_json)[REPOSITORY_IDENTITY_METADATA_KEY];
+		const repositoryIdentity = typeof value === "string" && value.trim() ? value.trim() : null;
+		if (!evidence.has(projectId)) {
+			evidence.set(projectId, repositoryIdentity);
+			continue;
+		}
+		if (evidence.get(projectId) !== repositoryIdentity) evidence.set(projectId, null);
+	}
+	return new Map(
+		[...evidence].flatMap(([projectId, identity]) => (identity ? [[projectId, identity]] : [])),
+	);
 }
 
 function preview(
@@ -347,6 +399,41 @@ function reviewOptions(
 	};
 }
 
+function reviewProjectGroup(
+	projection: LegacyRecipientPolicyProjectionV1,
+	repositoryIdentity: string | undefined,
+): RecipientPolicyReviewProjectGroupV1 {
+	return {
+		identity: repositoryIdentity ?? projection.project.canonicalIdentity,
+		displayName: projection.project.displayName,
+	};
+}
+
+function actionableReviewItem(
+	projection: LegacyRecipientPolicyProjectionV1,
+	condition: LegacyRecipientPolicyConditionV1,
+	memoryCount: number,
+	scope: { key: string | null; projection: LegacyRecipientPolicyProjectionV1 },
+	repositoryIdentity: string | undefined,
+): RecipientPolicyActionableReviewItemV1 {
+	return {
+		version: RECIPIENT_POLICY_CONTRACT_VERSION,
+		reviewItemId: digest("recipient-policy-review-v1", [
+			projection.project.canonicalIdentity,
+			condition.code,
+			...(scope.key ? [scope.key] : []),
+		]),
+		sourceFingerprint: recipientPolicyReviewSourceFingerprint(scope.projection, condition.code),
+		conditionCode: actionableConditionCode(condition.code),
+		projectGroup: reviewProjectGroup(scope.projection, repositoryIdentity),
+		finding: condition.message,
+		reason: `Review the current recipient evidence for ${projection.project.displayName}.`,
+		...reviewOptions(scope.projection, condition, memoryCount),
+		state: "open",
+		resolution: null,
+	};
+}
+
 function blockedOwner(code: LegacyRecipientPolicyConditionCodeV1): {
 	ownerLabel: string;
 	repairAction: string;
@@ -397,6 +484,7 @@ export function deriveRecipientPolicyReviewState(
 	projections = listLegacyRecipientPolicyProjections(db, context),
 ): RecipientPolicyDerivedReviewState {
 	const memoryCounts = memoryCountsByProject(db);
+	const repositoryIdentities = repositoryIdentitiesByProject(db);
 	const allReviewItems: RecipientPolicyActionableReviewItemV1[] = [];
 	const blockedItems: RecipientPolicyBlockedItemV1[] = [];
 	const preservedDiagnosticFindings: RecipientPolicyDerivedReviewState["preservedDiagnosticFindings"] =
@@ -460,25 +548,15 @@ export function deriveRecipientPolicyReviewState(
 							}))
 					: [{ key: null, projection }];
 			for (const scope of decisionScopes) {
-				const sourceFingerprint = recipientPolicyReviewSourceFingerprint(
-					scope.projection,
-					condition.code,
+				allReviewItems.push(
+					actionableReviewItem(
+						projection,
+						condition,
+						memoryCount,
+						scope,
+						repositoryIdentities.get(projection.project.canonicalIdentity),
+					),
 				);
-				const choices = reviewOptions(scope.projection, condition, memoryCount);
-				allReviewItems.push({
-					version: RECIPIENT_POLICY_CONTRACT_VERSION,
-					reviewItemId: digest("recipient-policy-review-v1", [
-						projection.project.canonicalIdentity,
-						condition.code,
-						...(scope.key ? [scope.key] : []),
-					]),
-					sourceFingerprint,
-					finding: condition.message,
-					reason: `Review the current recipient evidence for ${projection.project.displayName}.`,
-					...choices,
-					state: "open",
-					resolution: null,
-				});
 			}
 		}
 	}

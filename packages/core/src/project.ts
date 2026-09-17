@@ -1,5 +1,41 @@
-import { existsSync, lstatSync, readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { existsSync, lstatSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { basename, dirname, resolve } from "node:path";
+
+export interface GitRepositoryIdentity {
+	identity: string;
+	root: string | null;
+	source: "git_remote" | "git_common_dir";
+}
+
+export const REPOSITORY_IDENTITY_METADATA_KEY = "codemem_repository_identity";
+
+function normalizePathLike(value: string): string {
+	return value.trim().replaceAll("\\", "/").replace(/\/+$/u, "") || value.trim();
+}
+
+function normalizeRemoteIdentity(value: string, repositoryRoot: string): string | null {
+	const remote = value.trim();
+	if (!remote) return null;
+	if (/^[a-z][a-z0-9+.-]*:\/\//iu.test(remote)) {
+		try {
+			const url = new URL(remote);
+			if (url.protocol === "http:" || url.protocol === "https:") url.username = "";
+			url.password = "";
+			url.search = "";
+			url.hash = "";
+			return normalizePathLike(url.toString());
+		} catch {
+			return null;
+		}
+	}
+	if (/^[A-Za-z]:[\\/]/u.test(remote) || !remote.includes(":")) {
+		return normalizePathLike(resolve(repositoryRoot, remote));
+	}
+	const scpRemote = remote.match(/^((?:[^/@:]+@)?[^/:]+):(.+)$/u);
+	if (!scpRemote?.[1] || !scpRemote[2]) return null;
+	return `${scpRemote[1]}:${normalizePathLike(scpRemote[2])}`;
+}
 
 export function projectBasename(value: string): string {
 	let normalized = value.replaceAll("\\", "/");
@@ -52,26 +88,87 @@ function findGitAnchor(startCwd: string): string | null {
 	while (true) {
 		const gitPath = resolve(current, ".git");
 		if (existsSync(gitPath)) {
-			try {
-				if (lstatSync(gitPath).isDirectory()) {
-					return current;
-				}
-				const text = readFileSync(gitPath, "utf8").trim();
-				if (text.startsWith("gitdir:")) {
-					const gitdir = resolve(current, text.slice("gitdir:".length).trim()).replaceAll(
-						"\\",
-						"/",
-					);
-					const worktreeMarker = "/.git/worktrees/";
-					const worktreeIndex = gitdir.indexOf(worktreeMarker);
-					if (worktreeIndex >= 0) {
-						return gitdir.slice(0, worktreeIndex);
-					}
-				}
-				return current;
-			} catch {
-				return current;
-			}
+			const gitDirectory = gitDirectoryFromMarker(current, gitPath);
+			if (!gitDirectory) return current;
+			const layout = gitDirectoryLayout(gitDirectory);
+			return layout.isLinkedWorktree && basename(layout.commonDirectory) === ".git"
+				? dirname(layout.commonDirectory)
+				: current;
+		}
+		const parent = dirname(current);
+		if (parent === current) return null;
+		current = parent;
+	}
+}
+
+function gitDirectoryFromMarker(repositoryRoot: string, gitPath: string): string | null {
+	try {
+		const pathInfo = lstatSync(gitPath);
+		if (pathInfo.isDirectory()) return gitPath;
+		if (pathInfo.isSymbolicLink() && statSync(gitPath).isDirectory()) return realpathSync(gitPath);
+		const text = readFileSync(gitPath, "utf8").trim();
+		if (!text.startsWith("gitdir:")) return null;
+		return resolve(repositoryRoot, text.slice("gitdir:".length).trim());
+	} catch {
+		return null;
+	}
+}
+
+function gitDirectoryLayout(gitDirectory: string): {
+	commonDirectory: string;
+	isLinkedWorktree: boolean;
+} {
+	try {
+		const marker = readFileSync(resolve(gitDirectory, "commondir"), "utf8").trim();
+		if (marker) return { commonDirectory: resolve(gitDirectory, marker), isLinkedWorktree: true };
+	} catch {
+		// Normal repositories use their own .git directory as the common directory.
+	}
+	return { commonDirectory: gitDirectory, isLinkedWorktree: false };
+}
+
+function originRemote(commonDirectory: string, repositoryRoot: string): string | null {
+	try {
+		const value = execFileSync(
+			"git",
+			[
+				"config",
+				"--file",
+				resolve(commonDirectory, "config"),
+				"--includes",
+				"--get",
+				"remote.origin.url",
+			],
+			{ encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 2_000 },
+		).trim();
+		return normalizeRemoteIdentity(value, repositoryRoot);
+	} catch {
+		return null;
+	}
+}
+
+/** Resolve a location-independent identity for a live Git repository or linked worktree. */
+export function resolveGitRepositoryIdentity(cwd: string): GitRepositoryIdentity | null {
+	let current = resolve(cwd);
+	while (true) {
+		const gitPath = resolve(current, ".git");
+		if (existsSync(gitPath)) {
+			const gitDirectory = gitDirectoryFromMarker(current, gitPath);
+			if (!gitDirectory) return null;
+			const layout = gitDirectoryLayout(gitDirectory);
+			const { commonDirectory } = layout;
+			const normalizedCommonDirectory = normalizePathLike(commonDirectory);
+			const root =
+				layout.isLinkedWorktree && basename(normalizedCommonDirectory) === ".git"
+					? dirname(commonDirectory)
+					: current;
+			const remote = originRemote(commonDirectory, root);
+			if (remote) return { identity: remote, root, source: "git_remote" };
+			return {
+				identity: normalizedCommonDirectory,
+				root,
+				source: "git_common_dir",
+			};
 		}
 		const parent = dirname(current);
 		if (parent === current) return null;

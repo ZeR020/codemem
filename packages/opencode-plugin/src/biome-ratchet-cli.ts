@@ -19,6 +19,7 @@ export interface CliOptions {
 	head?: string;
 	json: boolean;
 	githubAnnotations?: boolean;
+	staged?: boolean;
 }
 
 interface CommandResult {
@@ -32,9 +33,10 @@ interface Snapshot {
 	commit: string;
 }
 
-const BOOLEAN_FLAGS = new Map<string, "json" | "githubAnnotations">([
+const BOOLEAN_FLAGS = new Map<string, "json" | "githubAnnotations" | "staged">([
 	["--json", "json"],
 	["--github-annotations", "githubAnnotations"],
+	["--staged", "staged"],
 ]);
 
 function referenceOption(argument: string, value: string): Partial<CliOptions> {
@@ -60,6 +62,7 @@ export function parseArguments(argv: string[]): CliOptions {
 		index += 1;
 	}
 	if (!options.base) throw new Error("--base is required");
+	if (options.head && options.staged) throw new Error("--staged cannot be combined with --head");
 	return options as CliOptions;
 }
 
@@ -135,6 +138,32 @@ async function resolveCommit(root: string, reference: string): Promise<string> {
 	return commit;
 }
 
+export async function resolveAutomaticBaseReference(root: string): Promise<string> {
+	const symbolicRemotes = (
+		await git(root, ["for-each-ref", "--format=%(symref)", "refs/remotes/*/HEAD"])
+	)
+		.split("\n")
+		.map((reference) => reference.trim())
+		.filter(Boolean);
+	const preferredRemotes = symbolicRemotes.toSorted((left, right) => {
+		const leftIsOrigin = left.startsWith("refs/remotes/origin/");
+		const rightIsOrigin = right.startsWith("refs/remotes/origin/");
+		if (leftIsOrigin !== rightIsOrigin) return leftIsOrigin ? -1 : 1;
+		return left.localeCompare(right);
+	});
+	for (const reference of preferredRemotes) {
+		try {
+			await resolveCommit(root, reference);
+			const mergeBase = (await git(root, ["merge-base", "HEAD", reference])).trim();
+			return await resolveCommit(root, mergeBase);
+		} catch {
+			// Ignore stale symbolic remote HEAD refs and try the next local candidate.
+		}
+	}
+	await resolveCommit(root, "HEAD");
+	return "HEAD";
+}
+
 async function addSnapshot(
 	root: string,
 	parent: string,
@@ -183,6 +212,22 @@ async function captureWorkingTreeCommit(root: string, temporaryRoot: string): Pr
 				env: commitEnv,
 			},
 		)
+	).trim();
+}
+
+async function captureStagedCommit(root: string): Promise<string> {
+	const tree = (await git(root, ["write-tree"])).trim();
+	const commitEnv = {
+		...process.env,
+		GIT_AUTHOR_NAME: "codemem Biome ratchet",
+		GIT_AUTHOR_EMAIL: "biome-ratchet@example.invalid",
+		GIT_COMMITTER_NAME: "codemem Biome ratchet",
+		GIT_COMMITTER_EMAIL: "biome-ratchet@example.invalid",
+	};
+	return (
+		await gitWithOptions(root, ["commit-tree", tree, "-p", "HEAD", "-m", "Biome staged snapshot"], {
+			env: commitEnv,
+		})
 	).trim();
 }
 
@@ -416,6 +461,11 @@ async function loadSnapshotInputs(root: string, baseSnapshot: Snapshot, headSnap
 	};
 }
 
+function snapshotMode(options: CliOptions): "refs" | "staged" | "working-tree" {
+	if (options.head) return "refs";
+	return options.staged ? "staged" : "working-tree";
+}
+
 export async function runRatchet(
 	options: CliOptions,
 	dependencies: {
@@ -427,14 +477,17 @@ export async function runRatchet(
 	const cwd = dependencies.cwd ?? process.cwd();
 	const root = (await git(cwd, ["rev-parse", "--show-toplevel"])).trim();
 	const entrypoint = dependencies.biomeEntrypoint ?? resolveRootBiomeEntrypoint(root);
-	const baseCommit = await resolveCommit(root, options.base);
+	const baseReference =
+		options.base === "auto" ? await resolveAutomaticBaseReference(root) : options.base;
+	const baseCommit = await resolveCommit(root, baseReference);
 	const temporaryRoot = await mkdtemp(path.join(tmpdir(), "codemem-biome-ratchet-"));
 	let baseSnapshot: Snapshot | undefined;
 	let headSnapshot: Snapshot | undefined;
 	try {
-		const headCommit = options.head
-			? await resolveCommit(root, options.head)
-			: await captureWorkingTreeCommit(root, temporaryRoot);
+		let headCommit: string;
+		if (options.head) headCommit = await resolveCommit(root, options.head);
+		else if (options.staged) headCommit = await captureStagedCommit(root);
+		else headCommit = await captureWorkingTreeCommit(root, temporaryRoot);
 		baseSnapshot = await addSnapshot(root, temporaryRoot, "base", baseCommit);
 		headSnapshot = await addSnapshot(root, temporaryRoot, "head", headCommit);
 		await dependencies.afterSnapshot?.();
@@ -466,7 +519,7 @@ export async function runRatchet(
 			...compareBiomeToolPolicy(baseLockfile, headLockfile, changesWithSources),
 		);
 		return {
-			mode: options.head ? "refs" : "working-tree",
+			mode: snapshotMode(options),
 			base: baseCommit,
 			head: options.head ? headCommit : null,
 			changedFiles: changes.length,

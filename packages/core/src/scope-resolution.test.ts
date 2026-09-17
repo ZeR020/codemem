@@ -248,3 +248,75 @@ describe("resolveProjectScope", () => {
 		).toMatchObject({ reason: "local_default", scopeId: "local-only-custom" });
 	});
 });
+
+function repositoryIdentityCompatibilityTests(): void {
+	it("uses a cwd pattern after repository identity becomes available", () => {
+		expect(
+			resolveProjectScope({
+				cwd: "/work/acme/service",
+				gitRemote: "https://github.com/acme/service.git",
+				mappings: [mapping({ project_pattern: "/work/acme/*", scope_id: "existing-pattern" })],
+			}),
+		).toMatchObject({
+			reason: "pattern_mapping",
+			scopeId: "existing-pattern",
+			workspaceIdentity: { source: "git_remote" },
+		});
+	});
+
+	it("ranks repository and cwd pattern matches together", () => {
+		expect(
+			resolveProjectScope({
+				cwd: "/work/acme/service",
+				gitRemote: "https://github.com/acme/service.git",
+				mappings: [
+					mapping({
+						project_pattern: "https://github.com/*",
+						priority: 1,
+						scope_id: "remote-pattern",
+					}),
+					mapping({
+						project_pattern: "/work/acme/*",
+						priority: 10,
+						scope_id: "cwd-pattern",
+					}),
+				],
+			}),
+		).toMatchObject({ reason: "pattern_mapping", scopeId: "cwd-pattern" });
+	});
+
+	it("uses an existing cwd mapping when repository identity is newly available", () => {
+		expect(
+			resolveProjectScope({
+				cwd: "/work/acme/service",
+				gitRemote: "https://github.com/acme/service.git",
+				mappings: [mapping({ scope_id: "existing-cwd", workspace_identity: "/work/acme/service" })],
+			}),
+		).toMatchObject({
+			reason: "exact_mapping",
+			scopeId: "existing-cwd",
+			workspaceIdentity: {
+				source: "git_remote",
+				value: "https://github.com/acme/service.git",
+			},
+		});
+	});
+
+	it("prefers a repository mapping over its cwd compatibility mapping", () => {
+		expect(
+			resolveProjectScope({
+				cwd: "/work/acme/service",
+				gitRemote: "https://github.com/acme/service.git",
+				mappings: [
+					mapping({ scope_id: "existing-cwd", workspace_identity: "/work/acme/service" }),
+					mapping({
+						scope_id: "repository-scope",
+						workspace_identity: "https://github.com/acme/service.git",
+					}),
+				],
+			}),
+		).toMatchObject({ reason: "exact_mapping", scopeId: "repository-scope" });
+	});
+}
+
+describe("repository identity scope compatibility", repositoryIdentityCompatibilityTests);

@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
@@ -7,6 +7,7 @@ import {
 	type LegacyRecipientPolicyProjectionV1,
 	listLegacyRecipientPolicyProjections,
 } from "./legacy-recipient-policy-projection.js";
+import { REPOSITORY_IDENTITY_METADATA_KEY } from "./project.js";
 import { deterministicPolicyTeamId } from "./recipient-policy-identifiers.js";
 import {
 	deriveRecipientPolicyReviewState,
@@ -274,6 +275,125 @@ describe("recipient policy review fingerprint", () => {
 		expect(recipientPolicyReviewSourceFingerprint(other, "suggest_local_identity")).not.toBe(
 			recipientPolicyReviewSourceFingerprint(projection(), "suggest_local_identity"),
 		);
+	});
+});
+
+describe("recipient policy review Project groups", () => {
+	let db: InstanceType<typeof Database>;
+
+	beforeEach(() => {
+		db = new Database(":memory:");
+		initTestSchema(db);
+		insertLocalFixture(db);
+	});
+
+	afterEach(() => db.close());
+
+	it("includes grouping metadata in actionable items", () => {
+		expect(listRecipientPolicyReview(db, context).reviewItems[0]).toMatchObject({
+			conditionCode: "suggest_local_identity",
+			projectGroup: { displayName: "review", identity: PROJECT_ID },
+		});
+	});
+
+	it("assigns externally placed worktrees to one repository review group", () => {
+		const directory = mkdtempSync(join(tmpdir(), "codemem-review-group-"));
+		const mainRepo = join(directory, "main", "repository");
+		const worktree = join(directory, "external", "worktree");
+		const worktreeGitDir = join(mainRepo, ".git", "worktrees", "external");
+		try {
+			mkdirSync(worktreeGitDir, { recursive: true });
+			mkdirSync(worktree, { recursive: true });
+			writeFileSync(join(worktreeGitDir, "commondir"), "../..\n");
+			writeFileSync(join(worktree, ".git"), `gitdir: ${worktreeGitDir}\n`);
+			const first = projection();
+			first.project = { ...first.project, canonicalIdentity: worktree };
+			const second = projection();
+			second.project = { ...second.project, canonicalIdentity: mainRepo };
+			for (const [cwd, id] of [
+				[worktree, 1001],
+				[mainRepo, 1002],
+			] as const) {
+				db.prepare(
+					`INSERT INTO sessions (id, started_at, cwd, metadata_json)
+					 VALUES (?, ?, ?, ?)`,
+				).run(
+					id,
+					"2026-09-16T00:00:00.000Z",
+					cwd,
+					JSON.stringify({ [REPOSITORY_IDENTITY_METADATA_KEY]: join(mainRepo, ".git") }),
+				);
+			}
+
+			const state = deriveRecipientPolicyReviewState(db, context, [first, second]);
+
+			expect(state.allReviewItems).toHaveLength(2);
+			expect(new Set(state.allReviewItems.map((item) => item.projectGroup.identity))).toEqual(
+				new Set([join(mainRepo, ".git").replaceAll("\\", "/")]),
+			);
+		} finally {
+			rmSync(directory, { recursive: true, force: true });
+		}
+	});
+
+	it("does not derive historical groups from current path contents", () => {
+		const directory = mkdtempSync(join(tmpdir(), "codemem-review-reused-path-"));
+		try {
+			mkdirSync(join(directory, ".git"));
+			writeFileSync(
+				join(directory, ".git", "config"),
+				'[remote "origin"]\n\turl = https://example.test/current/repository.git\n',
+			);
+			const historical = projection();
+			historical.project = { ...historical.project, canonicalIdentity: directory };
+
+			const state = deriveRecipientPolicyReviewState(db, context, [historical]);
+
+			expect(state.allReviewItems[0]?.projectGroup.identity).toBe(directory);
+		} finally {
+			rmSync(directory, { recursive: true, force: true });
+		}
+	});
+
+	it("does not group mixed historical and recorded repository evidence", () => {
+		const projectPath = "/work/reused/project";
+		for (const [id, metadata] of [
+			[1001, {}],
+			[1002, { [REPOSITORY_IDENTITY_METADATA_KEY]: "https://example.test/new/repository.git" }],
+		] as const) {
+			db.prepare(
+				`INSERT INTO sessions (id, started_at, cwd, metadata_json)
+				 VALUES (?, ?, ?, ?)`,
+			).run(id, "2026-09-16T00:00:00.000Z", projectPath, JSON.stringify(metadata));
+		}
+		const historical = projection();
+		historical.project = { ...historical.project, canonicalIdentity: projectPath };
+
+		const state = deriveRecipientPolicyReviewState(db, context, [historical]);
+
+		expect(state.allReviewItems[0]?.projectGroup.identity).toBe(projectPath);
+	});
+
+	it("keeps non-Git and missing Project paths in separate review groups", () => {
+		const directory = mkdtempSync(join(tmpdir(), "codemem-review-fallback-"));
+		const general = join(directory, "general");
+		const missing = join(directory, "deleted-worktree");
+		try {
+			mkdirSync(general);
+			const first = projection();
+			first.project = { ...first.project, canonicalIdentity: general };
+			const second = projection();
+			second.project = { ...second.project, canonicalIdentity: missing };
+
+			const state = deriveRecipientPolicyReviewState(db, context, [first, second]);
+
+			expect(state.allReviewItems.map((item) => item.projectGroup.identity)).toEqual([
+				general,
+				missing,
+			]);
+		} finally {
+			rmSync(directory, { recursive: true, force: true });
+		}
 	});
 });
 
