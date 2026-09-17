@@ -314,9 +314,66 @@ describe("pi-hook-ingest boundary replay on recovered spool", () => {
 		expect(result.via).toBe("http");
 		expect(readdirSync(sandbox.queueDir)).toHaveLength(0);
 		// HTTP accepted the drained envelope; session_shutdown additionally gets
-		// the promised synchronous direct write + flush replay.
+		// the promised synchronous direct write + flush replay. Delivery happ-
+		// ened via HTTP so only the boundary write-through goes direct.
 		expect(directCalls.map((p) => p.tag)).toEqual(["boundary"]);
 		expect(flushes.map((p) => p.tag)).toEqual(["boundary"]);
+	});
+
+	it("keeps a recovered boundary spooled when the replayed flush fails, then flushes on a later drain", async () => {
+		// Boundary spooled while everything was down.
+		const spooled = await ingestPiHookPayload(
+			{ piEvent: "session_before_compact", sessionId: "sess-keep", tag: "boundary" },
+			{ host: "127.0.0.1", port: 38888 },
+			{
+				httpIngest: async () => ({ ok: false, inserted: 0, skipped: 0 }),
+				directIngest: () => {
+					throw new Error("db unavailable");
+				},
+				boundaryFlush: () => {
+					throw new Error("flush unavailable");
+				},
+				resolveDb: () => "/tmp/unreachable.sqlite",
+			},
+		);
+		expect(spooled.via).toBe("spool");
+
+		// Recovery pass 1: delivery succeeds (DB healthy) but the flush still
+		// fails (observer path down). Entry must NOT be deleted — extraction
+		// has not run, so deleting would reproduce the original data loss.
+		const firstFlushAttempts: Array<Record<string, unknown>> = [];
+		await ingestPiHookPayload(
+			{ piEvent: "session_start", sessionId: "sess-pass1", tag: "pass1" },
+			{ host: "127.0.0.1", port: 38888 },
+			{
+				httpIngest: async () => ({ ok: false, inserted: 0, skipped: 0 }),
+				directIngest: () => ({ inserted: 1, skipped: 0 }),
+				boundaryFlush: (payload) => {
+					firstFlushAttempts.push(payload);
+					throw new Error("observer still unavailable");
+				},
+				resolveDb: () => "/tmp/healthy.sqlite",
+			},
+		);
+		expect(firstFlushAttempts.map((p) => p.tag)).toEqual(["boundary"]);
+		expect(readdirSync(sandbox.queueDir).filter((n) => n.endsWith(".json"))).toHaveLength(1);
+
+		// Recovery pass 2: flush now succeeds; entry drains and is deleted.
+		const secondFlushAttempts: Array<Record<string, unknown>> = [];
+		await ingestPiHookPayload(
+			{ piEvent: "session_start", sessionId: "sess-pass2", tag: "pass2" },
+			{ host: "127.0.0.1", port: 38888 },
+			{
+				httpIngest: async () => ({ ok: false, inserted: 0, skipped: 0 }),
+				directIngest: () => ({ inserted: 1, skipped: 0 }),
+				boundaryFlush: (payload) => {
+					secondFlushAttempts.push(payload);
+				},
+				resolveDb: () => "/tmp/healthy.sqlite",
+			},
+		);
+		expect(secondFlushAttempts.map((p) => p.tag)).toEqual(["boundary"]);
+		expect(readdirSync(sandbox.queueDir).filter((n) => n.endsWith(".json"))).toHaveLength(0);
 	});
 });
 describe("pi-hook-ingest durability boundary order", () => {

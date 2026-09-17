@@ -270,6 +270,36 @@ async function flushOnBoundaryIfRequested(
 	}
 }
 
+/**
+ * Replayed-variant of flushOnBoundaryIfRequested used on the spool drain
+ * path: a boundary flush that still fails keeps the spooled payload alive
+ * (caller reports failure so drainPiHookSpool does not delete the entry).
+ */
+async function flushOnBoundaryForRecoveredPayload(
+	payload: Record<string, unknown>,
+	directIngest: typeof directEnqueuePiHook,
+	boundaryFlush: (payload: Record<string, unknown>, dbPath: string) => Promise<void> | void,
+	getDbPath: () => string,
+): Promise<boolean> {
+	if (!shouldForcePiBoundaryFlush(payload)) return true;
+	try {
+		directIngest(payload, getDbPath());
+	} catch (err) {
+		logHookEvent(
+			`codemem pi-hook-ingest boundary flush direct write failed: ${err instanceof Error ? err.message : String(err)}`,
+		);
+	}
+	try {
+		await boundaryFlush(payload, getDbPath());
+		return true;
+	} catch (err) {
+		logHookEvent(
+			`codemem pi-hook-ingest boundary flush failed; keeping spooled payload: ${err instanceof Error ? err.message : String(err)}`,
+		);
+		return false;
+	}
+}
+
 /** Wrap one payload with the db/identity target fields /api/pi-hooks expects. */
 function targetedPiPayload(
 	payload: Record<string, unknown>,
@@ -308,8 +338,10 @@ async function deliverQueuedPiHook(
 	const queuedHttp = await httpIngest(targetedPiPayload(queuedPayload, getDbPath), host, port);
 	const delivered = queuedHttp.ok || tryDirectFallback(directIngest, getDbPath, queuedPayload).ok;
 	if (!delivered) return false;
-	await flushOnBoundaryIfRequested(queuedPayload, directIngest, boundaryFlush, getDbPath);
-	return true;
+	// A recovered boundary whose flush still fails stays spooled (reported as
+	// undelivered) so a later invocation can retry the extraction instead of
+	// losing it. Non-boundary payloads are done once durably delivered.
+	return flushOnBoundaryForRecoveredPayload(queuedPayload, directIngest, boundaryFlush, getDbPath);
 }
 
 async function drainBacklogIfPresent(
