@@ -697,9 +697,98 @@ async function startBackgroundViewer(invocation: ResolvedServeInvocation): Promi
 	);
 }
 
+function startRawEventProcessing(
+	dbPath: string,
+	store: MemoryStore,
+	observer: ObserverClient,
+	createInbox: typeof import("@codemem/server").createViewerRawEventInbox,
+) {
+	const sweeper = new RawEventSweeper(store, { observer });
+	sweeper.start();
+	const queue = createInbox({
+		dbPath,
+		sweeper,
+		onDrainError: () => {
+			p.log.warn("Raw-event database ingestion is delayed; accepted events remain queued");
+		},
+		onDrainRecovered: () => {
+			p.log.info("Raw-event database ingestion recovered");
+		},
+		onCorruptEntries: (count) => {
+			p.log.error(`Raw-event queue contains ${count} corrupt retained entries`);
+		},
+		onBacklog: (pending, oldestAgeMs) => {
+			p.log.warn(
+				`Raw-event queue backlog is sustained (${pending} pending, oldest ${Math.ceil(oldestAgeMs / 1000)}s)`,
+			);
+		},
+		onBacklogRecovered: () => {
+			p.log.info("Raw-event queue backlog recovered");
+		},
+	});
+	queue.inbox.start();
+	const rawEventTarget = createRawEventTargetState(store);
+	return {
+		appOptions: {
+			rawEventInbox: queue.inbox,
+			rawEventTarget,
+			sweeper,
+			observer,
+		},
+		stop: async () => {
+			rawEventTarget.stop();
+			await queue.stop();
+			await sweeper.stop();
+		},
+	};
+}
+
+export function createRawEventTargetState(
+	store: Pick<
+		MemoryStore,
+		| "actorId"
+		| "dbPath"
+		| "deviceId"
+		| "hasCurrentConfiguredIdentity"
+		| "hasCurrentIdentity"
+		| "onIdentityChanged"
+	>,
+) {
+	let hasCurrentIdentity = false;
+	let actorId = store.actorId;
+	let deviceId = store.deviceId;
+	const refreshCurrentIdentity = () => {
+		try {
+			hasCurrentIdentity = store.hasCurrentIdentity();
+		} catch {
+			hasCurrentIdentity = false;
+		}
+		actorId = store.actorId;
+		deviceId = store.deviceId;
+	};
+	refreshCurrentIdentity();
+	const stop = store.onIdentityChanged(refreshCurrentIdentity);
+	return {
+		dbPath: store.dbPath,
+		hasCurrentIdentity: () => {
+			if (!hasCurrentIdentity || actorId !== store.actorId || deviceId !== store.deviceId) {
+				return false;
+			}
+			try {
+				return store.hasCurrentConfiguredIdentity();
+			} catch {
+				return false;
+			}
+		},
+		stop,
+	};
+}
+
 async function startForegroundViewer(invocation: ResolvedServeInvocation): Promise<void> {
 	const serverModule = await import("@codemem/server");
-	const { createApp, createSyncApp, closeStore, getStore } = serverModule;
+	const { createApp, createSyncApp, closeStore, createViewerRawEventInbox, getStore } =
+		serverModule;
+	const createRawEventInbox = createViewerRawEventInbox;
 	const coordinatorMaintenanceDependencies =
 		createServeCoordinatorMaintenanceDependencies(serverModule);
 	const { serve } = await import("@hono/node-server");
@@ -737,8 +826,7 @@ async function startForegroundViewer(invocation: ResolvedServeInvocation): Promi
 		p.log.warn("Embeddings disabled for this viewer process; raw-event ingestion remains active.");
 	}
 
-	const sweeper = new RawEventSweeper(store, { observer });
-	sweeper.start();
+	const rawEventProcessing = startRawEventProcessing(dbPath, store, observer, createRawEventInbox);
 
 	const syncAbort = new AbortController();
 	const config = invocation.configPath
@@ -756,8 +844,7 @@ async function startForegroundViewer(invocation: ResolvedServeInvocation): Promi
 
 	const appOpts = {
 		storeFactory: () => store,
-		sweeper,
-		observer,
+		...rawEventProcessing.appOptions,
 		getSyncRuntimeStatus: () => syncRuntimeStatus,
 	};
 	const app = createApp(appOpts);
@@ -878,7 +965,7 @@ async function startForegroundViewer(invocation: ResolvedServeInvocation): Promi
 		}).catch(() => {
 			// Best-effort drain — proceed to cleanup.
 		});
-		await sweeper.stop();
+		await rawEventProcessing.stop();
 
 		try {
 			rmSync(pidPath);
