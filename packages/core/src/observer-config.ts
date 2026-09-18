@@ -518,7 +518,7 @@ export type CodememConfigMutationResult = {
 	revision: string;
 };
 
-type ConfigFileMetadata = { mode: number; uid: number; gid: number };
+export type ConfigFileMetadata = { mode: number; uid: number; gid: number };
 type ConfigFileIdentity = ConfigFileMetadata & {
 	ctimeNs: bigint;
 	dev: bigint;
@@ -777,8 +777,9 @@ export function atomicReplaceConfigFile(
 	metadata: ConfigFileMetadata | number | undefined,
 	operations: AtomicConfigFileOperations = atomicConfigFileOperations,
 	verifyBeforeRename?: () => void,
+	{ followSymlink = true }: { followSymlink?: boolean } = {},
 ): void {
-	const replacementPath = resolveConfigMutationTarget(targetPath);
+	const replacementPath = followSymlink ? resolveConfigMutationTarget(targetPath) : targetPath;
 	const tempPath = `${replacementPath}.tmp-${process.pid}-${randomUUID()}`;
 	let tempFd: number | null = null;
 	let renameCommitted = false;
