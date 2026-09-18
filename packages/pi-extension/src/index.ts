@@ -118,18 +118,11 @@ function eventKey(payload: PiHookPayload): string {
 function loadCursorsFromSession(ctx: ExtensionContext, sessionId: string): Set<string> {
 	const seen = new Set<string>();
 	try {
-		const entries = ctx.sessionManager.getEntries();
-		for (const entry of entries) {
+		for (const entry of ctx.sessionManager.getEntries()) {
 			if (entry.type !== "custom") continue;
 			const custom = entry as { customType?: string; data?: unknown };
 			if (custom.customType !== CURSOR_CUSTOM_TYPE) continue;
-			const data = custom.data as CursorState | undefined;
-			if (!data || data.sessionId !== sessionId) continue;
-			if (Array.isArray(data.seenEventKeys)) {
-				for (const key of data.seenEventKeys) {
-					if (typeof key === "string" && key) seen.add(key);
-				}
-			}
+			addCursorKeys(custom.data, sessionId, seen);
 		}
 	} catch {
 		// getEntries may throw on ephemeral sessions
@@ -193,6 +186,223 @@ function readPathFromToolInput(input: Record<string, unknown>): string | null {
 	return null;
 }
 
+function addCursorKeys(data: unknown, sessionId: string, seen: Set<string>): void {
+	const cursor = data as CursorState | undefined;
+	if (!cursor || cursor.sessionId !== sessionId) return;
+	if (!Array.isArray(cursor.seenEventKeys)) return;
+	for (const key of cursor.seenEventKeys) {
+		if (typeof key === "string" && key) seen.add(key);
+	}
+}
+
+async function fileContextAppend(
+	client: PiCodememClient,
+	config: PiExtensionConfig,
+	event: ToolResultEvent,
+	toolName: string,
+	toolInput: Record<string, unknown>,
+	signal?: AbortSignal,
+) {
+	if (!config.fileContext || toolName !== "read" || event.isError) return;
+	const filePath = readPathFromToolInput(toolInput);
+	if (!filePath) return;
+	try {
+		const fileCtx = await fetchFileContextBlock(client, filePath, signal);
+		if (!fileCtx.text.trim()) return;
+		const block = fileCtx.preformatted ? fileCtx.text : formatPiInjectionBlock(fileCtx.text, 4_000);
+		const existing = Array.isArray(event.content) ? [...event.content] : [];
+		return { content: [...existing, { type: "text" as const, text: `\n\n${block}` }] };
+	} catch {
+		return;
+	}
+}
+
+async function systemPromptInjection(
+	client: PiCodememClient,
+	config: PiExtensionConfig,
+	event: BeforeAgentStartEvent,
+	signal?: AbortSignal,
+): Promise<{ systemPrompt: string } | undefined> {
+	if (!config.injectPrompts) return;
+	try {
+		const prompt = typeof event.prompt === "string" ? event.prompt : "";
+		if (!prompt.trim()) return;
+		const packFetch = await client.fetchPackText(prompt, signal);
+		if (!packFetch.text.trim()) return;
+		const block = packFetch.preformatted
+			? packFetch.text
+			: formatPiInjectionBlock(packFetch.text, config.injectMaxChars);
+		if (!block.trim()) return;
+		const base = typeof event.systemPrompt === "string" ? event.systemPrompt : "";
+		return { systemPrompt: base ? `${base}\n\n${block}` : block };
+	} catch {
+		return;
+	}
+}
+
+async function onSessionStart(
+	state: SessionState,
+	client: PiCodememClient,
+	pi: ExtensionAPI,
+	event: SessionStartEvent,
+	ctx: ExtensionContext,
+): Promise<void> {
+	const sessionId = ctx.sessionManager.getSessionId();
+	const cwd = ctx.cwd || process.cwd();
+	const project = resolveProject(cwd);
+	state.sessionId = sessionId;
+	state.cwd = cwd;
+	state.project = project;
+	state.active = true;
+	state.toolCalls.clear();
+	state.seenEventKeys = loadCursorsFromSession(ctx, sessionId);
+	client.rekey(sessionId, cwd, project);
+	void client.ensureViewer(ctx.signal).catch(() => {});
+	const payload = buildSessionStartPayload({
+		sessionId,
+		cwd,
+		project,
+		reason: event.reason,
+	});
+	await safeIngest(client, payload, state, pi, ctx.signal);
+}
+
+async function onSessionShutdown(
+	state: SessionState,
+	client: PiCodememClient,
+	runtime: ViewerRuntime,
+	pi: ExtensionAPI,
+	event: SessionShutdownEvent,
+	ctx: ExtensionContext,
+): Promise<void> {
+	const sessionId = state.sessionId ?? ctx.sessionManager.getSessionId();
+	if (sessionId) {
+		const payload = buildSessionShutdownPayload({
+			sessionId,
+			cwd: state.cwd || ctx.cwd,
+			project: state.project,
+			reason: event.reason,
+		});
+		await safeIngest(client, payload, { ...state, active: true, sessionId }, pi, ctx.signal);
+	}
+	state.active = false;
+	state.toolCalls.clear();
+	stopViewerTracking(runtime);
+}
+
+function messageDiscriminator(
+	state: SessionState,
+	message: { timestamp?: unknown },
+): string | number {
+	if (typeof message.timestamp === "number" && Number.isFinite(message.timestamp)) {
+		return message.timestamp;
+	}
+	state.messageSeq += 1;
+	return `n:${state.messageSeq}`;
+}
+
+async function onMessageEnd(
+	state: SessionState,
+	client: PiCodememClient,
+	pi: ExtensionAPI,
+	event: MessageEndEvent,
+	ctx: ExtensionContext,
+): Promise<void> {
+	if (!state.active || !state.sessionId) return;
+	const role = extractMessageRole(event.message);
+	if (role !== "user" && role !== "assistant") return;
+	const text = extractMessageText(event.message);
+	if (!text) return;
+	const discriminator = messageDiscriminator(state, event.message as { timestamp?: unknown });
+	const entryId = stableMessageEntryId(state.sessionId, role, text, discriminator);
+	const payload = buildMessageEndPayload({
+		sessionId: state.sessionId,
+		cwd: state.cwd || ctx.cwd,
+		project: state.project,
+		entryId,
+		role,
+		text,
+	});
+	if (!payload) return;
+	await safeIngest(client, payload, state, pi, ctx.signal);
+}
+
+async function onToolCall(
+	state: SessionState,
+	client: PiCodememClient,
+	pi: ExtensionAPI,
+	event: ToolCallEvent,
+	ctx: ExtensionContext,
+): Promise<void> {
+	if (!state.active || !state.sessionId) return;
+	const toolName = event.toolName;
+	const toolCallId = event.toolCallId;
+	const toolInput =
+		event.input != null && typeof event.input === "object"
+			? (event.input as Record<string, unknown>)
+			: {};
+	state.toolCalls.set(toolCallId, { toolName, input: toolInput });
+	const payload = buildToolCallPayload({
+		sessionId: state.sessionId,
+		cwd: state.cwd || ctx.cwd,
+		project: state.project,
+		toolCallId,
+		toolName,
+		toolInput,
+	});
+	await safeIngest(client, payload, state, pi, ctx.signal);
+}
+
+async function onToolResult(
+	state: SessionState,
+	client: PiCodememClient,
+	config: PiExtensionConfig,
+	pi: ExtensionAPI,
+	event: ToolResultEvent,
+	ctx: ExtensionContext,
+) {
+	if (!state.active || !state.sessionId) return;
+	const tracked = state.toolCalls.get(event.toolCallId);
+	const toolName = event.toolName;
+	const toolInput =
+		event.input != null && typeof event.input === "object"
+			? (event.input as Record<string, unknown>)
+			: (tracked?.input ?? {});
+	state.toolCalls.delete(event.toolCallId);
+	const payload = buildToolResultPayload({
+		sessionId: state.sessionId,
+		cwd: state.cwd || ctx.cwd,
+		project: state.project,
+		toolCallId: event.toolCallId,
+		toolName,
+		toolInput,
+		toolOutput: serializeToolOutput(event.content),
+		isError: Boolean(event.isError),
+		error: event.isError ? serializeToolOutput(event.content) : null,
+	});
+	await safeIngest(client, payload, state, pi, ctx.signal);
+	return fileContextAppend(client, config, event, toolName, toolInput, ctx.signal);
+}
+
+async function onBeforeCompact(
+	state: SessionState,
+	client: PiCodememClient,
+	pi: ExtensionAPI,
+	event: SessionBeforeCompactEvent,
+	ctx: ExtensionContext,
+): Promise<void> {
+	if (!state.sessionId) return;
+	state.compactSeq += 1;
+	const payload = buildBeforeCompactPayload({
+		sessionId: state.sessionId,
+		cwd: state.cwd || ctx.cwd,
+		project: state.project,
+		reason: event.reason,
+		entryId: `session_before_compact:${state.compactSeq}`,
+	});
+	await safeIngest(client, payload, state, pi, event.signal ?? ctx.signal);
+}
+
 /**
  * Extension factory. Default export required by pi package loader.
  */
@@ -206,207 +416,17 @@ export default function codememPiExtension(pi: ExtensionAPI): void {
 		sessionId: state.sessionId,
 		execImpl: testExecImpl,
 	});
-
-	// ---- session_start ----
-	pi.on("session_start", async (event: SessionStartEvent, ctx: ExtensionContext) => {
-		const sessionId = ctx.sessionManager.getSessionId();
-		const cwd = ctx.cwd || process.cwd();
-		const project = resolveProject(cwd);
-
-		state.sessionId = sessionId;
-		state.cwd = cwd;
-		state.project = project;
-		state.active = true;
-		state.toolCalls.clear();
-		state.seenEventKeys = loadCursorsFromSession(ctx, sessionId);
-		client.rekey(sessionId, cwd, project);
-
-		// Start viewer on first session need (not in factory).
-		void client.ensureViewer(ctx.signal).catch(() => {});
-
-		const payload = buildSessionStartPayload({
-			sessionId,
-			cwd,
-			project,
-			reason: event.reason,
-		});
-		await safeIngest(client, payload, state, pi, ctx.signal);
-	});
-
-	// ---- session_shutdown ----
-	pi.on("session_shutdown", async (event: SessionShutdownEvent, ctx: ExtensionContext) => {
-		const sessionId = state.sessionId ?? ctx.sessionManager.getSessionId();
-		if (sessionId) {
-			const payload = buildSessionShutdownPayload({
-				sessionId,
-				cwd: state.cwd || ctx.cwd,
-				project: state.project,
-				reason: event.reason,
-			});
-			await safeIngest(client, payload, { ...state, active: true, sessionId }, pi, ctx.signal);
-		}
-		state.active = false;
-		state.toolCalls.clear();
-		stopViewerTracking(runtime);
-	});
-
-	// ---- message_end (user → prompt, assistant → assistant) ----
-	pi.on("message_end", async (event: MessageEndEvent, ctx: ExtensionContext) => {
-		if (!state.active || !state.sessionId) return;
-		const role = extractMessageRole(event.message);
-		if (role !== "user" && role !== "assistant") return;
-		const text = extractMessageText(event.message);
-		if (!text) return;
-
-		// Identity for message_end (pi-ai 0.84.x):
-		// UserMessage/AssistantMessage expose role/content/timestamp only — no id or
-		// index field. message_end also fires BEFORE the message is persisted, so
-		// sessionManager.getLeafEntry() is the PREVIOUS entry (often a tool result or
-		// our own codemem.cursor custom entry from persistCursor) and must never be
-		// used as identity.
-		//
-		// entryId = stableMessageEntryId(sessionId, role, text, discriminator):
-		//   1. message.timestamp — retry-stable (same logical message keeps the same
-		//      timestamp across handler retries; distinct across turns)
-		//   2. else per-session monotonic messageSeq (fresh discriminator per firing)
-		// Content hash alone is never an id on its own.
-		const msg = event.message as { timestamp?: unknown };
-		let discriminator: string | number;
-		if (typeof msg.timestamp === "number" && Number.isFinite(msg.timestamp)) {
-			discriminator = msg.timestamp;
-		} else {
-			state.messageSeq += 1;
-			discriminator = `n:${state.messageSeq}`;
-		}
-		const entryId = stableMessageEntryId(state.sessionId, role, text, discriminator);
-
-		const payload = buildMessageEndPayload({
-			sessionId: state.sessionId,
-			cwd: state.cwd || ctx.cwd,
-			project: state.project,
-			entryId,
-			role,
-			text,
-		});
-		if (!payload) return;
-		await safeIngest(client, payload, state, pi, ctx.signal);
-	});
-
-	// ---- tool_call (ingest + track; file_context is applied on tool_result) ----
-	pi.on("tool_call", async (event: ToolCallEvent, ctx: ExtensionContext) => {
-		if (!state.active || !state.sessionId) return;
-		const toolName = event.toolName;
-		const toolCallId = event.toolCallId;
-		const toolInput =
-			event.input != null && typeof event.input === "object"
-				? (event.input as Record<string, unknown>)
-				: {};
-		state.toolCalls.set(toolCallId, { toolName, input: toolInput });
-
-		const payload = buildToolCallPayload({
-			sessionId: state.sessionId,
-			cwd: state.cwd || ctx.cwd,
-			project: state.project,
-			toolCallId,
-			toolName,
-			toolInput,
-		});
-		await safeIngest(client, payload, state, pi, ctx.signal);
-		// Do not block or mutate — return undefined.
-	});
-
-	// ---- tool_result (ingest + optional file-context append for read) ----
-	pi.on("tool_result", async (event: ToolResultEvent, ctx: ExtensionContext) => {
-		if (!state.active || !state.sessionId) return;
-		const tracked = state.toolCalls.get(event.toolCallId);
-		const toolName = event.toolName;
-		const toolInput =
-			event.input != null && typeof event.input === "object"
-				? (event.input as Record<string, unknown>)
-				: (tracked?.input ?? {});
-		state.toolCalls.delete(event.toolCallId);
-
-		const payload = buildToolResultPayload({
-			sessionId: state.sessionId,
-			cwd: state.cwd || ctx.cwd,
-			project: state.project,
-			toolCallId: event.toolCallId,
-			toolName,
-			toolInput,
-			toolOutput: serializeToolOutput(event.content),
-			isError: Boolean(event.isError),
-			error: event.isError ? serializeToolOutput(event.content) : null,
-		});
-		await safeIngest(client, payload, state, pi, ctx.signal);
-
-		// File-context: attach relevant memories when read completes (fail-open).
-		if (config.fileContext && toolName === "read" && !event.isError) {
-			const path = readPathFromToolInput(toolInput);
-			if (path) {
-				try {
-					const fileCtx = await fetchFileContextBlock(client, path, ctx.signal);
-					if (fileCtx.text.trim()) {
-						const block = fileCtx.preformatted
-							? fileCtx.text
-							: formatPiInjectionBlock(fileCtx.text, 4_000);
-						const existing = Array.isArray(event.content) ? [...event.content] : [];
-						return {
-							content: [...existing, { type: "text" as const, text: `\n\n${block}` }],
-						};
-					}
-				} catch {
-					// fail-open
-				}
-			}
-		}
-	});
-
-	// ---- session_before_compact: flush only, NEVER return compaction ----
-	pi.on(
-		"session_before_compact",
-		async (event: SessionBeforeCompactEvent, ctx: ExtensionContext) => {
-			if (!state.sessionId) return;
-			// Unique per firing so repeated compactions are not collapsed by keying.
-			state.compactSeq += 1;
-			const payload = buildBeforeCompactPayload({
-				sessionId: state.sessionId,
-				cwd: state.cwd || ctx.cwd,
-				project: state.project,
-				reason: event.reason,
-				entryId: `session_before_compact:${state.compactSeq}`,
-			});
-			// Flush-only: CLI path (HTTP cannot flush). Not durable-deduped.
-			// Observe-only — never return { compaction }.
-			await safeIngest(client, payload, state, pi, event.signal ?? ctx.signal);
-		},
+	pi.on("session_start", (event, ctx) => onSessionStart(state, client, pi, event, ctx));
+	pi.on("session_shutdown", (event, ctx) =>
+		onSessionShutdown(state, client, runtime, pi, event, ctx),
 	);
-
-	// ---- before_agent_start: systemPrompt append only (D4) ----
-	pi.on("before_agent_start", async (event: BeforeAgentStartEvent, ctx: ExtensionContext) => {
-		if (!config.injectPrompts) return;
-		try {
-			const prompt = typeof event.prompt === "string" ? event.prompt : "";
-			if (!prompt.trim()) return;
-
-			const packFetch = await client.fetchPackText(prompt, ctx.signal);
-			if (!packFetch.text.trim()) return;
-
-			// pi-hook-inject already returns the full ## block (preformatted);
-			// HTTP pack / pack --json return bare text that must be framed here.
-			const block = packFetch.preformatted
-				? packFetch.text
-				: formatPiInjectionBlock(packFetch.text, config.injectMaxChars);
-			if (!block.trim()) return;
-
-			const base = typeof event.systemPrompt === "string" ? event.systemPrompt : "";
-			return {
-				systemPrompt: base ? `${base}\n\n${block}` : block,
-			};
-		} catch {
-			// fail-open: no mutation
-			return;
-		}
-	});
+	pi.on("message_end", (event, ctx) => onMessageEnd(state, client, pi, event, ctx));
+	pi.on("tool_call", (event, ctx) => onToolCall(state, client, pi, event, ctx));
+	pi.on("tool_result", (event, ctx) => onToolResult(state, client, config, pi, event, ctx));
+	pi.on("session_before_compact", (event, ctx) => onBeforeCompact(state, client, pi, event, ctx));
+	pi.on("before_agent_start", (event, ctx) =>
+		systemPromptInjection(client, config, event, ctx.signal),
+	);
 }
 
 /**

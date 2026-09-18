@@ -8,7 +8,6 @@ import { existsSync, lstatSync, readFileSync } from "node:fs";
 import { basename, dirname, resolve } from "node:path";
 import type { PiExtensionConfig } from "./config.js";
 import {
-	apiUrl,
 	checkIngestAvailable,
 	clearStreamFailure,
 	ensureViewerRunning,
@@ -83,6 +82,22 @@ export const CLI_PACK_TIMEOUT_MS = 8_000;
  * exceed the short HTTP ingest timeout, so it must not reuse httpTimeoutMs.
  */
 export const BOUNDARY_CLI_TIMEOUT_MS = 30_000;
+
+function projectFromGitMarker(dir: string, gitPath: string): string {
+	try {
+		if (lstatSync(gitPath).isDirectory()) return basename(dir);
+		const text = readFileSync(gitPath, "utf8").trim();
+		if (text.startsWith("gitdir:")) {
+			const gitdir = resolve(dir, text.slice("gitdir:".length).trim()).replaceAll("\\", "/");
+			const marker = "/.git/worktrees/";
+			const index = gitdir.indexOf(marker);
+			if (index >= 0) return basename(gitdir.slice(0, index));
+		}
+	} catch {
+		return basename(dir);
+	}
+	return basename(dir);
+}
 
 export class PiCodememClient {
 	readonly config: PiExtensionConfig;
@@ -301,66 +316,6 @@ export class PiCodememClient {
 		}
 	}
 
-	async httpJson(
-		method: "GET" | "POST",
-		path: string,
-		opts: {
-			query?: Record<string, string | number | boolean | undefined | null>;
-			body?: unknown;
-			signal?: AbortSignal;
-			timeoutMs?: number;
-		} = {},
-	): Promise<{ ok: true; status: number; data: unknown } | { ok: false; error: string }> {
-		await this.ensureViewer(opts.signal);
-		const url = new URL(apiUrl(this.config, path));
-		if (opts.query) {
-			for (const [key, value] of Object.entries(opts.query)) {
-				if (value == null || value === "") continue;
-				url.searchParams.set(key, String(value));
-			}
-		}
-		const controller = new AbortController();
-		const onAbort = () => controller.abort();
-		opts.signal?.addEventListener("abort", onAbort, { once: true });
-		const timeout = setTimeout(
-			() => controller.abort(),
-			opts.timeoutMs ?? this.config.httpTimeoutMs,
-		);
-		try {
-			const res = await fetch(url, {
-				method,
-				headers: method === "POST" ? { "Content-Type": "application/json" } : undefined,
-				body: method === "POST" ? JSON.stringify(opts.body ?? {}) : undefined,
-				signal: controller.signal,
-			});
-			let data: unknown = null;
-			const text = await res.text();
-			if (text) {
-				try {
-					data = JSON.parse(text);
-				} catch {
-					data = text;
-				}
-			}
-			if (!res.ok) {
-				const errMsg =
-					data != null && typeof data === "object" && !Array.isArray(data)
-						? String((data as Record<string, unknown>).error ?? res.statusText)
-						: res.statusText;
-				return { ok: false, error: errMsg || `HTTP ${res.status}` };
-			}
-			return { ok: true, status: res.status, data };
-		} catch (err) {
-			return {
-				ok: false,
-				error: err instanceof Error ? err.message : String(err),
-			};
-		} finally {
-			clearTimeout(timeout);
-			opts.signal?.removeEventListener("abort", onAbort);
-		}
-	}
-
 	async execCodemem(
 		args: string[],
 		opts: { stdin?: string; signal?: AbortSignal; timeoutMs?: number } = {},
@@ -421,33 +376,11 @@ export class PiCodememClient {
 		let current = resolve(cwd);
 		while (true) {
 			const gitPath = resolve(current, ".git");
-			if (existsSync(gitPath)) {
-				try {
-					if (lstatSync(gitPath).isDirectory()) {
-						return basename(current);
-					}
-					const text = readFileSync(gitPath, "utf8").trim();
-					if (text.startsWith("gitdir:")) {
-						const gitdir = resolve(current, text.slice("gitdir:".length).trim()).replaceAll(
-							"\\",
-							"/",
-						);
-						const worktreeMarker = "/.git/worktrees/";
-						const worktreeIndex = gitdir.indexOf(worktreeMarker);
-						if (worktreeIndex >= 0) {
-							return basename(gitdir.slice(0, worktreeIndex));
-						}
-					}
-					return basename(current);
-				} catch {
-					return basename(current);
-				}
-			}
+			if (existsSync(gitPath)) return projectFromGitMarker(current, gitPath);
 			const parent = dirname(current);
 			if (parent === current) break;
 			current = parent;
 		}
-		// No git anchor found — fall back to the cwd basename (core parity).
 		return basename(resolve(cwd)) || null;
 	}
 }

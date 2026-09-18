@@ -85,8 +85,29 @@ function resolveConfigPath(): string {
 	return join(base, "config.json");
 }
 
+function skipJsoncComment(text: string, i: number, kind: "/" | "*"): number {
+	if (kind === "/") {
+		i += 2;
+		while (i < text.length && text[i] !== "\n") i += 1;
+		return i;
+	}
+	i += 2;
+	while (i < text.length && !(text[i] === "*" && text[i + 1] === "/")) i += 1;
+	return i + 2;
+}
+
+function stepJsoncString(
+	ch: string,
+	quote: string,
+	escaped: boolean,
+): { escaped: boolean; closed: boolean } {
+	if (escaped) return { escaped: false, closed: false };
+	if (ch === "\\") return { escaped: true, closed: false };
+	if (ch === quote) return { escaped: false, closed: true };
+	return { escaped: false, closed: false };
+}
+
 function stripJsonc(text: string): string {
-	// Minimal JSONC strip: // line comments and /* block comments */, keep strings intact.
 	let out = "";
 	let i = 0;
 	let inString = false;
@@ -97,13 +118,9 @@ function stripJsonc(text: string): string {
 		const next = text[i + 1] ?? "";
 		if (inString) {
 			out += ch;
-			if (escaped) {
-				escaped = false;
-			} else if (ch === "\\") {
-				escaped = true;
-			} else if (ch === quote) {
-				inString = false;
-			}
+			const step = stepJsoncString(ch, quote, escaped);
+			escaped = step.escaped;
+			if (step.closed) inString = false;
 			i += 1;
 			continue;
 		}
@@ -114,15 +131,8 @@ function stripJsonc(text: string): string {
 			i += 1;
 			continue;
 		}
-		if (ch === "/" && next === "/") {
-			i += 2;
-			while (i < text.length && text[i] !== "\n") i += 1;
-			continue;
-		}
-		if (ch === "/" && next === "*") {
-			i += 2;
-			while (i < text.length && !(text[i] === "*" && text[i + 1] === "/")) i += 1;
-			i += 2;
+		if (ch === "/" && (next === "/" || next === "*")) {
+			i = skipJsoncComment(text, i, next);
 			continue;
 		}
 		out += ch;

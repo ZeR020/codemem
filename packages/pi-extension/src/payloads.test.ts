@@ -74,6 +74,11 @@ describe("pi-extension payloads ↔ core adapter", () => {
 		const adapter = mapPiEventPayload(payload);
 		expect(adapter?.event_type).toBe("assistant");
 	});
+});
+
+describe("pi-extension tool payloads", () => {
+	const sessionId = "sess-abc";
+	const cwd = "/tmp/proj";
 
 	it("tool_call / tool_result pair with deterministic ids", () => {
 		const call = buildToolCallPayload({
@@ -140,7 +145,9 @@ describe("pi-extension payloads ↔ core adapter", () => {
 		expect(payload).not.toHaveProperty("compaction");
 		expect(payload).not.toHaveProperty("summary");
 	});
+});
 
+describe("stableMessageEntryId", () => {
 	it("stableMessageEntryId is deterministic and content-sensitive", () => {
 		const a = stableMessageEntryId("s1", "user", "hello");
 		const b = stableMessageEntryId("s1", "user", "hello");
