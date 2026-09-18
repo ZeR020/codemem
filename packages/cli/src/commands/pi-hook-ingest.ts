@@ -49,11 +49,15 @@ type HttpIngestResult = {
 	targetMismatch?: boolean;
 };
 type IngestOpts = { host: string; port: string | number } & DbOpts;
+type BoundaryFlush = (
+	payload: Record<string, unknown>,
+	dbPath: string,
+) => Promise<boolean | undefined> | boolean | undefined;
 type IngestDeps = {
 	httpIngest?: typeof tryHttpIngest;
 	directIngest?: typeof directEnqueuePiHook;
 	resolveDb?: typeof resolveDbPath;
-	boundaryFlush?: (payload: Record<string, unknown>, dbPath: string) => Promise<void> | void;
+	boundaryFlush?: BoundaryFlush;
 };
 
 const DEFAULT_HTTP_TIMEOUT_MS = 5000;
@@ -163,16 +167,17 @@ export function directEnqueuePiHook(
 /**
  * Best-effort boundary flush for session_before_compact / session_shutdown.
  * Always passes source "pi" — never relies on a helper default.
- * Failures are logged and swallowed so the hook never crashes the agent.
+ * Returns false when observer/store/extraction fail so a recovered-boundary
+ * retry can keep the spool; live hook callers stay fail-open and ignore it.
  */
 async function flushBoundaryRawEvents(
 	payload: Record<string, unknown>,
 	dbPath: string,
-): Promise<void> {
+): Promise<boolean> {
 	const envelope = buildRawEventEnvelopeFromPiEvent(payload);
 	const signal = buildPiFlushSignalFromEvent(payload);
 	const sessionId = envelope?.session_stream_id ?? signal?.session_id ?? null;
-	if (!sessionId) return;
+	if (!sessionId) return true;
 
 	// Explicit source "pi" per attribution-audit.md — never bare defaults.
 	const source = "pi" as const;
@@ -187,7 +192,7 @@ async function flushBoundaryRawEvents(
 		logHookEvent(
 			`codemem pi-hook-ingest boundary flush observer init failed: ${err instanceof Error ? err.message : String(err)}`,
 		);
-		return;
+		return false;
 	}
 
 	let store: MemoryStore;
@@ -197,7 +202,7 @@ async function flushBoundaryRawEvents(
 		logHookEvent(
 			`codemem pi-hook-ingest boundary flush store init failed: ${err instanceof Error ? err.message : String(err)}`,
 		);
-		return;
+		return false;
 	}
 
 	try {
@@ -213,10 +218,12 @@ async function flushBoundaryRawEvents(
 				maxEvents: null,
 			},
 		);
+		return true;
 	} catch (err) {
 		logHookEvent(
 			`codemem pi-hook-ingest boundary flush raw events failed: ${err instanceof Error ? err.message : String(err)}`,
 		);
+		return false;
 	} finally {
 		store.close();
 	}
@@ -250,7 +257,7 @@ function tryDirectFallback(
 async function flushOnBoundaryIfRequested(
 	payload: Record<string, unknown>,
 	directIngest: typeof directEnqueuePiHook,
-	boundaryFlush: (payload: Record<string, unknown>, dbPath: string) => Promise<void> | void,
+	boundaryFlush: BoundaryFlush,
 	getDbPath: () => string,
 ): Promise<void> {
 	if (!shouldForcePiBoundaryFlush(payload)) return;
@@ -274,11 +281,13 @@ async function flushOnBoundaryIfRequested(
  * Replayed-variant of flushOnBoundaryIfRequested used on the spool drain
  * path: a boundary flush that still fails keeps the spooled payload alive
  * (caller reports failure so drainPiHookSpool does not delete the entry).
+ * Observes flushBoundaryRawEvents' boolean result — the production helper
+ * catches observer/store/extraction errors and returns false without throwing.
  */
 async function flushOnBoundaryForRecoveredPayload(
 	payload: Record<string, unknown>,
 	directIngest: typeof directEnqueuePiHook,
-	boundaryFlush: (payload: Record<string, unknown>, dbPath: string) => Promise<void> | void,
+	boundaryFlush: BoundaryFlush,
 	getDbPath: () => string,
 ): Promise<boolean> {
 	if (!shouldForcePiBoundaryFlush(payload)) return true;
@@ -290,7 +299,11 @@ async function flushOnBoundaryForRecoveredPayload(
 		);
 	}
 	try {
-		await boundaryFlush(payload, getDbPath());
+		const flushed = await boundaryFlush(payload, getDbPath());
+		if (flushed === false) {
+			logHookEvent("codemem pi-hook-ingest boundary flush failed; keeping spooled payload");
+			return false;
+		}
 		return true;
 	} catch (err) {
 		logHookEvent(
@@ -332,7 +345,7 @@ async function deliverQueuedPiHook(
 	host: string,
 	port: number,
 	directIngest: typeof directEnqueuePiHook,
-	boundaryFlush: (payload: Record<string, unknown>, dbPath: string) => Promise<void> | void,
+	boundaryFlush: BoundaryFlush,
 	getDbPath: () => string,
 ): Promise<boolean> {
 	const queuedHttp = await httpIngest(targetedPiPayload(queuedPayload, getDbPath), host, port);
@@ -349,7 +362,7 @@ async function drainBacklogIfPresent(
 	host: string,
 	port: number,
 	directIngest: typeof directEnqueuePiHook,
-	boundaryFlush: (payload: Record<string, unknown>, dbPath: string) => Promise<void> | void,
+	boundaryFlush: BoundaryFlush,
 	getDbPath: () => string,
 ): Promise<void> {
 	if (!hasPiHookSpooledEntries()) return;
@@ -383,7 +396,7 @@ async function runLockedPiHookIngest(
 	port: number,
 	httpIngest: typeof tryHttpIngest,
 	directIngest: typeof directEnqueuePiHook,
-	boundaryFlush: (payload: Record<string, unknown>, dbPath: string) => Promise<void> | void,
+	boundaryFlush: BoundaryFlush,
 	getDbPath: () => string,
 ): Promise<IngestResult> {
 	recoverStalePiHookTmpSpool(piHookLockTtlSeconds());
@@ -420,7 +433,7 @@ async function runLockedPiHookIngest(
 async function ingestPiHookLockBusyFallback(
 	payload: Record<string, unknown>,
 	directIngest: typeof directEnqueuePiHook,
-	boundaryFlush: (payload: Record<string, unknown>, dbPath: string) => Promise<void> | void,
+	boundaryFlush: BoundaryFlush,
 	getDbPath: () => string,
 	err: unknown,
 ): Promise<IngestResult> {
@@ -446,7 +459,7 @@ async function ingestLockedPiHookPayload(
 	port: number,
 	httpIngest: typeof tryHttpIngest,
 	directIngest: typeof directEnqueuePiHook,
-	boundaryFlush: (payload: Record<string, unknown>, dbPath: string) => Promise<void> | void,
+	boundaryFlush: BoundaryFlush,
 	getDbPath: () => string,
 ): Promise<IngestResult> {
 	try {

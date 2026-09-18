@@ -338,24 +338,19 @@ describe("pi-hook-ingest boundary replay on recovered spool", () => {
 		);
 		expect(spooled.via).toBe("spool");
 
-		// Recovery pass 1: delivery succeeds (DB healthy) but the flush still
-		// fails (observer path down). Entry must NOT be deleted — extraction
-		// has not run, so deleting would reproduce the original data loss.
-		const firstFlushAttempts: Array<Record<string, unknown>> = [];
+		// Recovery pass 1: delivery succeeds, but the default production
+		// flushBoundaryRawEvents fails without throwing (store cannot open a directory).
+		const notADb = join(sandbox.sandboxDir, "not-a-db");
+		mkdirSync(notADb);
 		await ingestPiHookPayload(
 			{ piEvent: "session_start", sessionId: "sess-pass1", tag: "pass1" },
 			{ host: "127.0.0.1", port: 38888 },
 			{
 				httpIngest: async () => ({ ok: false, inserted: 0, skipped: 0 }),
 				directIngest: () => ({ inserted: 1, skipped: 0 }),
-				boundaryFlush: (payload) => {
-					firstFlushAttempts.push(payload);
-					throw new Error("observer still unavailable");
-				},
-				resolveDb: () => "/tmp/healthy.sqlite",
+				resolveDb: () => notADb,
 			},
 		);
-		expect(firstFlushAttempts.map((p) => p.tag)).toEqual(["boundary"]);
 		expect(readdirSync(sandbox.queueDir).filter((n) => n.endsWith(".json"))).toHaveLength(1);
 
 		// Recovery pass 2: flush now succeeds; entry drains and is deleted.
