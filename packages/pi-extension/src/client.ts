@@ -12,10 +12,12 @@ import {
 	clearStreamFailure,
 	ensureViewerRunning,
 	isStreamInBackoff,
+	isViewerTargetConflict,
 	markStreamFailure,
-	packUrl,
 	piHooksUrl,
+	proveAndPostPack,
 	type ViewerRuntime,
+	viewerRequestTarget,
 } from "./viewer.js";
 
 /** pi AgentToolResult shape (content + required details). */
@@ -159,7 +161,7 @@ export class PiCodememClient {
 			return this.tryCliIngest(body, signal);
 		}
 
-		if (!isStreamInBackoff(this.runtime)) {
+		if (this.config.viewerEnabled && !isStreamInBackoff(this.runtime)) {
 			await this.ensureViewer(signal);
 			const available = await checkIngestAvailable(this.config, this.runtime, signal);
 			if (available) {
@@ -187,6 +189,8 @@ export class PiCodememClient {
 		payload: Record<string, unknown>,
 		signal?: AbortSignal,
 	): Promise<{ ok: boolean; inserted: number; skipped: number }> {
+		const failed = { ok: false, inserted: 0, skipped: 0 };
+		if (!this.config.viewerEnabled) return failed;
 		const controller = new AbortController();
 		const onAbort = () => controller.abort();
 		signal?.addEventListener("abort", onAbort, { once: true });
@@ -195,26 +199,26 @@ export class PiCodememClient {
 			const res = await fetch(piHooksUrl(this.config), {
 				method: "POST",
 				headers: { "Content-Type": "application/json" },
-				body: JSON.stringify(payload),
+				body: JSON.stringify({ ...payload, ...viewerRequestTarget(this.cwd) }),
 				signal: controller.signal,
 			});
-			if (!res.ok) return { ok: false, inserted: 0, skipped: 0 };
 			let parsed: unknown;
 			try {
 				parsed = await res.json();
 			} catch {
-				return { ok: false, inserted: 0, skipped: 0 };
+				return failed;
 			}
+			if (isViewerTargetConflict(res.status, parsed) || !res.ok) return failed;
 			if (parsed == null || typeof parsed !== "object" || Array.isArray(parsed)) {
-				return { ok: false, inserted: 0, skipped: 0 };
+				return failed;
 			}
 			const obj = parsed as Record<string, unknown>;
 			if (typeof obj.inserted !== "number" || typeof obj.skipped !== "number") {
-				return { ok: false, inserted: 0, skipped: 0 };
+				return failed;
 			}
 			return { ok: true, inserted: obj.inserted, skipped: obj.skipped };
 		} catch {
-			return { ok: false, inserted: 0, skipped: 0 };
+			return failed;
 		} finally {
 			clearTimeout(timeout);
 			signal?.removeEventListener("abort", onAbort);
@@ -253,13 +257,14 @@ export class PiCodememClient {
 		}
 	}
 
-	/** GET /api/pack then CLI pi-hook-inject / pack --json fallback. */
+	/** Profile-proven POST /api/pack, then CLI pi-hook-inject / pack --json fallback. */
 	async fetchPackText(context: string, signal?: AbortSignal): Promise<PackFetch> {
 		const query = context.trim().slice(0, 500) || "recent work";
-		await this.ensureViewer(signal);
-
-		const httpPack = await this.tryHttpPack(query, signal);
-		if (httpPack.text) return httpPack;
+		if (this.config.viewerEnabled) {
+			await this.ensureViewer(signal);
+			const httpPack = await this.tryHttpPack(query, signal);
+			if (httpPack.text) return httpPack;
+		}
 
 		// CLI pi-hook-inject already emits the full `## codemem memories` block.
 		try {
@@ -293,23 +298,22 @@ export class PiCodememClient {
 	}
 
 	private async tryHttpPack(context: string, signal?: AbortSignal): Promise<PackFetch> {
-		const url = new URL(packUrl(this.config));
-		url.searchParams.set("context", context);
-		url.searchParams.set("limit", String(this.config.injectLimit));
-		url.searchParams.set("token_budget", String(this.config.injectTokenBudget));
-		if (this.project) url.searchParams.set("project", this.project);
-
+		const empty = { text: "", preformatted: false };
+		if (!this.config.viewerEnabled) return empty;
 		const controller = new AbortController();
 		const onAbort = () => controller.abort();
 		signal?.addEventListener("abort", onAbort, { once: true });
 		const timeout = setTimeout(() => controller.abort(), 2_000);
 		try {
-			const res = await fetch(url, { signal: controller.signal });
-			if (!res.ok) return { text: "", preformatted: false };
-			const body = (await res.json()) as { pack_text?: string };
-			return { text: String(body.pack_text ?? "").trim(), preformatted: false };
+			const text = await proveAndPostPack(this.config, {
+				context,
+				cwd: this.cwd,
+				project: this.project,
+				signal: controller.signal,
+			});
+			return text ? { text, preformatted: false } : empty;
 		} catch {
-			return { text: "", preformatted: false };
+			return empty;
 		} finally {
 			clearTimeout(timeout);
 			signal?.removeEventListener("abort", onAbort);
@@ -325,7 +329,15 @@ export class PiCodememClient {
 		}
 		const timeout = opts.timeoutMs ?? 15_000;
 		return new Promise((resolve, reject) => {
-			const child = execFile(
+			let child: ReturnType<typeof execFile>;
+			const onAbort = () => {
+				try {
+					child.kill("SIGTERM");
+				} catch {
+					// ignore
+				}
+			};
+			child = execFile(
 				"codemem",
 				args,
 				{
@@ -336,6 +348,7 @@ export class PiCodememClient {
 					killSignal: "SIGTERM",
 				},
 				(err, stdout, stderr) => {
+					opts.signal?.removeEventListener("abort", onAbort);
 					if (err) {
 						const error = err as Error & { stdout?: string; stderr?: string };
 						error.stdout = stdout;
@@ -346,13 +359,6 @@ export class PiCodememClient {
 					resolve({ stdout: String(stdout ?? ""), stderr: String(stderr ?? "") });
 				},
 			);
-			const onAbort = () => {
-				try {
-					child.kill("SIGTERM");
-				} catch {
-					// ignore
-				}
-			};
 			if (opts.signal) {
 				if (opts.signal.aborted) onAbort();
 				else opts.signal.addEventListener("abort", onAbort, { once: true });

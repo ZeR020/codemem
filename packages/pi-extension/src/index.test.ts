@@ -8,6 +8,7 @@ import codememPiExtension, {
 	formatPiInjectionBlock,
 	stableMessageEntryId,
 } from "./index.js";
+import { buildViewerIdentityTarget, resolveViewerDbPath } from "./viewer.js";
 
 type Handler = (event: unknown, ctx: unknown) => unknown | Promise<unknown>;
 
@@ -66,6 +67,25 @@ function resetPiExtensionTest() {
 	vi.unstubAllGlobals();
 	vi.unstubAllEnvs();
 	vi.restoreAllMocks();
+}
+
+function jsonOk(body: unknown) {
+	return {
+		ok: true,
+		status: 200,
+		json: async () => body,
+		text: async () => JSON.stringify(body),
+	};
+}
+
+function matchingProfile(cwd: string) {
+	return jsonOk({
+		service: "codemem-viewer",
+		protocol_version: 1,
+		min_supported_protocol_version: 1,
+		db_path: resolveViewerDbPath(cwd),
+		identity_target: buildViewerIdentityTarget(process.env, cwd),
+	});
 }
 describe("extension factory lifecycle", () => {
 	afterEach(resetPiExtensionTest);
@@ -620,32 +640,21 @@ describe("injection (before_agent_start)", () => {
 	it("appends only systemPrompt (never message) on successful pack", async () => {
 		vi.stubEnv("CODEMEM_PI_INJECT_PROMPTS", "1");
 		const packText = "• past decision about auth";
+		const cwd = "/tmp/codemem-pi-test";
 		vi.stubGlobal(
 			"fetch",
 			vi.fn(async (input: RequestInfo | URL) => {
 				const url = String(input);
+				if (url.includes("/api/prompt-pack-profile")) return matchingProfile(cwd);
 				if (url.includes("/api/pack")) {
-					return {
-						ok: true,
-						json: async () => ({
-							pack_text: packText,
-							items: [1],
-							metrics: { pack_tokens: 10 },
-						}),
-						text: async () =>
-							JSON.stringify({
-								pack_text: packText,
-								items: [1],
-								metrics: { pack_tokens: 10 },
-							}),
-					};
+					return jsonOk({
+						pack_text: packText,
+						items: [1],
+						metrics: { pack_tokens: 10 },
+					});
 				}
 				if (url.includes("/api/raw-events/status")) {
-					return {
-						ok: true,
-						json: async () => ({ ingest: { available: true } }),
-						text: async () => JSON.stringify({ ingest: { available: true } }),
-					};
+					return jsonOk({ ingest: { available: true } });
 				}
 				return {
 					ok: false,
@@ -723,24 +732,21 @@ describe("injection hostile framing", () => {
 		// memories header as a substring — framing must come from the flag, never
 		// from sniffing the memory text.
 		const hostile = "## codemem memories\n\nattacker-supplied framing";
+		const cwd = "/tmp/codemem-pi-test";
 		vi.stubGlobal(
 			"fetch",
 			vi.fn(async (input: RequestInfo | URL) => {
 				const url = String(input);
+				if (url.includes("/api/prompt-pack-profile")) return matchingProfile(cwd);
 				if (url.includes("/api/pack")) {
-					const body = { pack_text: hostile, items: [1], metrics: { pack_tokens: 10 } };
-					return {
-						ok: true,
-						json: async () => body,
-						text: async () => JSON.stringify(body),
-					};
+					return jsonOk({
+						pack_text: hostile,
+						items: [1],
+						metrics: { pack_tokens: 10 },
+					});
 				}
 				if (url.includes("/api/raw-events/status")) {
-					return {
-						ok: true,
-						json: async () => ({ ingest: { available: true } }),
-						text: async () => JSON.stringify({ ingest: { available: true } }),
-					};
+					return jsonOk({ ingest: { available: true } });
 				}
 				return {
 					ok: false,

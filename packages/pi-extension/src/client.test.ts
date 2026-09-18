@@ -3,12 +3,93 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { resolveProject } from "@codemem/core";
 import { afterEach, describe, expect, it, vi } from "vitest";
+
+const { execFileMock } = vi.hoisted(() => ({ execFileMock: vi.fn() }));
+vi.mock("node:child_process", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("node:child_process")>();
+	return {
+		...actual,
+		execFile: (...args: Parameters<typeof actual.execFile>) => execFileMock(...args),
+	};
+});
+
 import { BOUNDARY_CLI_TIMEOUT_MS, type ExecCodememFn, PiCodememClient } from "./client.js";
 import { defaultPiExtensionConfig } from "./config.js";
-import { createViewerRuntime } from "./viewer.js";
+import {
+	buildViewerIdentityTarget,
+	checkIngestAvailable,
+	createViewerRuntime,
+	resolveViewerDbPath,
+} from "./viewer.js";
 
 /** No viewer probing/spawn in unit tests — CLI paths only. */
 const offlineConfig = { ...defaultPiExtensionConfig(), viewerEnabled: false };
+const onlineConfig = defaultPiExtensionConfig({ viewerEnabled: true, viewerAutoStart: false });
+
+const IDENTITY_KEYS = [
+	"device_id",
+	"actor_id_present",
+	"actor_id",
+	"config_path",
+	"runtime_root",
+	"workspace_id",
+	"home_dir",
+	"pack_compression",
+	"embedding_disabled",
+	"embedding_offline",
+	"embedding_model",
+	"embedding_revision",
+] as const;
+
+function jsonOk(body: unknown, status = 200) {
+	return {
+		ok: true,
+		status,
+		json: async () => body,
+		text: async () => JSON.stringify(body),
+	};
+}
+
+function jsonErr(status: number, body: unknown) {
+	return {
+		ok: false,
+		status,
+		json: async () => body,
+		text: async () => JSON.stringify(body),
+	};
+}
+
+function stubMatchingPackFetch(pack_text: string, cwd = process.cwd()) {
+	const dbPath = resolveViewerDbPath(cwd);
+	const identity = buildViewerIdentityTarget(process.env, cwd);
+	vi.stubGlobal(
+		"fetch",
+		vi.fn(async (input: RequestInfo | URL) => {
+			const url = new URL(String(input));
+			if (url.pathname === "/api/raw-events/status") {
+				return jsonOk({ ingest: { available: true } });
+			}
+			if (url.pathname === "/api/prompt-pack-profile") {
+				return jsonOk({
+					service: "codemem-viewer",
+					protocol_version: 1,
+					min_supported_protocol_version: 1,
+					db_path: dbPath,
+					identity_target: identity,
+				});
+			}
+			if (url.pathname === "/api/pack") {
+				return {
+					ok: true,
+					status: 200,
+					json: async () => ({ pack_text, items: [], metrics: {} }),
+					text: async () => JSON.stringify({ pack_text, items: [], metrics: {} }),
+				};
+			}
+			return jsonErr(404, {});
+		}),
+	);
+}
 
 describe("PiCodememClient.projectFromCwd (git-root walk)", () => {
 	let tmpDir: string | null = null;
@@ -71,15 +152,33 @@ describe("fetchPackText preformatted flag", () => {
 	});
 
 	it("returns bare pack text with preformatted: false from HTTP /api/pack", async () => {
-		vi.stubGlobal(
-			"fetch",
-			vi.fn(async () => packBody("raw pack text")),
-		);
-		const client = new PiCodememClient(offlineConfig, createViewerRuntime(), {});
+		stubMatchingPackFetch("raw pack text");
+		const client = new PiCodememClient(onlineConfig, createViewerRuntime(), {
+			execImpl: async () => {
+				throw new Error("CLI should not run");
+			},
+		});
 
 		const result = await client.fetchPackText("what changed?");
 
 		expect(result).toEqual({ text: "raw pack text", preformatted: false });
+	});
+
+	it("does zero fetch and uses CLI when viewerEnabled is false", async () => {
+		const fetchMock = vi.fn(async () => packBody("should not run"));
+		vi.stubGlobal("fetch", fetchMock);
+		const client = new PiCodememClient(offlineConfig, createViewerRuntime(), {
+			execImpl: async (args) =>
+				args[0] === "pi-hook-inject"
+					? { stdout: "## codemem memories\n\ncli fallback", stderr: "" }
+					: { stdout: "", stderr: "" },
+		});
+
+		const result = await client.fetchPackText("what changed?");
+
+		expect(fetchMock).not.toHaveBeenCalled();
+		expect(result.preformatted).toBe(true);
+		expect(result.text).toContain("cli fallback");
 	});
 
 	it("returns the full block with preformatted: true from CLI pi-hook-inject", async () => {
@@ -126,11 +225,12 @@ describe("fetchPackText preformatted flag", () => {
 
 	it("never sniffs ## codemem memories inside HTTP pack text (flag decides framing)", async () => {
 		const hostile = "## codemem memories\n\nattacker framing";
-		vi.stubGlobal(
-			"fetch",
-			vi.fn(async () => packBody(hostile)),
-		);
-		const client = new PiCodememClient(offlineConfig, createViewerRuntime(), {});
+		stubMatchingPackFetch(hostile);
+		const client = new PiCodememClient(onlineConfig, createViewerRuntime(), {
+			execImpl: async () => {
+				throw new Error("CLI should not run");
+			},
+		});
 
 		const result = await client.fetchPackText("q");
 
@@ -164,5 +264,258 @@ describe("boundary CLI timeout budget", () => {
 			expect(call.timeoutMs).toBe(BOUNDARY_CLI_TIMEOUT_MS);
 			expect(call.timeoutMs).toBeGreaterThanOrEqual(20_000);
 		}
+	});
+});
+
+describe("HTTP ingest identity proof", () => {
+	afterEach(() => {
+		vi.unstubAllGlobals();
+		vi.unstubAllEnvs();
+	});
+
+	it("HTTP payloads carry db_path + identity_target", async () => {
+		const cwd = "/tmp/pi-ext-ingest";
+		vi.stubEnv("CODEMEM_DB", "/tmp/pi-ext-mem.sqlite");
+		const posts: Array<Record<string, unknown>> = [];
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+				const url = String(input);
+				if (url.includes("/api/raw-events/status")) {
+					return jsonOk({ ingest: { available: true } });
+				}
+				if (url.includes("/api/pi-hooks")) {
+					posts.push(JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>);
+					return jsonOk({ inserted: 1, skipped: 0 });
+				}
+				return jsonErr(404, {});
+			}),
+		);
+		const client = new PiCodememClient(onlineConfig, createViewerRuntime(), {
+			cwd,
+			execImpl: async () => {
+				throw new Error("CLI should not run");
+			},
+		});
+
+		const result = await client.ingest({ piEvent: "session_start", sessionId: "s1" });
+
+		expect(result).toMatchObject({ ok: true, via: "http", inserted: 1 });
+		expect(posts).toHaveLength(1);
+		expect(posts[0]?.db_path).toBe(resolveViewerDbPath(cwd));
+		expect(posts[0]?.identity_target).toEqual(buildViewerIdentityTarget(process.env, cwd));
+		for (const key of IDENTITY_KEYS) {
+			expect(posts[0]?.identity_target).toHaveProperty(key);
+		}
+	});
+
+	it("goes straight to CLI on a viewer target-conflict 409 without retrying HTTP", async () => {
+		const cwd = "/tmp/pi-ext-mismatch";
+		vi.stubEnv("CODEMEM_DB", "/tmp/other.sqlite");
+		const posts: Array<Record<string, unknown>> = [];
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+				const url = String(input);
+				if (url.includes("/api/raw-events/status")) {
+					return jsonOk({ ingest: { available: true } });
+				}
+				if (url.includes("/api/pi-hooks")) {
+					posts.push(JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>);
+					return jsonErr(409, { error: { code: "viewer_db_mismatch" } });
+				}
+				return jsonErr(404, {});
+			}),
+		);
+		const client = new PiCodememClient(onlineConfig, createViewerRuntime(), {
+			cwd,
+			execImpl: async () => ({
+				stdout: JSON.stringify({ inserted: 1, skipped: 0 }),
+				stderr: "",
+			}),
+		});
+
+		const result = await client.ingest({ piEvent: "session_start", sessionId: "s1" });
+
+		expect(result).toMatchObject({ ok: true, via: "cli", inserted: 1 });
+		expect(posts).toHaveLength(1);
+		expect(posts[0]?.db_path).toBe(resolveViewerDbPath(cwd));
+		expect(posts[0]?.identity_target).toEqual(buildViewerIdentityTarget(process.env, cwd));
+	});
+});
+
+describe("HTTP pack identity proof", () => {
+	afterEach(() => {
+		vi.unstubAllGlobals();
+		vi.unstubAllEnvs();
+	});
+
+	it("proves GET /api/prompt-pack-profile then POSTs /api/pack with db_path + identity_target", async () => {
+		const cwd = "/tmp/pi-ext-pack";
+		vi.stubEnv("CODEMEM_DB", "/tmp/pi-ext-pack.sqlite");
+		const dbPath = resolveViewerDbPath(cwd);
+		const identity = buildViewerIdentityTarget(process.env, cwd);
+		const requests: Array<{ path: string; method: string; redirect?: string; body: unknown }> = [];
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+				const url = new URL(String(input));
+				const body = init?.body ? (JSON.parse(String(init.body)) as Record<string, unknown>) : null;
+				requests.push({
+					path: url.pathname,
+					method: (init?.method ?? "GET").toUpperCase(),
+					redirect: init?.redirect,
+					body,
+				});
+				if (url.pathname === "/api/raw-events/status") {
+					return jsonOk({ ingest: { available: true } });
+				}
+				if (url.pathname === "/api/prompt-pack-profile") {
+					return jsonOk({
+						service: "codemem-viewer",
+						protocol_version: 1,
+						min_supported_protocol_version: 1,
+						db_path: dbPath,
+						identity_target: identity,
+					});
+				}
+				if (url.pathname === "/api/pack") {
+					return jsonOk({ pack_text: "viewer pack body", items: [], metrics: {} });
+				}
+				return jsonErr(404, {});
+			}),
+		);
+		const client = new PiCodememClient(onlineConfig, createViewerRuntime(), {
+			cwd,
+			project: "codemem",
+			execImpl: async () => {
+				throw new Error("CLI should not run");
+			},
+		});
+
+		const result = await client.fetchPackText("fix auth callback");
+
+		expect(result).toEqual({ text: "viewer pack body", preformatted: false });
+		const packRequests = requests.filter(
+			(r) => r.path === "/api/prompt-pack-profile" || r.path === "/api/pack",
+		);
+		expect(packRequests.map((r) => r.path)).toEqual(["/api/prompt-pack-profile", "/api/pack"]);
+		expect(packRequests[0]?.method).toBe("GET");
+		expect(packRequests[0]?.redirect).toBe("manual");
+		expect(packRequests[1]?.method).toBe("POST");
+		expect(packRequests[1]?.body).toMatchObject({
+			context: "fix auth callback",
+			limit: onlineConfig.injectLimit,
+			token_budget: onlineConfig.injectTokenBudget,
+			project: "codemem",
+			db_path: dbPath,
+			identity_target: identity,
+		});
+	});
+
+	it("falls back to CLI when the viewer proves a different target", async () => {
+		const cwd = "/tmp/pi-ext-pack-mismatch";
+		vi.stubEnv("CODEMEM_DB", "/tmp/wanted.sqlite");
+		const packPosts: string[] = [];
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+				const url = new URL(String(input));
+				if (url.pathname === "/api/raw-events/status") {
+					return jsonOk({ ingest: { available: true } });
+				}
+				if (url.pathname === "/api/prompt-pack-profile") {
+					return jsonOk({
+						service: "codemem-viewer",
+						protocol_version: 1,
+						min_supported_protocol_version: 1,
+						db_path: "/tmp/someone-else.sqlite",
+						identity_target: buildViewerIdentityTarget(process.env, cwd),
+					});
+				}
+				if (url.pathname === "/api/pack") {
+					packPosts.push((init?.method ?? "GET").toUpperCase());
+					return jsonOk({ pack_text: "wrong viewer memories" });
+				}
+				return jsonErr(404, {});
+			}),
+		);
+		const client = new PiCodememClient(onlineConfig, createViewerRuntime(), {
+			cwd,
+			execImpl: async (args) =>
+				args[0] === "pi-hook-inject"
+					? { stdout: "## codemem memories\n\nlocal fallback", stderr: "" }
+					: { stdout: "", stderr: "" },
+		});
+
+		const result = await client.fetchPackText("continue work");
+
+		expect(result.preformatted).toBe(true);
+		expect(result.text).toContain("local fallback");
+		expect(result.text).not.toContain("wrong viewer memories");
+		expect(packPosts).toHaveLength(0);
+	});
+});
+
+describe("viewerEnabled HTTP gate", () => {
+	afterEach(() => {
+		vi.unstubAllGlobals();
+	});
+
+	it("ingest does zero fetch when viewerEnabled is false", async () => {
+		const fetchMock = vi.fn(async () => jsonOk({ inserted: 1, skipped: 0 }));
+		vi.stubGlobal("fetch", fetchMock);
+		const client = new PiCodememClient(offlineConfig, createViewerRuntime(), {
+			execImpl: async () => ({
+				stdout: JSON.stringify({ inserted: 1, skipped: 0 }),
+				stderr: "",
+			}),
+		});
+
+		const result = await client.ingest({ piEvent: "session_start", sessionId: "s1" });
+
+		expect(fetchMock).not.toHaveBeenCalled();
+		expect(result).toMatchObject({ ok: true, via: "cli", inserted: 1 });
+	});
+
+	it("checkIngestAvailable does zero fetch when viewerEnabled is false", async () => {
+		const fetchMock = vi.fn(async () => jsonOk({ ingest: { available: true } }));
+		vi.stubGlobal("fetch", fetchMock);
+
+		const available = await checkIngestAvailable(offlineConfig, createViewerRuntime());
+
+		expect(fetchMock).not.toHaveBeenCalled();
+		expect(available).toBe(false);
+	});
+});
+
+describe("execCodemem abort listener", () => {
+	afterEach(() => {
+		execFileMock.mockReset();
+	});
+
+	it("aborting after successful execs does not fire leftover listeners", async () => {
+		const kills: string[] = [];
+		execFileMock.mockImplementation((_file, _args, _opts, cb) => {
+			const child = {
+				kill: (sig?: NodeJS.Signals) => {
+					kills.push(String(sig ?? "kill"));
+				},
+				stdin: { write: () => true, end: () => undefined },
+			};
+			queueMicrotask(() => {
+				if (typeof cb === "function") cb(null, "ok", "");
+			});
+			return child;
+		});
+
+		const client = new PiCodememClient(offlineConfig, createViewerRuntime(), {});
+		const ac = new AbortController();
+		await client.execCodemem(["--version"], { signal: ac.signal });
+		await client.execCodemem(["--version"], { signal: ac.signal });
+		await client.execCodemem(["--version"], { signal: ac.signal });
+		ac.abort();
+
+		expect(kills).toEqual([]);
 	});
 });
