@@ -25,24 +25,87 @@ import {
 	hasCodexHookSpooledEntries,
 	recoverStaleCodexHookTmpSpool,
 	spoolCodexHookPayload,
+	spoolCodexHookPayloadWithReceipt,
 	withCodexHookIngestLock,
 } from "./codex-hook-ingest-spool.js";
-import { rawEventTarget } from "./raw-event-target.js";
+import { isViewerTargetConflict, rawEventTarget } from "./raw-event-target.js";
 
-type IngestVia = "http" | "direct" | "spool" | "spool_lock_busy";
+type IngestVia = "http" | "spool";
 type IngestResult = { inserted: number; skipped: number; via: IngestVia };
 type IngestOpts = { host: string; port: string | number } & DbOpts;
 
 type IngestDeps = {
 	httpIngest?: typeof tryHttpIngest;
-	directIngest?: typeof directEnqueueCodexHook;
 	resolveDb?: typeof resolveDbPath;
 };
 type HttpIngestResult = {
 	ok: boolean;
 	inserted: number;
 	skipped: number;
+	queued?: number;
+	targetMismatch?: boolean;
+	cause?: "timeout" | "connection" | "http_status" | "malformed_response" | "invalid_target";
+	status?: number;
+	elapsedMs?: number;
 };
+
+function elapsedSince(startedAt: number): number {
+	return Math.max(0, Date.now() - startedAt);
+}
+
+function transportCause(error: unknown): "timeout" | "connection" {
+	const diagnostic = error instanceof Error ? `${error.name} ${error.message}` : String(error);
+	return /AbortError|TimeoutError|timeout|timed out|ETIMEDOUT/i.test(diagnostic)
+		? "timeout"
+		: "connection";
+}
+
+function logHttpFailure(result: HttpIngestResult): void {
+	const fields = [
+		"codemem codex-hook-ingest HTTP failed",
+		`cause=${result.targetMismatch ? "target_mismatch" : (result.cause ?? "unknown")}`,
+		`elapsed_ms=${result.elapsedMs ?? 0}`,
+	];
+	if (result.status != null) fields.push(`status=${result.status}`);
+	logHookEvent(fields.join(" "));
+}
+
+function malformedHttpResult(startedAt: number): HttpIngestResult {
+	return {
+		ok: false,
+		inserted: 0,
+		skipped: 0,
+		cause: "malformed_response",
+		elapsedMs: elapsedSince(startedAt),
+	};
+}
+
+function acceptedHttpResult(body: unknown, startedAt: number): HttpIngestResult {
+	if (body == null || typeof body !== "object" || Array.isArray(body)) {
+		logHookEvent("codemem codex-hook-ingest HTTP accepted with invalid response type");
+		return malformedHttpResult(startedAt);
+	}
+	const result = body as Record<string, unknown>;
+	if (typeof result.accepted === "number" && typeof result.queued === "number") {
+		return {
+			ok: true,
+			inserted: 0,
+			skipped: 0,
+			queued: result.queued,
+			elapsedMs: elapsedSince(startedAt),
+		};
+	}
+	if (typeof result.inserted === "number" && typeof result.skipped === "number") {
+		return {
+			ok: true,
+			inserted: result.inserted,
+			skipped: result.skipped,
+			elapsedMs: elapsedSince(startedAt),
+		};
+	}
+	logHookEvent("codemem codex-hook-ingest HTTP accepted with unexpected response body");
+	return malformedHttpResult(startedAt);
+}
 
 // Codex hooks run under a tight wrapper budget (see plugins/codex/scripts/
 // ingest-hook.mjs, which kills the CLI after ~2s), so the HTTP enqueue attempt
@@ -118,10 +181,13 @@ export async function tryHttpIngest(
 	port: number,
 ): Promise<HttpIngestResult> {
 	const baseUrl = codexViewerBaseUrl(host, port);
-	if (!baseUrl) return { ok: false, inserted: 0, skipped: 0 };
+	if (!baseUrl) {
+		return { ok: false, inserted: 0, skipped: 0, cause: "invalid_target", elapsedMs: 0 };
+	}
 	const url = `${baseUrl}/api/codex-hooks`;
 	const controller = new AbortController();
 	const timeout = setTimeout(() => controller.abort(), httpTimeoutMs());
+	const startedAt = Date.now();
 	try {
 		const res = await fetch(url, {
 			method: "POST",
@@ -131,23 +197,34 @@ export async function tryHttpIngest(
 			signal: controller.signal,
 		});
 		if (!res.ok) {
-			await res.json().catch(() => null);
-			return { ok: false, inserted: 0, skipped: 0 };
+			const body = await res.json().catch(() => null);
+			return {
+				ok: false,
+				inserted: 0,
+				skipped: 0,
+				targetMismatch: isViewerTargetConflict(res.status, body),
+				cause: "http_status",
+				status: res.status,
+				elapsedMs: elapsedSince(startedAt),
+			};
 		}
 
-		const body = (await res.json()) as unknown;
-		if (body == null || typeof body !== "object" || Array.isArray(body)) {
-			logHookEvent("codemem codex-hook-ingest HTTP accepted with invalid response type");
-			return { ok: false, inserted: 0, skipped: 0 };
+		let body: unknown;
+		try {
+			body = await res.json();
+		} catch {
+			logHookEvent("codemem codex-hook-ingest HTTP accepted with invalid response body");
+			return malformedHttpResult(startedAt);
 		}
-		const obj = body as Record<string, unknown>;
-		if (typeof obj.inserted !== "number" || typeof obj.skipped !== "number") {
-			logHookEvent("codemem codex-hook-ingest HTTP accepted with unexpected response body");
-			return { ok: false, inserted: 0, skipped: 0 };
-		}
-		return { ok: true, inserted: obj.inserted, skipped: obj.skipped };
-	} catch {
-		return { ok: false, inserted: 0, skipped: 0 };
+		return acceptedHttpResult(body, startedAt);
+	} catch (error) {
+		return {
+			ok: false,
+			inserted: 0,
+			skipped: 0,
+			cause: transportCause(error),
+			elapsedMs: elapsedSince(startedAt),
+		};
 	} finally {
 		clearTimeout(timeout);
 	}
@@ -175,13 +252,20 @@ export function directEnqueueCodexHook(
 	}
 }
 
+function spoolCurrentCodexPayload(payload: Record<string, unknown>): string {
+	const receipt = spoolCodexHookPayloadWithReceipt(payload);
+	if (receipt === null) {
+		throw new Error("codex-hook-ingest: failed to spool current payload before backlog recovery");
+	}
+	return receipt;
+}
+
 export async function ingestCodexHookPayload(
 	payload: Record<string, unknown>,
 	opts: IngestOpts,
 	deps: IngestDeps = {},
 ): Promise<IngestResult> {
 	const httpIngest = deps.httpIngest ?? tryHttpIngest;
-	const directIngest = deps.directIngest ?? directEnqueueCodexHook;
 	const resolveDb = deps.resolveDb ?? resolveDbPath;
 	const port = typeof opts.port === "number" ? opts.port : Number.parseInt(opts.port, 10);
 	const ingestPayload = normalizePayloadForIngest(payload);
@@ -194,91 +278,64 @@ export async function ingestCodexHookPayload(
 		...queuedPayload,
 		...rawEventTarget(getDbPath()),
 	});
-	const tryDirectFallback = (queuedPayload: Record<string, unknown>): boolean => {
-		try {
-			directIngest(queuedPayload, getDbPath());
-			return true;
-		} catch (err) {
-			logHookEvent(
-				`codemem codex-hook-ingest direct fallback failed: ${err instanceof Error ? err.message : String(err)}`,
-			);
-			return false;
-		}
-	};
-	const drainBacklogIfPresent = async (): Promise<void> => {
-		if (!hasCodexHookSpooledEntries()) return;
+	const drainBacklogIfPresent = async (): Promise<{
+		drained: boolean;
+		lastResult: HttpIngestResult | null;
+	}> => {
+		const startedAt = Date.now();
+		let lastResult: HttpIngestResult | null = null;
 		try {
 			await withCodexHookIngestLock(async () => {
 				recoverStaleCodexHookTmpSpool(codexHookLockTtlSeconds());
 				await drainCodexHookSpool(async (queuedPayload) => {
-					const queuedHttp = await httpIngest(httpPayload(queuedPayload), opts.host, port);
-					return queuedHttp.ok || tryDirectFallback(queuedPayload);
+					lastResult = await httpIngest(httpPayload(queuedPayload), opts.host, port);
+					if (!lastResult.ok) logHttpFailure(lastResult);
+					return lastResult.ok;
 				});
 			});
+			logHookEvent(`codemem codex-hook-ingest spool drain elapsed_ms=${elapsedSince(startedAt)}`);
+			return { drained: !hasCodexHookSpooledEntries(), lastResult };
 		} catch (err) {
-			if (err instanceof CodexHookLockBusyError) return;
+			if (err instanceof CodexHookLockBusyError) {
+				logHookEvent(
+					`codemem codex-hook-ingest spool drain deferred cause=lock_busy elapsed_ms=${elapsedSince(startedAt)}`,
+				);
+				return { drained: false, lastResult };
+			}
 			logHookEvent(
-				`codemem codex-hook-ingest backlog drain failed: ${err instanceof Error ? err.message : String(err)}`,
+				`codemem codex-hook-ingest backlog drain failed cause=${err instanceof Error ? err.name : "unknown"} elapsed_ms=${elapsedSince(startedAt)}`,
 			);
+			return { drained: false, lastResult };
 		}
 	};
 
+	if (hasCodexHookSpooledEntries()) {
+		spoolCurrentCodexPayload(ingestPayload);
+		const recovery = await drainBacklogIfPresent();
+		if (recovery.drained && recovery.lastResult?.ok) {
+			return {
+				inserted: recovery.lastResult.inserted,
+				skipped: recovery.lastResult.skipped,
+				via: "http",
+			};
+		}
+		return { inserted: 0, skipped: 0, via: "spool" };
+	}
+
 	const httpResult = await httpIngest(httpPayload(ingestPayload), opts.host, port);
 	if (httpResult.ok) {
-		await drainBacklogIfPresent();
 		return { inserted: httpResult.inserted, skipped: httpResult.skipped, via: "http" };
 	}
-
-	try {
-		return await withCodexHookIngestLock(async () => {
-			recoverStaleCodexHookTmpSpool(codexHookLockTtlSeconds());
-
-			// Make the current payload durable first so a slow backlog drain
-			// can never strand the live event under the hook timeout budget.
-			let currentResult: IngestResult;
-			try {
-				const result = directIngest(ingestPayload, getDbPath());
-				currentResult = { ...result, via: "direct" as const };
-			} catch (err) {
-				logHookEvent(
-					`codemem codex-hook-ingest direct fallback failed: ${err instanceof Error ? err.message : String(err)}`,
-				);
-				if (!spoolCodexHookPayload(ingestPayload)) {
-					throw new Error("codex-hook-ingest: fallback and spool both failed");
-				}
-				currentResult = { inserted: 0, skipped: 0, via: "spool" as const };
-			}
-
-			// Now drain any previously spooled payloads under the lock. Use the
-			// local direct path only: the live HTTP attempt just failed, so a
-			// downed viewer must not consume the hook budget on repeated HTTP
-			// timeouts. The HTTP-success path drains via HTTP when the viewer is
-			// reachable again.
-			await drainCodexHookSpool((queuedPayload) => tryDirectFallback(queuedPayload));
-
-			return currentResult;
-		});
-	} catch (err) {
-		if (!(err instanceof CodexHookLockBusyError)) throw err;
-		logHookEvent("codemem codex-hook-ingest lock busy; trying unlocked fallback");
-		try {
-			const result = directIngest(ingestPayload, getDbPath());
-			return { ...result, via: "direct" };
-		} catch (directErr) {
-			logHookEvent(
-				`codemem codex-hook-ingest unlocked direct fallback failed: ${directErr instanceof Error ? directErr.message : String(directErr)}`,
-			);
-		}
-		if (spoolCodexHookPayload(ingestPayload)) {
-			return { inserted: 0, skipped: 0, via: "spool_lock_busy" };
-		}
-		throw err;
+	logHttpFailure(httpResult);
+	if (spoolCodexHookPayload(ingestPayload)) {
+		return { inserted: 0, skipped: 0, via: "spool" };
 	}
+	throw new Error("codex-hook-ingest: HTTP and spool failed");
 }
 
 const codexHookCmd = new Command("codex-hook-ingest")
 	.configureHelp(helpStyle)
-	.description("Ingest Codex hook payload: HTTP first, direct DB fallback");
+	.description("Ingest Codex hook payload: durable HTTP queue with local spool fallback");
 
 addDbOption(codexHookCmd);
 addViewerHostOptions(codexHookCmd);
