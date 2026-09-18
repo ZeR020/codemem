@@ -61,13 +61,14 @@ function createMockCtx(
 	};
 }
 
+function resetPiExtensionTest() {
+	__setTestExecImpl(null);
+	vi.unstubAllGlobals();
+	vi.unstubAllEnvs();
+	vi.restoreAllMocks();
+}
 describe("extension factory lifecycle", () => {
-	afterEach(() => {
-		__setTestExecImpl(null);
-		vi.unstubAllGlobals();
-		vi.unstubAllEnvs();
-		vi.restoreAllMocks();
-	});
+	afterEach(resetPiExtensionTest);
 
 	it("registers session + agent + tool handlers without starting daemons", () => {
 		const { pi, handlers } = createMockPi();
@@ -133,6 +134,10 @@ describe("extension factory lifecycle", () => {
 			expect(result).not.toHaveProperty("compaction");
 		}
 	});
+});
+
+describe("session_before_compact HTTP bypass", () => {
+	afterEach(resetPiExtensionTest);
 
 	it("session_before_compact bypasses HTTP and calls CLI pi-hook-ingest; returns undefined", async () => {
 		const execCalls: Array<{ args: string[]; stdin?: string }> = [];
@@ -205,6 +210,10 @@ describe("extension factory lifecycle", () => {
 		).length;
 		expect(piHooksAfter).toBe(piHooksBefore);
 	});
+});
+
+describe("session_before_compact distinct flushes", () => {
+	afterEach(resetPiExtensionTest);
 
 	it("two session_before_compact firings both send distinct CLI flushes", async () => {
 		const compactPayloads: Array<Record<string, unknown>> = [];
@@ -247,6 +256,10 @@ describe("extension factory lifecycle", () => {
 			expect(keys.some((k) => k.includes("session_before_compact"))).toBe(false);
 		}
 	});
+});
+
+describe("failed ingest retry", () => {
+	afterEach(resetPiExtensionTest);
 
 	it("failed ingest leaves event unseen so a retry is attempted", async () => {
 		const execState = { fail: true, messageEndCalls: 0 };
@@ -311,6 +324,10 @@ describe("extension factory lifecycle", () => {
 		await handlers.get("message_end")?.[0]?.(msgEvent, ctx);
 		expect(execState.messageEndCalls).toBe(2);
 	});
+});
+
+describe("message_end stable hash", () => {
+	afterEach(resetPiExtensionTest);
 
 	it("message_end entryId is a stable hash — never wall-clock, random, or leaf id", async () => {
 		const entryIds: string[] = [];
@@ -362,6 +379,10 @@ describe("extension factory lifecycle", () => {
 		expect(entryIds[0]).not.toMatch(/user-\d{10,}/);
 		expect(entryIds[0]).not.toMatch(/[0-9]+-[a-z0-9]{4,}$/);
 	});
+});
+
+describe("message_end ignores leaf", () => {
+	afterEach(resetPiExtensionTest);
 
 	it("message_end never adopts getLeafEntry (codemem.cursor leaf is poisonous)", async () => {
 		const entryIds: string[] = [];
@@ -411,6 +432,10 @@ describe("extension factory lifecycle", () => {
 			stableMessageEntryId("sess-leaf-poison", "user", "ignore the leaf", ts),
 		);
 	});
+});
+
+describe("message_end timestamp dedupe", () => {
+	afterEach(resetPiExtensionTest);
 
 	it("two identical user turns with distinct timestamps both ingest; same-timestamp retry dedupes", async () => {
 		const messageEndPayloads: Array<{ entryId?: string; text?: string }> = [];
@@ -502,6 +527,10 @@ describe("extension factory lifecycle", () => {
 		// exact prior seq id still dedupes if the caller reconstructs the same entryId
 		// via a second fire with the same timestamp path only.
 	});
+});
+
+describe("tool_call identity", () => {
+	afterEach(resetPiExtensionTest);
 
 	it("tool_call / tool_result identity keys on toolCallId (untouched by message_end redesign)", async () => {
 		const toolPayloads: Array<{ piEvent?: string; toolCallId?: string; entryId?: string }> = [];
@@ -586,12 +615,7 @@ describe("extension factory lifecycle", () => {
 });
 
 describe("injection (before_agent_start)", () => {
-	afterEach(() => {
-		__setTestExecImpl(null);
-		vi.unstubAllGlobals();
-		vi.restoreAllMocks();
-		vi.unstubAllEnvs();
-	});
+	afterEach(resetPiExtensionTest);
 
 	it("appends only systemPrompt (never message) on successful pack", async () => {
 		vi.stubEnv("CODEMEM_PI_INJECT_PROMPTS", "1");
@@ -688,6 +712,10 @@ describe("injection (before_agent_start)", () => {
 		expect(block).not.toMatch(/"customType"/);
 		expect(typeof block).toBe("string");
 	});
+});
+
+describe("injection hostile framing", () => {
+	afterEach(resetPiExtensionTest);
 
 	it("still frames pack text containing the memories header when preformatted is false", async () => {
 		vi.stubEnv("CODEMEM_PI_INJECT_PROMPTS", "1");
@@ -743,6 +771,10 @@ describe("injection (before_agent_start)", () => {
 			`base\n\n${formatPiInjectionBlock(hostile, cfg.injectMaxChars)}`,
 		);
 	});
+});
+
+describe("file-context pack budget", () => {
+	afterEach(resetPiExtensionTest);
 
 	it("file-context exec uses the pack/inject budget instead of a 3s probe", async () => {
 		const timeouts: number[] = [];
