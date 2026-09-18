@@ -1,7 +1,7 @@
 import { mkdtempSync, readdirSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ingestRawEvents, MemoryStore } from "@codemem/core";
+import { ingestRawEvents, MemoryStore, type RawEventSweeper } from "@codemem/core";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createApp } from "./index.js";
 import {
@@ -12,6 +12,11 @@ import {
 import { currentIdentityTarget } from "./routes/target-validation.js";
 
 const cleanupDirectories: string[] = [];
+const PI_BOUNDARY = {
+	source: "pi",
+	streamId: "session-pi-boundary",
+	id: "2026-09-18T12:00:00.000000Z",
+};
 
 function testDirectory(): string {
 	const directory = mkdtempSync(join(tmpdir(), "codemem-raw-event-inbox-"));
@@ -59,7 +64,11 @@ describe("FileRawEventInbox", () => {
 	});
 
 	it("deduplicates identical queued requests", async () => {
-		const processEntry = vi.fn().mockResolvedValue(undefined);
+		let releaseProcessing: (() => void) | undefined;
+		const processingBlocked = new Promise<void>((resolve) => {
+			releaseProcessing = resolve;
+		});
+		const processEntry = vi.fn(async () => await processingBlocked);
 		const inbox = new FileRawEventInbox({
 			directory: testDirectory(),
 			processEntry,
@@ -68,8 +77,10 @@ describe("FileRawEventInbox", () => {
 
 		await inbox.enqueue(request);
 		await inbox.enqueue(request);
-		await vi.waitFor(() => expect(processEntry).toHaveBeenCalledOnce());
+		expect((await inbox.status()).pending).toBe(1);
+		releaseProcessing?.();
 		await vi.waitFor(async () => expect((await inbox.status()).pending).toBe(0));
+		expect(processEntry).toHaveBeenCalledOnce();
 		await inbox.stop();
 	});
 
@@ -143,6 +154,32 @@ describe("FileRawEventInbox", () => {
 			reason: { code: RAW_EVENT_INBOX_FULL_CODE },
 		});
 		expect((await inbox.status()).pending).toBe(1);
+		await inbox.stop();
+	});
+});
+
+describe("FileRawEventInbox boundary identity", () => {
+	it("keeps repeated boundaries distinct when their identities differ", async () => {
+		let releaseProcessing: (() => void) | undefined;
+		const processingBlocked = new Promise<void>((resolve) => {
+			releaseProcessing = resolve;
+		});
+		const inbox = new FileRawEventInbox({
+			directory: testDirectory(),
+			processEntry: async () => await processingBlocked,
+		});
+		const request = { source: "pi", session_stream_id: "session-repeat", events: [] };
+
+		await inbox.enqueue(request, {
+			boundary: { source: "pi", streamId: "session-repeat", id: "2026-09-18T12:00:00.000Z" },
+		});
+		await inbox.enqueue(request, {
+			boundary: { source: "pi", streamId: "session-repeat", id: "2026-09-18T12:01:00.000Z" },
+		});
+
+		expect((await inbox.status()).pending).toBe(2);
+		releaseProcessing?.();
+		await vi.waitFor(async () => expect((await inbox.status()).pending).toBe(0));
 		await inbox.stop();
 	});
 });
@@ -223,6 +260,62 @@ describe("queue-first raw-event routes", () => {
 		expect(response.status).toBe(202);
 		expect(inbox.enqueue).toHaveBeenCalledWith(expect.any(Object), { flushBoundary: true });
 	});
+
+	it.each([
+		["session_before_compact", true],
+		["session_shutdown", false],
+	] as const)(
+		"durably queues Pi %s with an ordered boundary directive",
+		async (piEvent, flushOnly) => {
+			const inbox = {
+				enqueue: vi.fn().mockResolvedValue(undefined),
+				start: vi.fn(),
+				status: vi.fn(),
+				stop: vi.fn(),
+			};
+			const storeFactory = vi.fn(() => {
+				throw new Error("queued Pi request must not open SQLite");
+			});
+			const app = createApp({
+				storeFactory,
+				rawEventInbox: inbox,
+				rawEventTarget: { dbPath: "/expected/memory.sqlite", hasCurrentIdentity: () => true },
+			});
+
+			const response = await app.request("/api/pi-hooks", {
+				method: "POST",
+				headers: {
+					"Content-Type": "application/json",
+					Origin: "http://127.0.0.1:38888",
+				},
+				body: JSON.stringify({
+					piEvent,
+					sessionId: "session-pi-boundary",
+					timestamp: "2026-09-18T12:00:00.000Z",
+				}),
+			});
+
+			expect(response.status).toBe(202);
+			expect(await response.json()).toEqual({ accepted: 1, queued: 1 });
+			expect(inbox.enqueue).toHaveBeenCalledWith(
+				flushOnly
+					? expect.objectContaining({
+							source: "pi",
+							session_stream_id: "session-pi-boundary",
+							events: [],
+						})
+					: expect.objectContaining({
+							source: "pi",
+							session_stream_id: "session-pi-boundary",
+						}),
+				{
+					flushBoundary: false,
+					boundary: PI_BOUNDARY,
+				},
+			);
+			expect(storeFactory).not.toHaveBeenCalled();
+		},
+	);
 });
 
 describe("canonical queue route", () => {
@@ -413,6 +506,41 @@ describe("queued raw-event validation", () => {
 		expect(response.status).toBe(400);
 		expect(await response.json()).toEqual({ error: "payload must be an object" });
 		expect(inbox.enqueue).not.toHaveBeenCalled();
+	});
+});
+
+describe("viewer raw-event boundary drain", () => {
+	it("flushes an explicit Pi boundary after earlier queued events", async () => {
+		const root = testDirectory();
+		const actions: string[] = [];
+		const queue = createViewerRawEventInbox({
+			dbPath: join(root, "mem.sqlite"),
+			homeDir: root,
+			sweeper: {
+				nudge: (streamId: string, source: string) => {
+					actions.push(`nudge:${source}:${streamId}`);
+				},
+				flushBoundary: async (streamId: string, source: string) => {
+					actions.push(`flush:${source}:${streamId}`);
+				},
+			} as Partial<RawEventSweeper> as RawEventSweeper,
+		});
+		await queue.inbox.enqueue({
+			source: "pi",
+			session_stream_id: "session-pi-ordered",
+			event_id: "event-pi-ordered",
+			event_type: "pi.hook",
+			payload: { type: "pi.hook" },
+		});
+		await queue.inbox.enqueue(
+			{ source: "pi", session_stream_id: "session-pi-ordered", events: [] },
+			{ boundary: { source: "pi", streamId: "session-pi-ordered" } },
+		);
+		queue.inbox.start();
+
+		await vi.waitFor(async () => expect((await queue.inbox.status()).pending).toBe(0));
+		expect(actions).toEqual(["nudge:pi:session-pi-ordered", "flush:pi:session-pi-ordered"]);
+		await queue.stop();
 	});
 });
 
