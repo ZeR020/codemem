@@ -2,6 +2,7 @@ packages:
   - packages/*
 
 allowBuilds:
+  '@google/genai': false # transitive dev-only dep of pi-coding-agent; never run its build script
   '@opencode/cli': true
   better-sqlite3: false
   esbuild: true
