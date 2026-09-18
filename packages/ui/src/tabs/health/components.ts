@@ -258,7 +258,15 @@ export function renderUpdateBanner(container: HTMLElement | null, status: Update
 	render(status ? h(UpdateBanner, { status }) : null, container);
 }
 
-export function HealthCard({ label, value, detail, icon, className, title }: HealthCardInput) {
+export function HealthCard({
+	label,
+	value,
+	detail,
+	icon,
+	className,
+	title,
+	loading,
+}: HealthCardInput) {
 	const card = h(
 		"div",
 		{
@@ -266,10 +274,15 @@ export function HealthCard({ label, value, detail, icon, className, title }: Hea
 			style: title ? "cursor: help;" : undefined,
 		},
 		icon
-			? h("i", {
-					"data-lucide": icon,
-					class: "stat-icon",
-				})
+			? h(
+					"span",
+					{ class: "health-icon-slot", key: `${icon}-${loading ? "loading" : "static"}` },
+					h("i", {
+						"aria-hidden": "true",
+						"data-lucide": icon,
+						class: `stat-icon${loading ? " health-loading-icon" : ""}`,
+					}),
+				)
 			: null,
 		h(
 			"div",
