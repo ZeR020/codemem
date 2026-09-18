@@ -37,6 +37,7 @@ describe("PiCodememClient.projectFromCwd (git-root walk)", () => {
 		const mainRepo = join(tmpDir, "main-repo");
 		const worktree = join(tmpDir, "feature-worktree");
 		mkdirSync(join(mainRepo, ".git", "worktrees", "feature-worktree"), { recursive: true });
+		writeFileSync(join(mainRepo, ".git", "worktrees", "feature-worktree", "commondir"), "../..\n");
 		mkdirSync(worktree, { recursive: true });
 		writeFileSync(
 			join(worktree, ".git"),
