@@ -38,7 +38,10 @@ type LockConfig = {
 	graceSeconds: number;
 };
 
-export type SpoolHandler = (payload: Record<string, unknown>) => Promise<boolean> | boolean;
+export type SpoolHandler = (
+	payload: Record<string, unknown>,
+	receipt: string,
+) => Promise<boolean> | boolean;
 
 export type SpoolDrainResult = {
 	processed: number;
@@ -96,6 +99,15 @@ function envInt(name: string, fallback: number): number {
 	if (raw === undefined) return fallback;
 	const parsed = Number.parseInt(raw, 10);
 	return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+export function hasHookIngestSpoolReceipt(dir: string, receipt: string): boolean {
+	if (receipt.includes("/") || receipt.includes("\\") || !receipt.endsWith(".json")) return false;
+	try {
+		return statSync(join(dir, receipt)).isFile();
+	} catch {
+		return false;
+	}
 }
 
 export function createHookIngestSpool(cfg: HookIngestSpoolConfig): HookIngestSpool {
@@ -473,7 +485,7 @@ export function createHookIngestSpool(cfg: HookIngestSpoolConfig): HookIngestSpo
 
 			let ok = false;
 			try {
-				ok = await handler(parsed as Record<string, unknown>);
+				ok = await handler(parsed as Record<string, unknown>, name);
 			} catch {
 				ok = false;
 			}
