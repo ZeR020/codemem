@@ -58,6 +58,30 @@ function toolJson(result: { content: Array<{ text: string }>; details: Record<st
 	}
 }
 
+function matchingProfile(cwd: string) {
+	return jsonOk({
+		service: "codemem-viewer",
+		protocol_version: 1,
+		min_supported_protocol_version: 1,
+		db_path: resolveViewerDbPath(cwd),
+		identity_target: buildViewerIdentityTarget(process.env, cwd),
+	});
+}
+
+/** Old pre-target-aware viewer: serves op routes with 2xx, no profile route. */
+function legacyViewerWithoutProfile() {
+	return vi.fn(async (input: RequestInfo | URL) => {
+		const url = new URL(String(input));
+		if (url.pathname === "/api/raw-events/status") {
+			return jsonOk({ ingest: { available: true } });
+		}
+		if (url.pathname.startsWith("/api/memories/")) {
+			return jsonOk({ stale: "viewer", items: [{ id: 1, stale: true }] });
+		}
+		return jsonErr(404, {});
+	});
+}
+
 afterEach(() => {
 	vi.unstubAllGlobals();
 	vi.unstubAllEnvs();
@@ -180,6 +204,9 @@ describe("every operation re-sends db_path and identity_target as query params",
 				if (url.pathname === "/api/raw-events/status") {
 					return jsonOk({ ingest: { available: true } });
 				}
+				if (url.pathname === "/api/prompt-pack-profile") {
+					return matchingProfile(cwd);
+				}
 				if (url.pathname === "/api/memories/remember" || url.pathname === "/api/memories/forget") {
 					seen.push({
 						path: url.pathname,
@@ -288,6 +315,9 @@ describe("does not CLI-replay remember when HTTP commits then the response is lo
 				if (url.pathname === "/api/raw-events/status") {
 					return jsonOk({ ingest: { available: true } });
 				}
+				if (url.pathname === "/api/prompt-pack-profile") {
+					return matchingProfile(process.cwd());
+				}
 				if (url.pathname === "/api/memories/remember") {
 					writes += 1;
 					throw Object.assign(new TypeError("fetch failed"), {
@@ -350,6 +380,39 @@ describe("falls back to CLI remember when the connection is refused before send"
 
 		expect(cliArgs.some((args) => args[0] === "memory" && args[1] === "remember")).toBe(true);
 		expect(toolJson(result)).toEqual({ id: 11 });
+	});
+});
+
+describe("falls back to CLI when an older viewer 2xx's while ignoring the target", () => {
+	it("falls back to CLI when an older viewer 2xx's while ignoring the target", async () => {
+		vi.stubGlobal("fetch", legacyViewerWithoutProfile());
+		const cliArgs: string[][] = [];
+		const client = new PiCodememClient(onlineConfig, createViewerRuntime(), {
+			execImpl: async (args) => {
+				cliArgs.push([...args]);
+				if (args[0] === "search") {
+					return { stdout: JSON.stringify({ items: [{ id: 5, title: "local" }] }), stderr: "" };
+				}
+				if (args[0] === "memory" && args[1] === "remember") {
+					return { stdout: JSON.stringify({ id: 12 }), stderr: "" };
+				}
+				return { stdout: "{}", stderr: "" };
+			},
+		});
+		const tools = installTools(client);
+
+		const search = await tools.memory_search.execute("t1", { query: "release steps" }, undefined);
+		const remember = await tools.memory_remember.execute(
+			"t2",
+			{ kind: "decision", title: "t", body: "b" },
+			undefined,
+		);
+
+		expect(JSON.stringify(toolJson(search))).toContain("local");
+		expect(JSON.stringify(toolJson(search))).not.toContain("stale");
+		expect(cliArgs.some((args) => args[0] === "search")).toBe(true);
+		expect(cliArgs.some((args) => args[0] === "memory" && args[1] === "remember")).toBe(true);
+		expect(toolJson(remember)).toEqual({ id: 12 });
 	});
 });
 

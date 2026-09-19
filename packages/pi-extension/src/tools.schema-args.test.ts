@@ -38,6 +38,16 @@ function jsonErr(status: number, body: unknown) {
 	};
 }
 
+function matchingProfile(cwd: string) {
+	return jsonOk({
+		service: "codemem-viewer",
+		protocol_version: 1,
+		min_supported_protocol_version: 1,
+		db_path: resolveViewerDbPath(cwd),
+		identity_target: buildViewerIdentityTarget(process.env, cwd),
+	});
+}
+
 function installTools(client: PiCodememClient): Record<string, ToolDef> {
 	const defs: ToolDef[] = [];
 	registerMemoryTools({ registerTool: (def: ToolDef) => defs.push(def) } as never, client);
@@ -132,6 +142,9 @@ describe("memory_get and memory_get_observations forward kind+project over HTTP"
 				if (url.pathname === "/api/raw-events/status") {
 					return jsonOk({ ingest: { available: true } });
 				}
+				if (url.pathname === "/api/prompt-pack-profile") {
+					return matchingProfile(cwd);
+				}
 				if (url.pathname === "/api/memories/expand") {
 					bodies.push(JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>);
 					return jsonOk({
@@ -201,6 +214,9 @@ describe("memory_forget HTTP forwards kind+project and does not CLI-delete on no
 				if (url.pathname === "/api/raw-events/status") {
 					return jsonOk({ ingest: { available: true } });
 				}
+				if (url.pathname === "/api/prompt-pack-profile") {
+					return matchingProfile(cwd);
+				}
 				if (url.pathname === "/api/memories/forget") {
 					forgetBody = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
 					return jsonErr(404, { error: "not_found" });
@@ -263,6 +279,9 @@ describe("memory_remember forwards confidence on HTTP and CLI", () => {
 				const url = new URL(String(input));
 				if (url.pathname === "/api/raw-events/status") {
 					return jsonOk({ ingest: { available: true } });
+				}
+				if (url.pathname === "/api/prompt-pack-profile") {
+					return matchingProfile(cwd);
 				}
 				if (url.pathname === "/api/memories/remember") {
 					rememberBody = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;

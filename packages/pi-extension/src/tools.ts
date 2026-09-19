@@ -8,7 +8,13 @@ import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-age
 import { Type } from "typebox";
 import { errorResult, jsonResult, type PiCodememClient, type ToolResultContent } from "./client.js";
 import { MEMORY_LEARN_PAYLOAD } from "./learn.js";
-import { apiUrl, proveAndPostPack, viewerRequestTarget } from "./viewer.js";
+import {
+	apiUrl,
+	profileMatchesViewerTarget,
+	promptPackProfileUrl,
+	proveAndPostPack,
+	viewerRequestTarget,
+} from "./viewer.js";
 
 /** Loose tool def — TypeBox Static inference is intentionally erased at the boundary. */
 type AnyToolDef = ToolDefinition;
@@ -117,6 +123,46 @@ async function readResponseData(res: Response): Promise<unknown> {
 		return JSON.parse(text);
 	} catch {
 		return text;
+	}
+}
+
+/**
+ * Target-aware proof for native-tool HTTP ops: GET /api/prompt-pack-profile
+ * and verify the server reports THIS process's db_path + identity_target.
+ * Older viewers 404 the route or report a different target — without this
+ * proof they would silently serve operations from their own database.
+ */
+async function proveViewerTarget(
+	client: PiCodememClient,
+	target: { db_path: string; identity_target: unknown },
+	signal?: AbortSignal,
+): Promise<boolean> {
+	try {
+		const controller = new AbortController();
+		const onAbort = () => controller.abort();
+		signal?.addEventListener("abort", onAbort, { once: true });
+		const timeout = setTimeout(
+			() => controller.abort(),
+			Math.min(client.config.httpTimeoutMs, 2000),
+		);
+		try {
+			const res = await fetch(promptPackProfileUrl(client.config), {
+				method: "GET",
+				redirect: "manual",
+				signal: controller.signal,
+			});
+			if (!res.ok) return false;
+			return profileMatchesViewerTarget(
+				await readResponseData(res),
+				target.db_path,
+				target.identity_target,
+			);
+		} finally {
+			clearTimeout(timeout);
+			signal?.removeEventListener("abort", onAbort);
+		}
+	} catch {
+		return false;
 	}
 }
 
@@ -247,13 +293,19 @@ async function httpJson(
 ): Promise<HttpJsonResult> {
 	if (!client.config.viewerEnabled)
 		return { ok: false, error: "viewer disabled", safeFallback: true };
+	// A stale older viewer on the port ignores unknown query params and would
+	// serve the operation from its own database with a 2xx. Every native-tool
+	// HTTP op therefore requires a target-aware proof first: GET
+	// /api/prompt-pack-profile and match the server-reported db_path +
+	// identity_target against this process's target. Old viewers 404 the route
+	// or report a different target, so an unproven viewer falls back to CLI.
 	await client.ensureViewer(opts.signal);
+	const target = viewerRequestTarget(client.cwd);
+	if (!(await proveViewerTarget(client, target, opts.signal))) {
+		return { ok: false, error: "viewer target not proven", safeFallback: true };
+	}
 	const url = new URL(apiUrl(client.config, path));
 	applyQuery(url, opts.query);
-	// Re-send the viewer target on every operation: the server validates it
-	// pre-handler (viewerTargetQueryGuard). Extra fields on unknown query keys
-	// are ignored by older viewers (wider than strictly needed — tolerated).
-	const target = viewerRequestTarget(client.cwd);
 	url.searchParams.set("db_path", target.db_path);
 	url.searchParams.set("identity_target", JSON.stringify(target.identity_target));
 	const controller = new AbortController();
