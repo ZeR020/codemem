@@ -35,7 +35,7 @@ import { packTransportRoutes } from "./routes/pack.js";
 import { rawEventsRoutes } from "./routes/raw-events.js";
 import { statsRoutes } from "./routes/stats.js";
 import { type SyncRoutesOptions, syncProtocolRoutes, syncRoutes } from "./routes/sync.js";
-import type { ViewerTargetStore } from "./routes/target-validation.js";
+import { type ViewerTargetStore, viewerTargetQueryGuard } from "./routes/target-validation.js";
 import {
 	type LegacyTeamCompletionDependencies,
 	type LegacyTeamConfiguredGroupSnapshotLoader,
@@ -189,6 +189,13 @@ export function createApp(opts?: AppOptions) {
 	// CORS / origin guard
 	app.use("*", preflightHandler());
 	app.use("*", originGuard({ unsafeGetPathPrefixes: [TEAM_SETUP_ROUTE_PREFIX] }));
+
+	// Optional db_path / identity_target query guard — targeted clients (pi native tools)
+	// re-send the target on every operation so a mismatch rejects before the handler runs.
+	// Clients that omit targets (UI, MCP, curl) are unaffected.
+	const viewerTargetGuard = viewerTargetQueryGuard(storeFactory);
+	app.use("/api/memories/*", viewerTargetGuard);
+	app.use("/api/memory", viewerTargetGuard);
 
 	// API routes
 	app.route("/", healthRoutes(storeFactory));

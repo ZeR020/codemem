@@ -5,6 +5,7 @@ import {
 	resolveDbPath,
 	VIEWER_IDENTITY_TARGET_KEYS,
 } from "@codemem/core";
+import type { Context, Next } from "hono";
 
 const IDENTITY_TARGET_KEYS = new Set<string>(VIEWER_IDENTITY_TARGET_KEYS);
 const BOOLEAN_IDENTITY_TARGET_KEYS = new Set([
@@ -101,4 +102,35 @@ export function validateViewerTarget(
 		return conflict("viewer_identity_mismatch", "viewer identity does not match request");
 	}
 	return { ok: true };
+}
+
+/**
+ * Middleware read of db_path / identity_target from the query string.
+ * Native tools (pi extension) send targets as query params so a pre-handler
+ * guard can reject a foreign viewer without consuming POST bodies. Lenient:
+ * clients that omit targets (UI, MCP, curl) are unaffected.
+ */
+export function viewerTargetQueryGuard(getStore: () => ViewerTargetStore) {
+	return async (c: Context, next: Next) => {
+		const dbPath = c.req.query("db_path");
+		const rawIdentity = c.req.query("identity_target");
+		if (dbPath == null && rawIdentity == null) return next();
+		let identityTarget: unknown;
+		if (rawIdentity != null) {
+			try {
+				identityTarget = JSON.parse(rawIdentity);
+			} catch {
+				return c.json(
+					{ error: { code: "invalid_request", message: "identity_target must be JSON" } },
+					400,
+				);
+			}
+		}
+		const target = validateViewerTarget(getStore(), {
+			db_path: dbPath ?? undefined,
+			identity_target: identityTarget,
+		});
+		if (!target.ok) return c.json(target.body, target.status);
+		return next();
+	};
 }

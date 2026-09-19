@@ -177,6 +177,13 @@ interface RememberMemoryOptions extends DbOpts, JsonOpts {
 	body: string;
 	tags?: string[];
 	project?: string;
+	confidence?: string;
+}
+
+function parseConfidence(value: string | undefined): number {
+	const n = value == null || value.trim() === "" ? 0.5 : Number(value);
+	if (!Number.isFinite(n)) return 0.5;
+	return Math.min(1, Math.max(0, n));
 }
 
 function rollbackManualMemory(store: MemoryStore, sessionId: number, memoryId: number): void {
@@ -215,7 +222,14 @@ async function rememberMemoryAction(opts: RememberMemoryOptions): Promise<void> 
 			toolVersion: "manual",
 			metadata: { manual: true },
 		});
-		const memId = store.remember(sessionId, opts.kind, opts.title, opts.body, 0.5, opts.tags);
+		const memId = store.remember(
+			sessionId,
+			opts.kind,
+			opts.title,
+			opts.body,
+			parseConfidence(opts.confidence),
+			opts.tags,
+		);
 		if (!store.get(memId)) {
 			await store.flushPendingVectorWrites();
 			rollbackManualMemory(store, sessionId, memId);
@@ -279,7 +293,8 @@ function createRememberMemoryCommand(): Command {
 		.requiredOption("-t, --title <title>", "memory title")
 		.requiredOption("-b, --body <body>", "memory body text")
 		.option("--tags <tags...>", "tags (space-separated)")
-		.option("--project <project>", "project name (defaults to git repo root)");
+		.option("--project <project>", "project name (defaults to git repo root)")
+		.option("--confidence <n>", "confidence 0-1", "0.5");
 	addDbOption(cmd);
 	addJsonOption(cmd);
 	cmd.action(rememberMemoryAction);
