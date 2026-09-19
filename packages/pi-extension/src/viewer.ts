@@ -204,6 +204,8 @@ export async function proveAndPostPack(
 		cwd: string;
 		project: string | null;
 		signal: AbortSignal;
+		limit?: number;
+		tokenBudget?: number;
 	},
 ): Promise<string> {
 	if (!config.viewerEnabled) return "";
@@ -226,8 +228,8 @@ export async function proveAndPostPack(
 		headers: { "Content-Type": "application/json" },
 		body: JSON.stringify({
 			context: args.context,
-			limit: config.injectLimit,
-			token_budget: config.injectTokenBudget,
+			limit: args.limit ?? config.injectLimit,
+			token_budget: args.tokenBudget ?? config.injectTokenBudget,
 			...(args.project ? { project: args.project } : {}),
 			...target,
 		}),

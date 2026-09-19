@@ -8,7 +8,7 @@ import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-age
 import { Type } from "typebox";
 import { errorResult, jsonResult, type PiCodememClient, type ToolResultContent } from "./client.js";
 import { MEMORY_LEARN_PAYLOAD } from "./learn.js";
-import { apiUrl } from "./viewer.js";
+import { apiUrl, proveAndPostPack, viewerRequestTarget } from "./viewer.js";
 
 /** Loose tool def — TypeBox Static inference is intentionally erased at the boundary. */
 type AnyToolDef = ToolDefinition;
@@ -71,7 +71,33 @@ async function httpOrCli(
 	return cli();
 }
 
-type HttpJsonResult = { ok: true; status: number; data: unknown } | { ok: false; error: string };
+type HttpJsonResult =
+	| { ok: true; status: number; data: unknown }
+	| { ok: false; error: string; safeFallback: boolean; status?: number };
+
+const SAFE_CONNECT_CODES = new Set([
+	"ECONNREFUSED",
+	"ENOTFOUND",
+	"EAI_AGAIN",
+	"ENETUNREACH",
+	"EHOSTUNREACH",
+]);
+
+function collectErrorTokens(err: unknown): string[] {
+	const tokens: string[] = [];
+	let current: unknown = err;
+	for (let i = 0; i < 6 && current && typeof current === "object"; i++) {
+		const rec = current as { code?: unknown; name?: unknown; cause?: unknown };
+		if (typeof rec.code === "string") tokens.push(rec.code);
+		if (typeof rec.name === "string") tokens.push(rec.name);
+		current = rec.cause;
+	}
+	return tokens;
+}
+
+function isSafeConnectFailure(err: unknown): boolean {
+	return collectErrorTokens(err).some((token) => SAFE_CONNECT_CODES.has(token));
+}
 
 function applyQuery(
 	url: URL,
@@ -108,6 +134,23 @@ function firstList(...candidates: unknown[]): unknown[] {
 		if (Array.isArray(candidate)) return candidate;
 	}
 	return [];
+}
+
+function optionalFilter(value: unknown): string | undefined {
+	return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function cliItemMatchesFilters(
+	item: unknown,
+	kind: string | undefined,
+	project: string | undefined,
+): boolean {
+	if (item == null || typeof item !== "object" || Array.isArray(item)) return false;
+	const row = item as Record<string, unknown>;
+	if (row.error) return false;
+	if (kind && String(row.kind ?? "") !== kind) return false;
+	if (project && String(row.project ?? "") !== project) return false;
+	return true;
 }
 
 async function searchMemoriesHttp(
@@ -202,10 +245,17 @@ async function httpJson(
 		timeoutMs?: number;
 	} = {},
 ): Promise<HttpJsonResult> {
-	if (!client.config.viewerEnabled) return { ok: false, error: "viewer disabled" };
+	if (!client.config.viewerEnabled)
+		return { ok: false, error: "viewer disabled", safeFallback: true };
 	await client.ensureViewer(opts.signal);
 	const url = new URL(apiUrl(client.config, path));
 	applyQuery(url, opts.query);
+	// Re-send the viewer target on every operation: the server validates it
+	// pre-handler (viewerTargetQueryGuard). Extra fields on unknown query keys
+	// are ignored by older viewers (wider than strictly needed — tolerated).
+	const target = viewerRequestTarget(client.cwd);
+	url.searchParams.set("db_path", target.db_path);
+	url.searchParams.set("identity_target", JSON.stringify(target.identity_target));
 	const controller = new AbortController();
 	const onAbort = () => controller.abort();
 	opts.signal?.addEventListener("abort", onAbort, { once: true });
@@ -221,10 +271,21 @@ async function httpJson(
 			signal: controller.signal,
 		});
 		const data = await readResponseData(res);
-		if (!res.ok) return { ok: false, error: httpErrorMessage(data, res) };
+		if (!res.ok) {
+			return {
+				ok: false,
+				error: httpErrorMessage(data, res),
+				safeFallback: res.status >= 400 && res.status < 500,
+				status: res.status,
+			};
+		}
 		return { ok: true, status: res.status, data };
 	} catch (err) {
-		return { ok: false, error: err instanceof Error ? err.message : String(err) };
+		return {
+			ok: false,
+			error: err instanceof Error ? err.message : String(err),
+			safeFallback: isSafeConnectFailure(err),
+		};
 	} finally {
 		clearTimeout(timeout);
 		opts.signal?.removeEventListener("abort", onAbort);
@@ -414,17 +475,27 @@ async function executeMemoryPack(
 			client,
 			signal,
 			async () => {
-				const res = await httpJson(client, "GET", "/api/pack", {
-					query: {
+				if (!client.config.viewerEnabled) return null;
+				await client.ensureViewer(signal);
+				const controller = new AbortController();
+				const onAbort = () => controller.abort();
+				signal?.addEventListener("abort", onAbort, { once: true });
+				const timeout = setTimeout(() => controller.abort(), client.config.httpTimeoutMs);
+				try {
+					const text = await proveAndPostPack(client.config, {
 						context,
+						cwd: client.cwd,
+						project: project ?? null,
+						signal: controller.signal,
 						limit: limit ?? 10,
-						token_budget: client.config.injectTokenBudget,
-						project,
-					},
-					signal,
-				});
-				if (!res.ok) return null;
-				return jsonResult(res.data);
+						tokenBudget: client.config.injectTokenBudget,
+					});
+					if (!text) return null;
+					return jsonResult({ pack_text: text });
+				} finally {
+					clearTimeout(timeout);
+					signal?.removeEventListener("abort", onAbort);
+				}
 			},
 			async () => {
 				const args = ["pack", context, "--json"];
@@ -446,6 +517,7 @@ async function executeMemoryGet(
 	return withToolError("memory_get", async () => {
 		const memoryId = Number(params.memory_id);
 		const project = projectOrClient(params as Record<string, unknown>, client);
+		const kind = optionalFilter(params.kind);
 		return httpOrCli(
 			client,
 			signal,
@@ -457,6 +529,7 @@ async function executeMemoryGet(
 						depth_after: 0,
 						include_observations: true,
 						project,
+						kind,
 					},
 					signal,
 				});
@@ -482,6 +555,7 @@ async function executeMemoryGet(
 				) {
 					return errorResult(String((parsed as { message?: string }).message ?? "not_found"));
 				}
+				if (!cliItemMatchesFilters(parsed, kind, project)) return errorResult("not_found");
 				return jsonResult(parsed);
 			},
 		);
@@ -497,6 +571,7 @@ async function executeMemoryGetObservations(
 	return withToolError("memory_get_observations", async () => {
 		const ids = Array.isArray(params.ids) ? params.ids.map(Number) : [];
 		const project = projectOrClient(params as Record<string, unknown>, client);
+		const kind = optionalFilter(params.kind);
 		return httpOrCli(
 			client,
 			signal,
@@ -508,6 +583,7 @@ async function executeMemoryGetObservations(
 						depth_after: 0,
 						include_observations: true,
 						project,
+						kind,
 					},
 					signal,
 				});
@@ -523,13 +599,7 @@ async function executeMemoryGetObservations(
 							signal,
 						});
 						const parsed = parseCliJson(stdout);
-						if (
-							parsed != null &&
-							typeof parsed === "object" &&
-							!(parsed as { error?: string }).error
-						) {
-							items.push(parsed);
-						}
+						if (cliItemMatchesFilters(parsed, kind, project)) items.push(parsed);
 					} catch {
 						// skip missing
 					}
@@ -563,8 +633,9 @@ async function executeMemoryRemember(
 					body,
 					signal,
 				});
-				if (!res.ok) return null;
-				return jsonResult(res.data);
+				if (res.ok) return jsonResult(res.data);
+				if (!res.safeFallback) return errorResult(res.error);
+				return null;
 			},
 			async () => {
 				const args = [
@@ -579,6 +650,7 @@ async function executeMemoryRemember(
 					"--json",
 				];
 				if (project) args.push("--project", project);
+				if (params.confidence != null) args.push("--confidence", String(params.confidence));
 				const { stdout } = await client.execCodemem(args, { signal });
 				return jsonResult(parseCliJson(stdout) ?? { status: "ok" });
 			},
@@ -594,23 +666,33 @@ async function executeMemoryForget(
 	const params = paramsOf(rawParams);
 	return withToolError("memory_forget", async () => {
 		const memoryId = Number(params.memory_id);
+		const kind = optionalFilter(params.kind);
+		const project = optionalFilter(params.project);
 		return httpOrCli(
 			client,
 			signal,
 			async () => {
 				const res = await httpJson(client, "POST", "/api/memories/forget", {
-					body: { memory_id: memoryId },
+					body: { memory_id: memoryId, kind, project },
 					signal,
 				});
-				if (!res.ok) return null;
-				return jsonResult(res.data);
+				if (res.ok) return jsonResult(res.data);
+				if (res.status === 404) return errorResult("not_found");
+				if (!res.safeFallback) return errorResult(res.error);
+				return null;
 			},
 			async () => {
 				const { stdout } = await client.execCodemem(
+					["memory", "show", String(memoryId), "--json"],
+					{ signal },
+				);
+				const parsed = parseCliJson(stdout);
+				if (!cliItemMatchesFilters(parsed, kind, project)) return errorResult("not_found");
+				const forgotten = await client.execCodemem(
 					["memory", "forget", String(memoryId), "--json"],
 					{ signal },
 				);
-				return jsonResult(parseCliJson(stdout) ?? { status: "ok" });
+				return jsonResult(parseCliJson(forgotten.stdout) ?? { status: "ok" });
 			},
 		);
 	});
@@ -894,7 +976,9 @@ function registerMemoryPack(
 				limit: Type.Optional(
 					Type.Integer({ minimum: 1, maximum: 50, description: "Max items to include" }),
 				),
-				...filterProps,
+				project: Type.Optional(
+					Type.String({ description: "Filter by project scope (matches sessions.project)" }),
+				),
 			}),
 			async execute(_id, rawParams, signal) {
 				return executeMemoryPack(client, rawParams, signal);

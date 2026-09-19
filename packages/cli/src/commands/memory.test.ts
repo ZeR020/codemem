@@ -600,6 +600,69 @@ describe("memory command error boundaries", () => {
 	});
 });
 
+describe("memory remember confidence", () => {
+	it("stores the --confidence flag on manually remembered memories", async () => {
+		const tmpDir = mkdtempSync(join(tmpdir(), "codemem-memory-command-confidence-"));
+		const dbPath = join(tmpDir, "test.sqlite");
+		initDatabase(dbPath);
+		vi.mocked(embeddings.getEmbeddingClient).mockResolvedValue({
+			model: "test-model",
+			dimensions: 384,
+			identity: {
+				package: "@huggingface/transformers",
+				version: "4.2.0",
+				model: "test-model",
+				revision: "0123456789abcdef0123456789abcdef01234567",
+				requestedRevision: "test-revision",
+				dtype: "fp32",
+				device: "cpu",
+				pooling: "mean",
+				normalization: "l2",
+				dimensions: 384,
+			},
+			embed: vi.fn(),
+		});
+		vi.mocked(embeddings.embedTexts).mockResolvedValue([new Float32Array(384)]);
+		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+		const originalExitCode = process.exitCode;
+		process.exitCode = undefined;
+		try {
+			await rememberMemoryCommand.parseAsync(
+				[
+					"--kind",
+					"discovery",
+					"--title",
+					"Manual confidence memory",
+					"--body",
+					"Manual confidence body",
+					"--confidence",
+					"0.9",
+					"--db-path",
+					dbPath,
+					"--json",
+				],
+				{ from: "user" },
+			);
+
+			const output = logSpy.mock.calls.at(-1)?.[0];
+			const parsed = JSON.parse(String(output)) as { id: number };
+			expect(parsed.id).toBeGreaterThan(0);
+
+			const verifyStore = new MemoryStore(dbPath);
+			try {
+				const row = verifyStore.get(parsed.id);
+				expect(row?.confidence).toBe(0.9);
+			} finally {
+				verifyStore.close();
+			}
+		} finally {
+			process.exitCode = originalExitCode;
+			logSpy.mockRestore();
+			rmSync(tmpDir, { recursive: true, force: true });
+		}
+	});
+});
+
 describe("memory command scope safety", () => {
 	it("stores vectors for manually remembered memories", async () => {
 		const tmpDir = mkdtempSync(join(tmpdir(), "codemem-memory-command-vector-"));

@@ -819,8 +819,8 @@ export function memoryRoutes(getStore: StoreFactory) {
 		if (memoryId == null || memoryId <= 0) {
 			return c.json({ error: "memory_id must be int" }, 400);
 		}
-		if (!store.get(memoryId)) {
-			return c.json({ error: "memory not found" }, 404);
+		if (!forgetTargetExists(store, memoryId, forgetSafetyFilters(body))) {
+			return c.json(...forgetNotFound(forgetSafetyFilters(body)));
 		}
 
 		const row = drizzle(store.db, { schema })
@@ -851,4 +851,24 @@ export function memoryRoutes(getStore: StoreFactory) {
 	});
 
 	return app;
+}
+
+function forgetNotFound(filters: MemoryFilters): [body: { error: string }, status: 404] {
+	return [{ error: Object.keys(filters).length > 0 ? "not_found" : "memory not found" }, 404];
+}
+
+function forgetSafetyFilters(body: Record<string, unknown>): MemoryFilters {
+	const filters: MemoryFilters = {};
+	if (typeof body.kind === "string" && body.kind.trim()) filters.kind = body.kind.trim();
+	if (typeof body.project === "string" && body.project.trim()) {
+		filters.project = body.project.trim();
+	}
+	return filters;
+}
+
+function forgetTargetExists(store: MemoryStore, memoryId: number, filters: MemoryFilters): boolean {
+	if (Object.keys(filters).length > 0) {
+		return store.timeline(null, memoryId, 0, 0, filters).some((row) => row.id === memoryId);
+	}
+	return store.get(memoryId) != null;
 }
