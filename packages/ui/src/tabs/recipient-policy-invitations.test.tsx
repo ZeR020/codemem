@@ -139,8 +139,16 @@ const projectShareInspection = {
 };
 
 function button(label: string, root: ParentNode = document): HTMLButtonElement {
+	const landingLabel =
+		root === document
+			? new Map([
+					["Invite Team member", "Invite a teammate"],
+					["Review invitation", "Review an invite"],
+					["Share exact Projects", "Share specific projects"],
+				]).get(label)
+			: undefined;
 	const match = [...root.querySelectorAll<HTMLButtonElement>("button")].find(
-		(item) => item.textContent?.trim() === label,
+		(item) => item.textContent?.trim() === (landingLabel ?? label),
 	);
 	if (!match) throw new Error(`button missing: ${label}`);
 	return match;
@@ -152,18 +160,38 @@ function mount(graph = intent) {
 	act(() => render(<RecipientPolicyInvitations intent={graph} />, element));
 }
 
+beforeEach(() => {
+	document.body.innerHTML = '<div id="mount"></div>';
+});
+
+afterEach(() => {
+	const element = document.getElementById("mount");
+	if (element) act(() => render(null, element));
+	vi.resetAllMocks();
+	document.body.innerHTML = "";
+});
+
 describe("recipient-policy invitations", () => {
-	beforeEach(() => {
-		document.body.innerHTML = '<div id="mount"></div>';
-	});
-
-	afterEach(() => {
+	it("uses the Advanced Sync navigation callback for older invite codes", () => {
 		const element = document.getElementById("mount");
-		if (element) act(() => render(null, element));
-		vi.resetAllMocks();
-		document.body.innerHTML = "";
-	});
+		if (!element) throw new Error("mount missing");
+		const onNavigateAdvancedSync = vi.fn();
+		act(() =>
+			render(
+				<RecipientPolicyInvitations
+					intent={intent}
+					onNavigateAdvancedSync={onNavigateAdvancedSync}
+				/>,
+				element,
+			),
+		);
 
+		act(() => button("Older invite codes →").click());
+
+		expect(onNavigateAdvancedSync).toHaveBeenCalledOnce();
+	});
+});
+describe("recipient-policy invitations", () => {
 	it("previews and creates a Team-member invitation with the exact reviewed request", async () => {
 		vi.mocked(api.previewRecipientInvite).mockResolvedValue({
 			kind: "team_member",
@@ -207,7 +235,8 @@ describe("recipient-policy invitations", () => {
 			reviewed_onboarding_digest: teamPreview.reviewedOnboardingDigest,
 		});
 	});
-
+});
+describe("recipient-policy invitations", () => {
 	it("inspects and accepts add-device access with direct, inherited, and excluded Projects", async () => {
 		vi.mocked(api.inspectCoordinatorInvite).mockResolvedValue({
 			kind: "add_device",
@@ -271,7 +300,8 @@ describe("recipient-policy invitations", () => {
 		await act(async () => Promise.resolve());
 		expect(dialog.querySelector("#recipient-invitation-result")).toBe(result);
 	});
-
+});
+describe("recipient-policy invitations", () => {
 	it("omits the delivery expectation when an add-device invitation shares no Projects", async () => {
 		vi.mocked(api.inspectCoordinatorInvite).mockResolvedValue({
 			kind: "add_device",
@@ -300,7 +330,8 @@ describe("recipient-policy invitations", () => {
 		await vi.waitFor(() => expect(dialog.textContent).toContain("Device added"));
 		expect(dialog.textContent).not.toContain("Existing shared Projects do not sync");
 	});
-
+});
+describe("recipient-policy invitations", () => {
 	it("persists a Team completion, prevents repeat acceptance, and resets after close and reopen", async () => {
 		vi.mocked(api.inspectCoordinatorInvite).mockResolvedValue({
 			kind: "team_member",
@@ -358,7 +389,8 @@ describe("recipient-policy invitations", () => {
 		expect(reopenedDialog.querySelector("#recipient-invitation-result")).toBeNull();
 		expect(button("Review invitation", reopenedDialog).disabled).toBe(false);
 	});
-
+});
+describe("recipient-policy invitations", () => {
 	it("requires a human Identity name before accepting a Team invitation", async () => {
 		vi.mocked(api.inspectCoordinatorInvite).mockResolvedValue({
 			kind: "team_member",
@@ -403,7 +435,8 @@ describe("recipient-policy invitations", () => {
 			"team_member",
 		);
 	});
-
+});
+describe("recipient-policy invitations", () => {
 	it("surfaces restart guidance when Team acceptance enables sync", async () => {
 		vi.mocked(api.inspectCoordinatorInvite).mockResolvedValue({
 			kind: "team_member",
@@ -455,7 +488,8 @@ describe("recipient-policy invitations", () => {
 			button("Done", dialog).closest(".recipient-policy-sharing-responsive-actions"),
 		).not.toBeNull();
 	});
-
+});
+describe("recipient-policy invitations", () => {
 	it("keeps unknown recipient-import errors generic", async () => {
 		vi.mocked(api.inspectCoordinatorInvite).mockResolvedValue({
 			kind: "team_member",
@@ -486,7 +520,8 @@ describe("recipient-policy invitations", () => {
 		);
 		expect(dialog.textContent).not.toContain("recipient_invite_unmapped_internal");
 	});
-
+});
+describe("recipient-policy invitations", () => {
 	it("shows contextual Identity guidance when add-device acceptance conflicts", async () => {
 		vi.mocked(api.inspectCoordinatorInvite).mockResolvedValue({
 			kind: "add_device",
@@ -515,7 +550,8 @@ describe("recipient-policy invitations", () => {
 		);
 		expect(dialog.textContent).not.toContain("invite_identity_conflict");
 	});
-
+});
+describe("recipient-policy invitations", () => {
 	it("reviews and accepts direct exact-Project access in the same dialog without repasting", async () => {
 		vi.mocked(api.inspectCoordinatorInvite).mockResolvedValue(projectShareInspection);
 		vi.mocked(api.importCoordinatorInvite).mockResolvedValue({
@@ -590,7 +626,8 @@ describe("recipient-policy invitations", () => {
 		expect(dialog.textContent).not.toContain("Team invitation accepted");
 		expect(document.querySelector('[role="dialog"]')).toBe(dialog);
 	});
-
+});
+describe("recipient-policy invitations", () => {
 	it("seeds machine-generated identity and device names as empty fields with placeholder hints", async () => {
 		vi.mocked(api.inspectCoordinatorInvite).mockResolvedValue({
 			...projectShareInspection,
@@ -621,7 +658,8 @@ describe("recipient-policy invitations", () => {
 		expect(recipientName.placeholder).toContain("Your name");
 		expect(deviceName.placeholder).toContain("This device");
 	});
-
+});
+describe("recipient-policy invitations", () => {
 	it.each([
 		["empty names", "project-share-recipient-name", "   ", "Identity display name is required"],
 		["machine actor names", "project-share-recipient-name", "actor:peer", "human-readable name"],
@@ -677,7 +715,8 @@ describe("recipient-policy invitations", () => {
 		act(() => accept.click());
 		expect(api.importCoordinatorInvite).not.toHaveBeenCalled();
 	});
-
+});
+describe("recipient-policy invitations", () => {
 	it.each([
 		["missing", undefined],
 		["empty", []],
@@ -710,7 +749,8 @@ describe("recipient-policy invitations", () => {
 			expect(api.importCoordinatorInvite).not.toHaveBeenCalled();
 		},
 	);
-
+});
+describe("recipient-policy invitations", () => {
 	it("retries failed Project inspection with the preserved invite text", async () => {
 		vi.mocked(api.inspectCoordinatorInvite)
 			.mockRejectedValueOnce(new Error("coordinator_unavailable"))
@@ -739,7 +779,8 @@ describe("recipient-policy invitations", () => {
 		expect(api.inspectCoordinatorInvite).toHaveBeenNthCalledWith(2, "preserved-project-invite");
 		expect(api.importCoordinatorInvite).not.toHaveBeenCalled();
 	});
-
+});
+describe("recipient-policy invitations", () => {
 	it("discards a stale Project inspection after the invitation text changes", async () => {
 		let resolveInspection: (
 			value: Awaited<ReturnType<typeof api.inspectCoordinatorInvite>>,
@@ -796,7 +837,8 @@ describe("recipient-policy invitations", () => {
 		expect(button("Accept Project access", dialog).disabled).toBe(false);
 		expect(api.importCoordinatorInvite).not.toHaveBeenCalled();
 	});
-
+});
+describe("recipient-policy invitations", () => {
 	it("shows restart-required Project setup as pending and restores focus after keyboard close", async () => {
 		vi.mocked(api.inspectCoordinatorInvite).mockResolvedValue(projectShareInspection);
 		vi.mocked(api.importCoordinatorInvite).mockResolvedValue({
@@ -833,7 +875,8 @@ describe("recipient-policy invitations", () => {
 		expect(event.defaultPrevented).toBe(true);
 		expect(document.activeElement).toBe(trigger);
 	});
-
+});
+describe("recipient-policy invitations", () => {
 	it("shows add-device restart guidance when the active Identity could not refresh", async () => {
 		vi.mocked(api.inspectCoordinatorInvite).mockResolvedValue({
 			kind: "add_device",
@@ -869,7 +912,8 @@ describe("recipient-policy invitations", () => {
 		expect(dialog.querySelector("#recipient-invitation-result")).toBe(document.activeElement);
 		expect(() => button("Accept invitation", dialog)).toThrow("button missing");
 	});
-
+});
+describe("recipient-policy invitations", () => {
 	it("uses safe fallback result copy after reviewing unavailable optional Project identity names", async () => {
 		vi.mocked(api.inspectCoordinatorInvite).mockResolvedValue({
 			...projectShareInspection,
@@ -919,7 +963,8 @@ describe("recipient-policy invitations", () => {
 		);
 		expect(dialog.textContent).not.toContain("Joined the team");
 	});
-
+});
+describe("recipient-policy invitations", () => {
 	it("keeps the reviewed Project payload available for retry after an acceptance error", async () => {
 		const hostileError =
 			'Backend failure at /Users/private-user/work/secret-client for ssh://git@private.example.test/secret/client.git (identity_opaque_private_52de04) <img src=x onerror="alert(1)">';
@@ -1007,7 +1052,8 @@ describe("recipient-policy invitations", () => {
 		);
 		expect(dialog.textContent).not.toContain(hostileError);
 	});
-
+});
+describe("recipient-policy invitations", () => {
 	it("shows loading, error, and empty states without exposing internal language", async () => {
 		let rejectPreview: (cause: Error) => void = () => undefined;
 		vi.mocked(api.previewRecipientInvite).mockImplementation(
@@ -1067,7 +1113,8 @@ describe("recipient-policy invitations", () => {
 		);
 		expect(dialog.textContent).not.toContain(code);
 	});
-
+});
+describe("recipient-policy invitations", () => {
 	it("uses the shared labelled close-button structure", () => {
 		mount();
 		act(() => button("Review invitation").click());
@@ -1081,7 +1128,8 @@ describe("recipient-policy invitations", () => {
 		expect(closeButton.querySelector(".modal-close-button-label")?.textContent).toBe("Close");
 		expect(closeButton.textContent).not.toContain("×");
 	});
-
+});
+describe("recipient-policy invitations", () => {
 	it("moves focus to the heading and restores it after Radix keyboard close", () => {
 		mount();
 		const trigger = button("Add a device");
@@ -1102,7 +1150,8 @@ describe("recipient-policy invitations", () => {
 		props.onCloseAutoFocus(event);
 		expect(document.activeElement).toBe(trigger);
 	});
-
+});
+describe("recipient-policy invitations", () => {
 	it("keeps direct Project review and legacy import routed to their established journeys", async () => {
 		vi.mocked(api.inspectCoordinatorInvite).mockResolvedValue({ kind: "legacy_team_invite" });
 		mount();

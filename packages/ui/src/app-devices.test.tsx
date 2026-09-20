@@ -958,6 +958,12 @@ describe("Devices app integration", () => {
 	});
 });
 
+type SharingNavigationCallbacks = {
+	onNavigateAdvancedSync?: () => void;
+	onOpenTeamSetup?: (candidateRef: string) => void;
+	onReviewDevices?: (deviceId?: string) => void;
+};
+
 describe("Viewer behavior contracts", () => {
 	beforeEach(setupDevicesAppTest);
 	afterEach(teardownDevicesAppTest);
@@ -967,7 +973,10 @@ describe("Viewer behavior contracts", () => {
 		const { initProjectsTab } = await import("./tabs/projects");
 		const { openLegacyTeamSetup } = await import("./tabs/legacy-team-setup-dialog");
 		const projectOptions = vi.mocked(initProjectsTab).mock.calls[0]?.[1];
-		const sharingOptions = vi.mocked(createRecipientPolicySharingLoader).mock.calls[0]?.[1];
+		const sharingOptions = vi
+			.mocked(createRecipientPolicySharingLoader)
+			.mock.calls.map((call) => call[1] as SharingNavigationCallbacks | undefined)
+			.find((options) => options?.onOpenTeamSetup);
 		expect(projectOptions?.onOpenTeamSetup).toEqual(expect.any(Function));
 		expect(sharingOptions?.onOpenTeamSetup).toEqual(expect.any(Function));
 
@@ -985,6 +994,19 @@ describe("Viewer behavior contracts", () => {
 
 		expect(openLegacyTeamSetup).toHaveBeenNthCalledWith(1, "sharing-candidate-ref");
 		expect(openLegacyTeamSetup).toHaveBeenNthCalledWith(2, "project-candidate-ref");
+	});
+
+	it("encodes the Advanced Sync target from Sharing", async () => {
+		const { createRecipientPolicySharingLoader } = await import("./app-sharing");
+		const sharingOptions = vi
+			.mocked(createRecipientPolicySharingLoader)
+			.mock.calls.map((call) => call[1] as SharingNavigationCallbacks | undefined)
+			.find((options) => options?.onNavigateAdvancedSync);
+
+		act(() => sharingOptions?.onNavigateAdvancedSync?.());
+		await Promise.resolve();
+
+		expect(window.location.hash).toBe("#advanced/sync");
 	});
 
 	it("routes legacy upgrade review actions to Advanced Sync and Projects", async () => {
