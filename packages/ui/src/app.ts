@@ -35,6 +35,7 @@ import {
 	ALL_TAB_IDS,
 	getVisibleTabs,
 	initState,
+	isCoordinatorAdministrationRoute,
 	parseAdvancedSectionFromHash,
 	parseTabFromHash,
 	resolveAccessibleTab,
@@ -45,7 +46,7 @@ import {
 } from "./lib/state";
 import { createTabVisibilityTracker } from "./lib/tab-visibility";
 import { getTheme, initThemeToggle, setTheme } from "./lib/theme";
-
+import { type AdvancedTabValue, mountAdvancedTabs } from "./tabs/advanced-tabs";
 import { initCoordinatorAdminTab, loadCoordinatorAdminData } from "./tabs/coordinator-admin";
 import {
 	beginStandaloneCoordinatorAdminStatusRefresh,
@@ -70,7 +71,8 @@ import { mountLegacyTeamSetupDialog, openLegacyTeamSetup } from "./tabs/legacy-t
 import { initProjectsTab, loadProjectsData } from "./tabs/projects";
 import { toRecipientPolicyManagementProjects } from "./tabs/recipient-policy-projects";
 import { requestSharingNavigation } from "./tabs/recipient-policy-sharing";
-import { initSettings, isSettingsOpen, loadConfigData } from "./tabs/settings";
+import { initSettings, isSettingsOpen, loadConfigData, openSettings } from "./tabs/settings";
+import { setSettingsTab } from "./tabs/settings/data/state-ops";
 import {
 	initSyncTab,
 	invalidateSyncPeerScopeCache,
@@ -344,22 +346,39 @@ document.addEventListener("visibilitychange", () => {
 
 /* ── Tab routing ─────────────────────────────────────────── */
 
+let revealCoordinatorAdministration = false;
+
 function renderAdvancedSection() {
 	const isSync = state.advancedSection === "sync";
 	const syncContent = $("advancedSyncContent");
 	const teamsContent = $("advancedTeamsContent");
 	if (syncContent) syncContent.hidden = !isSync;
 	if (teamsContent) teamsContent.hidden = isSync;
-	const syncButton = $("advancedSyncButton");
-	const teamsButton = $("advancedTeamsButton");
-	syncButton?.setAttribute("aria-pressed", String(isSync));
-	teamsButton?.setAttribute("aria-pressed", String(!isSync));
+	const tabsMount = $("advancedTabsMount");
+	if (tabsMount) mountAdvancedTabs(tabsMount, state.advancedSection, selectAdvancedSection);
 	queueMicrotask(() => {
 		const hash = window.location.hash.replace(/^#/, "");
+		if (!isSync && revealCoordinatorAdministration) {
+			revealCoordinatorAdministration = false;
+			const disclosure = document.getElementById("advancedAdministrationDisclosure");
+			if (disclosure instanceof HTMLDetailsElement) disclosure.open = true;
+			document.getElementById("coordinatorAdminHeading")?.focus();
+		}
 		applySyncSubView(
 			hash === "sync/diagnostics" || hash === "advanced/sync/diagnostics" ? "diagnostics" : "main",
 		);
 	});
+}
+
+function selectAdvancedSection(
+	section: AdvancedTabValue,
+	options: { focusContent?: boolean } = {},
+) {
+	setAdvancedSection(section, true);
+	renderAdvancedSection();
+	if (section === "teams" && options.focusContent) {
+		queueMicrotask(() => document.getElementById("coordinatorAdminHeading")?.focus());
+	}
 }
 
 const revealChangedTab = createTabVisibilityTracker();
@@ -382,7 +401,7 @@ function renderTabs(activeTab: TabId) {
 	});
 	const activeButton = $(`tabBtn-${activeTab}`);
 	if (activeButton) revealChangedTab(activeButton);
-	renderAdvancedSection();
+	if (activeTab === "advanced") renderAdvancedSection();
 }
 
 function switchTab(
@@ -404,6 +423,7 @@ function switchTab(
 }
 
 function initTabs() {
+	window.addEventListener("codemem:navigate-advanced-sync", navigateToAdvancedSyncFromSharing);
 	ALL_TAB_IDS.forEach((id) => {
 		const btn = $(`tabBtn-${id}`);
 		btn?.addEventListener("click", () =>
@@ -415,13 +435,19 @@ function initTabs() {
 			),
 		);
 	});
-	$("advancedSyncButton")?.addEventListener("click", () => setAdvancedSection("sync", true));
-	$("advancedTeamsButton")?.addEventListener("click", () => {
-		setAdvancedSection("teams", true);
-		renderAdvancedSection();
-		queueMicrotask(() => document.getElementById("coordinatorAdminLegacyNoticeTitle")?.focus());
+	$("syncTurnOnButton")?.addEventListener("click", () => {
+		setSettingsTab("sync");
+		openSettings(pausePolling);
 	});
-	$("coordinatorAdminOpenSharing")?.addEventListener("click", () => {
+	$("advancedTeamSettingsLink")?.addEventListener("click", (event) => {
+		event.preventDefault();
+		requestSharingNavigation("teams");
+		switchTab("sharing", { canonicalHash: true });
+		queueMicrotask(() => document.getElementById("tabBtn-sharing")?.focus());
+	});
+	$("advancedSharingLink")?.addEventListener("click", (event) => {
+		event.preventDefault();
+		requestSharingNavigation("invitations");
 		switchTab("sharing", { canonicalHash: true });
 		queueMicrotask(() => document.getElementById("tabBtn-sharing")?.focus());
 	});
@@ -433,14 +459,16 @@ function initTabs() {
 		const top = parseTabFromHash();
 		if (top) {
 			const advancedSection = parseAdvancedSectionFromHash();
+			revealCoordinatorAdministration = isCoordinatorAdministrationRoute();
 			switchTab(top, advancedSection ? { advancedSection } : {});
 			if (top === "advanced" && advancedSection === "teams") {
-				queueMicrotask(() => document.getElementById("coordinatorAdminLegacyNoticeTitle")?.focus());
+				queueMicrotask(() => document.getElementById("coordinatorAdminHeading")?.focus());
 			}
 		}
 	});
 
 	// Set initial tab
+	revealCoordinatorAdministration = isCoordinatorAdministrationRoute();
 	switchTab(state.activeTab);
 }
 
@@ -483,7 +511,6 @@ function navigateToAdvancedSyncFromSharing() {
 const loadRecipientPolicySharingData = createRecipientPolicySharingLoader(
 	{},
 	{
-		onNavigateAdvancedSync: navigateToAdvancedSyncFromSharing,
 		onOpenTeamSetup: openLegacyTeamSetup,
 		onReviewDevices: reviewDevicesFromSharing,
 	},

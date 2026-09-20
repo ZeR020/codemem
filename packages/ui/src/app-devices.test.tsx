@@ -93,6 +93,7 @@ vi.mock("./tabs/recipient-policy-management", () => ({
 	mountRecipientPolicyManagement: vi.fn(),
 }));
 vi.mock("./tabs/recipient-policy-sharing", () => ({
+	requestSharingNavigation: vi.fn(),
 	mountRecipientPolicySharing: vi.fn(),
 }));
 vi.mock("./tabs/settings", () => ({
@@ -532,27 +533,61 @@ describe("Devices app integration", () => {
 		expect(document.activeElement).toBe(document.getElementById("tabBtn-sharing"));
 	});
 
-	it("opens Sharing from the legacy coordinator notice and moves focus to its navigation control", async () => {
-		act(() => document.getElementById("coordinatorAdminOpenSharing")?.click());
+	it("links coordinator administration back to Team settings in Sharing", () => {
+		const sharingLink = document.querySelector<HTMLAnchorElement>(
+			'#advancedTeamsContent a[href="#sharing"]',
+		);
+		expect(sharingLink?.textContent).toContain("Team settings");
+	});
+
+	it("moves focus to Sharing after following the Advanced invitation link", async () => {
+		const { requestSharingNavigation } = await import("./tabs/recipient-policy-sharing");
+		act(() => document.getElementById("tabBtn-advanced")?.click());
+		const link = document.getElementById("advancedSharingLink");
+		if (!(link instanceof HTMLAnchorElement)) throw new Error("Advanced Sharing link missing");
+
+		act(() => link.click());
 		await Promise.resolve();
 
 		expect(window.location.hash).toBe("#sharing");
-		expect(document.getElementById("tab-sharing")?.hidden).toBe(false);
+		expect(requestSharingNavigation).toHaveBeenCalledWith("invitations");
 		expect(document.activeElement).toBe(document.getElementById("tabBtn-sharing"));
 	});
+	it("selects Teams when following Advanced Team settings", async () => {
+		const { requestSharingNavigation } = await import("./tabs/recipient-policy-sharing");
+		act(() => document.getElementById("advancedTeamSettingsLink")?.click());
+		expect(requestSharingNavigation).toHaveBeenCalledWith("teams");
+		expect(window.location.hash).toBe("#sharing");
+	});
 
-	it("focuses the legacy notice when switching into coordinator administration", async () => {
+	it("focuses coordinator administration when switching sections", async () => {
 		act(() => document.getElementById("tabBtn-advanced")?.click());
 		await Promise.resolve();
-		act(() => document.getElementById("advancedTeamsButton")?.click());
+		act(() => {
+			document
+				.getElementById("advancedTeamsButton")
+				?.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, button: 0 }));
+		});
 		await Promise.resolve();
 
 		expect(window.location.hash).toBe("#advanced/teams");
 		expect(document.getElementById("advancedTeamsContent")?.hidden).toBe(false);
-		expect(document.activeElement).toBe(
-			document.getElementById("coordinatorAdminLegacyNoticeTitle"),
-		);
+		expect(document.activeElement).toBe(document.getElementById("coordinatorAdminHeading"));
 	});
+
+	it.each(["#advanced/teams/administration", "#coordinator-admin"])(
+		"opens legacy administration for direct route %s",
+		async (route) => {
+			window.location.hash = route;
+			window.dispatchEvent(new HashChangeEvent("hashchange"));
+			await Promise.resolve();
+
+			const disclosure = document.getElementById("advancedAdministrationDisclosure");
+			expect(disclosure).toBeInstanceOf(HTMLDetailsElement);
+			expect((disclosure as HTMLDetailsElement).open).toBe(true);
+			expect(document.activeElement).toBe(document.getElementById("coordinatorAdminHeading"));
+		},
+	);
 
 	it("refreshes Sharing and Projects with the active surface mounting last", async () => {
 		const options = mocks.mountLegacyTeamSetupDialog.mock.calls[0]?.[1];
@@ -584,6 +619,23 @@ describe("Devices app integration", () => {
 		expect(mocks.loadRecipientPolicySharingData).toHaveBeenLastCalledWith({
 			requireTeamSetupSummary: true,
 		});
+	});
+});
+
+describe("Advanced keyboard focus", () => {
+	beforeEach(setupDevicesAppTest);
+	afterEach(teardownDevicesAppTest);
+
+	it("keeps keyboard section activation in the Advanced tablist", async () => {
+		act(() => document.getElementById("tabBtn-advanced")?.click());
+		await Promise.resolve();
+		const teamsButton = document.getElementById("advancedTeamsButton");
+		if (!(teamsButton instanceof HTMLButtonElement)) throw new Error("Advanced Teams tab missing");
+		act(() => teamsButton.focus());
+		await Promise.resolve();
+
+		expect(window.location.hash).toBe("#advanced/teams");
+		expect(document.activeElement).toBe(teamsButton);
 	});
 });
 
@@ -1023,13 +1075,9 @@ describe("Viewer behavior contracts", () => {
 	});
 
 	it("encodes the Advanced Sync target from Sharing", async () => {
-		const { createRecipientPolicySharingLoader } = await import("./app-sharing");
-		const sharingOptions = vi
-			.mocked(createRecipientPolicySharingLoader)
-			.mock.calls.map((call) => call[1] as SharingNavigationCallbacks | undefined)
-			.find((options) => options?.onNavigateAdvancedSync);
-
-		act(() => sharingOptions?.onNavigateAdvancedSync?.());
+		act(() => {
+			window.dispatchEvent(new CustomEvent("codemem:navigate-advanced-sync"));
+		});
 		await Promise.resolve();
 
 		expect(window.location.hash).toBe("#advanced/sync");

@@ -516,6 +516,15 @@ export function parseAdvancedSectionFromHash(hash = window.location.hash): Advan
 	return second === "teams" ? "teams" : "sync";
 }
 
+export function isCoordinatorAdministrationRoute(
+	hash = window.location.hash,
+	savedTab = localStorage.getItem(TAB_KEY),
+): boolean {
+	const route = hash.replace(/^#/, "");
+	if (route === "coordinator-admin" || route === "advanced/teams/administration") return true;
+	return !route && savedTab === "coordinator-admin";
+}
+
 export function getActiveTab(): CanonicalTabId {
 	const fromHash = parseTabFromHash();
 	if (fromHash) return resolveAccessibleTab(fromHash, state.lastCoordinatorAdminStatus);
@@ -638,9 +647,8 @@ export function initState() {
 	state.feedScopeFilter = getFeedScopeFilter();
 	state.preferredFeedViewMode = getPreferredFeedViewMode();
 	state.syncDiagnosticsOpen = isSyncDiagnosticsOpen();
+	state.syncPairingOpen = false;
 	try {
-		state.syncPairingOpen = localStorage.getItem(SYNC_PAIRING_KEY) === "1";
-	} catch {
-		state.syncPairingOpen = false;
-	}
+		localStorage.removeItem(SYNC_PAIRING_KEY);
+	} catch {}
 }

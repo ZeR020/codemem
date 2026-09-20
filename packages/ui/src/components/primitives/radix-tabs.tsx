@@ -3,6 +3,7 @@ import type { ComponentChildren } from "preact";
 
 export type RadixTabOption = {
 	disabled?: boolean;
+	id?: string;
 	label: string;
 	value: string;
 };
@@ -12,6 +13,8 @@ type RadixTabsProps = {
 	children?: ComponentChildren;
 	listClassName?: string;
 	onValueChange: (value: string) => void;
+	onTriggerKeyDown?: (value: string) => void;
+	onTriggerMouseDown?: (value: string) => void;
 	tabs: RadixTabOption[];
 	triggerClassName?: string;
 	value: string;
@@ -28,6 +31,8 @@ export function RadixTabs({
 	ariaLabel,
 	children,
 	listClassName,
+	onTriggerKeyDown,
+	onTriggerMouseDown,
 	onValueChange,
 	tabs,
 	triggerClassName,
@@ -40,7 +45,10 @@ export function RadixTabs({
 					<Tabs.Trigger
 						className={triggerClassName}
 						disabled={tab.disabled}
+						id={tab.id}
 						key={tab.value}
+						onKeyDownCapture={() => onTriggerKeyDown?.(tab.value)}
+						onMouseDownCapture={() => onTriggerMouseDown?.(tab.value)}
 						value={tab.value}
 					>
 						{tab.label}
