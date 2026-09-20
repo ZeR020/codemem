@@ -262,7 +262,7 @@ Cross-agent: one shared store. Memories from OpenCode/Claude/Codex sessions inje
 Caveats (v1):
 
 - Observer extraction from pi config supports **API-key providers only**. OAuth-only installs get an explicit `unconfigured (oauth-only)` status — never a silent 401. Set `observer_provider` / `observer_model` explicitly when needed. Selection is cheap-model-first.
-- Preferred HTTP `GET /api/pack` is unledgered — pi injection does not write an opencode retrieval-ledger row.
+- The preferred HTTP pack path — prove `GET /api/prompt-pack-profile`, then a targeted `POST /api/pack` — is unledgered: pi injection does not write an opencode retrieval-ledger row.
 - `--pi-mcp` requires the third-party `pi-mcp-adapter` package; without it setup writes nothing MCP-related and explains the prerequisite. Native tools remain the default surface (`pi.tools_mode: native`).
 
 See [`packages/pi-extension/README.md`](packages/pi-extension/README.md) and [docs/plugin-reference.md](docs/plugin-reference.md) for config knobs and lifecycle details.

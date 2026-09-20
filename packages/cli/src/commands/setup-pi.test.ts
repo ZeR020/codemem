@@ -87,6 +87,26 @@ function seedPiApiKeyInstall(dir: string): void {
 	});
 }
 
+function seedPiCustomGatewayInstall(dir: string): void {
+	writeJson(join(dir, "settings.json"), {
+		defaultProvider: "openai",
+		defaultModel: "openai/gpt-4o-mini",
+		enabledModels: ["openai/gpt-4o-mini"],
+		packages: [],
+	});
+	writeJson(join(dir, "models.json"), {
+		providers: {
+			openai: {
+				baseUrl: "https://gateway.example.test/v1",
+				api: "openai-completions",
+				models: [{ id: "gpt-4o-mini", cost: { input: 0.15, output: 0.6 } }],
+			},
+		},
+	});
+	writeJson(join(dir, "auth.json"), {
+		openai: { type: "api_key", key: FIXTURE_KEY },
+	});
+}
 beforeEach(() => {
 	saveEnv();
 	tempRoot = mkdtempSync(join(tmpdir(), "codemem-setup-pi-"));
@@ -433,6 +453,61 @@ describe("installPi — observer derivation", () => {
 		const config = readJson(configPath);
 		expect(config.observer_api_key).toBe(userKey);
 		expect(JSON.stringify(config)).not.toContain(FIXTURE_KEY);
+	});
+});
+
+describe("installPi — observer partial overrides", () => {
+	it("does not mix pi model or endpoint under a different explicit provider", () => {
+		// Partial file override: provider only. Pi resolves to openai behind a
+		// custom gateway — none of pi's model/endpoint may land under anthropic.
+		seedPiCustomGatewayInstall(piHome);
+		writeJson(configPath, { observer_provider: "anthropic" });
+
+		expect(installPi({ force: false })).toBe(true);
+
+		const config = readJson(configPath);
+		expect(config.observer_provider).toBe("anthropic");
+		expect(config).not.toHaveProperty("observer_model");
+		expect(config).not.toHaveProperty("observer_base_url");
+		expect(config).not.toHaveProperty("observer_openai_use_responses");
+	});
+
+	it("fills only the missing model when the explicit provider matches pi", () => {
+		seedPiCustomGatewayInstall(piHome);
+		writeJson(configPath, { observer_provider: "openai" });
+
+		expect(installPi({ force: false })).toBe(true);
+
+		const config = readJson(configPath);
+		expect(config.observer_provider).toBe("openai");
+		expect(config.observer_model).toBe("gpt-4o-mini");
+		expect(config).not.toHaveProperty("observer_base_url");
+		expect(config).not.toHaveProperty("observer_openai_use_responses");
+	});
+
+	it("does not derive from pi when only the env provider is set", () => {
+		seedPiCustomGatewayInstall(piHome);
+		process.env.CODEMEM_OBSERVER_PROVIDER = "anthropic";
+
+		expect(installPi({ force: false })).toBe(true);
+
+		const config = readJson(configPath);
+		expect(config).not.toHaveProperty("observer_provider");
+		expect(config).not.toHaveProperty("observer_model");
+		expect(config).not.toHaveProperty("observer_base_url");
+		expect(config).not.toHaveProperty("observer_openai_use_responses");
+	});
+
+	it("does not derive a pi provider when only the env model is set", () => {
+		seedPiCustomGatewayInstall(piHome);
+		process.env.CODEMEM_OBSERVER_MODEL = "claude-haiku-4-5";
+
+		expect(installPi({ force: false })).toBe(true);
+
+		const config = readJson(configPath);
+		expect(config).not.toHaveProperty("observer_provider");
+		expect(config).not.toHaveProperty("observer_model");
+		expect(config).not.toHaveProperty("observer_base_url");
 	});
 });
 

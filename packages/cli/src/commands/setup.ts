@@ -1041,18 +1041,38 @@ function applyResolvedPiObserver(
 		baseUrl?: string | null;
 		openAIUseResponses?: boolean;
 	},
-	needs: { provider: boolean; model: boolean; baseUrl: boolean; useResponses: boolean },
+	needs: {
+		provider: boolean;
+		model: boolean;
+		baseUrl: boolean;
+		useResponses: boolean;
+		fileProvider: string;
+		fileModel: string;
+		envProvider: string | undefined;
+		envModel: string | undefined;
+	},
 	next: Record<string, unknown>,
 	updated: string[],
 ): void {
-	if (needs.provider) {
-		next.observer_provider = resolved.provider;
-		updated.push("observer_provider");
+	// Tuple rule (mirrors core applyPiDerivedObserverFields): derive the full
+	// provider/model/endpoint set only when both identity fields are unset, or
+	// fill a missing model only when the explicit provider matches pi. Never
+	// combine pi's model or endpoint with a different explicit provider.
+	const explicitProvider = needs.envProvider || needs.fileProvider;
+	if (explicitProvider) {
+		if (needs.model && explicitProvider.toLowerCase() === String(resolved.provider).toLowerCase()) {
+			next.observer_model = resolved.model;
+			updated.push("observer_model");
+		}
+		return;
 	}
-	if (needs.model) {
-		next.observer_model = resolved.model;
-		updated.push("observer_model");
-	}
+	// Model set without a provider: leave provider unset so the client infers
+	// it from the model instead of routing that model through pi.
+	if (needs.envModel || needs.fileModel) return;
+	next.observer_provider = resolved.provider;
+	updated.push("observer_provider");
+	next.observer_model = resolved.model;
+	updated.push("observer_model");
 	// Official OpenAI/Anthropic URLs must stay unset: any non-empty
 	// observer_base_url is treated as a custom gateway (disables default
 	// Responses + tier routing). Persist only a real custom URL, and the

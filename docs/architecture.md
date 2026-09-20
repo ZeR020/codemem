@@ -380,8 +380,9 @@ normalizes them through `buildRawEventEnvelopeFromPiEvent` and runs `ingestNorma
 `source: "pi"` (same event identity as canonical `POST /api/raw-events`); retryable delivery reuses the
 payload for `codemem pi-hook-ingest` plus a pi-specific spool. Boundary flush events
 (`session_before_compact`, `session_shutdown`) always go through the CLI so extraction actually runs
-before pi discards context. Preferred HTTP `GET /api/pack` is unledgered (no opencode
-retrieval-ledger row). The queue/sweeper behavior is shared with the other adapters.
+before pi discards context. The preferred HTTP pack path — prove `GET /api/prompt-pack-profile`, then
+targeted `POST /api/pack` — is unledgered (no opencode retrieval-ledger row). The queue/sweeper
+behavior is shared with the other adapters.
 
 ### OpenCode session finalization triggers
 - `session.idle` — finalizes current local buffer

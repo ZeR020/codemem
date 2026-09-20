@@ -328,7 +328,7 @@ Uninstall by removing the packages entry and restarting pi.
 | Fork/resume | Re-keys stream identity on every `session_start`; durable cursors via `pi.appendEntry` |
 | Project identity | Nearest Git root (walks up for a directory `.git` or a `gitdir:` worktree file), same walk as the other adapters |
 
-Prompt-time pack retrieval uses the preferred HTTP `GET /api/pack` (or `codemem pi-hook-inject` / `pack --json` fallback). That HTTP pack path is unledgered — no opencode retrieval-ledger row is written for pi injection.
+Prompt-time pack retrieval prefers the HTTP path: prove `GET /api/prompt-pack-profile`, then a targeted `POST /api/pack` (or `codemem pi-hook-inject` / `pack --json` fallback). That HTTP pack path is unledgered — no opencode retrieval-ledger row is written for pi injection.
 
 Dashboard tabs are source-agnostic: pi rows appear alongside OpenCode/Claude/Codex with no extra setup. Packs are project-scoped, so memory crosses agents automatically.
 
