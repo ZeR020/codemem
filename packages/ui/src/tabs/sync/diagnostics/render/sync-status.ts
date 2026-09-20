@@ -108,18 +108,15 @@ export function renderSyncStatus() {
 	const retentionDeleted = Number(retention.last_deleted_ops || 0);
 	const retentionLastRunAt = retention.last_run_at || null;
 	const retentionLastError = String(retention.last_error || "");
-	const daemonStateLabel =
-		daemonState === "offline-peers"
-			? "Offline peers"
-			: daemonState === "needs_attention"
-				? "Needs attention"
-				: daemonState === "rebootstrapping"
-					? "Rebootstrapping"
-					: titleCase(daemonState);
+	const daemonStateLabels: Record<string, string> = {
+		needs_attention: "Needs attention",
+		"offline-peers": "Offline peers",
+		rebootstrapping: "Rebootstrapping",
+	};
+	const daemonStateLabel = daemonStateLabels[daemonState] ?? titleCase(daemonState);
 	const syncDisabled = daemonState === "disabled" || status.enabled === false;
 	const peerCount = Object.keys(peers).length;
 	const syncNoPeers = !syncDisabled && peerCount === 0;
-
 	if (syncMeta) {
 		let parts: string[];
 		if (syncDisabled) {
@@ -130,7 +127,7 @@ export function renderSyncStatus() {
 		} else if (syncNoPeers) {
 			parts = [
 				"Advanced sync is ready but idle",
-				"Use Pair a device in Devices to connect another device, then this panel will start showing live peer status and recent attempts",
+				"Pair another device from Devices, then return here for live peer status and recent attempts",
 			];
 		} else {
 			parts = [
