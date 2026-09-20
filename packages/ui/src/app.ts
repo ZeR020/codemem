@@ -68,6 +68,7 @@ import {
 import { mountLegacyTeamSetupDialog, openLegacyTeamSetup } from "./tabs/legacy-team-setup-dialog";
 import { initProjectsTab, loadProjectsData } from "./tabs/projects";
 import { toRecipientPolicyManagementProjects } from "./tabs/recipient-policy-projects";
+import { requestSharingNavigation } from "./tabs/recipient-policy-sharing";
 import { initSettings, isSettingsOpen, loadConfigData } from "./tabs/settings";
 import {
 	initSyncTab,
@@ -562,6 +563,12 @@ function navigateFromDevices(target: DevicesNavigationTarget) {
 	if (target === "advanced_sync") {
 		switchTab("advanced", { advancedSection: "sync" });
 		queueMicrotask(() => document.getElementById("tabBtn-advanced")?.focus());
+		return;
+	}
+	if (target === "sharing_teams") {
+		switchTab("sharing", { canonicalHash: true });
+		requestSharingNavigation("teams");
+		queueMicrotask(() => document.getElementById("tabBtn-sharing")?.focus());
 		return;
 	}
 	switchTab(target, { canonicalHash: true });

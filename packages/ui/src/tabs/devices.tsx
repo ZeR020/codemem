@@ -1,6 +1,8 @@
-import { render } from "preact";
+import { type RefObject, render } from "preact";
 import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import { LoadingCardList } from "../components/LoadingCardList";
+import { Chip } from "../components/primitives/chip";
+import { PresencePip } from "../components/primitives/presence-pip";
 import type {
 	RecipientPolicyIntentGraphV1,
 	RecipientPolicyReconciliationReadState,
@@ -22,7 +24,12 @@ import {
 import { state } from "../lib/state";
 
 export type DeviceAvailabilityState = "available" | "offline" | "unknown";
-export type DevicesNavigationTarget = "advanced" | "advanced_sync" | "health" | "sharing";
+export type DevicesNavigationTarget =
+	| "advanced"
+	| "advanced_sync"
+	| "health"
+	| "sharing"
+	| "sharing_teams";
 
 export interface DeviceAvailabilityInput {
 	deviceId: string;
@@ -70,6 +77,7 @@ export interface DeviceProjectProjection {
 export interface DeviceProjection {
 	deviceId: string;
 	displayName: string;
+	identityId: string;
 	identityName: string;
 	availability: DeviceAvailabilityState;
 	availabilityLabel: string;
@@ -92,8 +100,9 @@ export interface DevicesProjection {
 }
 
 type DeviceActionFocusIdentity = {
+	control: "action" | "menu";
 	deviceId: string;
-	target: DevicesNavigationTarget;
+	target?: DevicesNavigationTarget;
 };
 
 const deviceActionFocusIdentities = new WeakMap<HTMLElement, DeviceActionFocusIdentity>();
@@ -116,7 +125,7 @@ const PENDING_STATUS = {
 const AVAILABILITY_LABELS: Record<DeviceAvailabilityState, string> = {
 	available: "Available",
 	offline: "Offline",
-	unknown: "Availability unknown",
+	unknown: "Unknown",
 };
 
 function uniqueSorted(values: Iterable<string>): string[] {
@@ -212,6 +221,7 @@ export function projectDevices(
 			return {
 				deviceId: device.deviceId,
 				displayName: device.displayName,
+				identityId: device.identityId,
 				identityName: identityNames.get(device.identityId) ?? "Identity unavailable",
 				availability: deviceAvailability,
 				availabilityLabel: AVAILABILITY_LABELS[deviceAvailability],
@@ -222,10 +232,8 @@ export function projectDevices(
 				inheritedProjects,
 				unavailableProjectCount: directProjectIds.length - directProjects.length,
 				statusState: status?.state ?? "no_projects",
-				statusLabel: status?.statusLabel ?? "No directly shared Projects",
-				statusCopy:
-					status?.statusCopy ??
-					"Team access is not shown here without authoritative per-device eligibility.",
+				statusLabel: status?.statusLabel ?? "Team access unknown",
+				statusCopy: status?.statusCopy ?? "Open Team projects to review shared Project access.",
 				deliveredCopiesMayRemain: allProjects.some((project) => project.deliveredCopiesMayRemain),
 				action: actionForDevice(deviceAvailability, status?.state ?? "no_projects"),
 			};
@@ -787,19 +795,53 @@ function SetupWorkflow({
 	);
 }
 
-function ConfiguredRebind({
-	intent,
-	inventory,
-	item,
-	options,
-	previousIdentityName,
-}: {
+type ConfiguredRebindProps = {
+	controlKey: string;
 	intent: RecipientPolicyIntentGraphV1;
 	inventory: DeviceIdentityInventoryV1;
 	item: DeviceIdentityInventoryItemV1;
 	options: DevicesRendererOptions;
 	previousIdentityName: string;
+	triggerRef?: RefObject<HTMLButtonElement>;
+};
+
+function RebindTrigger({
+	blocked,
+	id,
+	onClick,
+	open,
+	triggerRef,
+}: {
+	blocked: boolean;
+	id: string;
+	onClick: () => void;
+	open: boolean;
+	triggerRef?: RefObject<HTMLButtonElement>;
 }) {
+	return (
+		<button
+			aria-expanded={open}
+			className="settings-button"
+			disabled={blocked}
+			id={id}
+			onClick={onClick}
+			ref={triggerRef}
+			type="button"
+		>
+			Change Identity…
+		</button>
+	);
+}
+
+function ConfiguredRebind({
+	controlKey,
+	intent,
+	inventory,
+	item,
+	options,
+	previousIdentityName,
+	triggerRef,
+}: ConfiguredRebindProps) {
 	const identities = intent.identities.filter(
 		(identity) =>
 			identity.status === "active" &&
@@ -830,7 +872,7 @@ function ConfiguredRebind({
 		previewMatchesBindings(reviewed.preview, reviewed.request, [item], "rebind");
 	const gate = deviceIdentitySetupGate(inventory, item);
 	const rebindBlocked = gate.blocked || identityMutationsBlocked(options);
-	const triggerId = `configured-rebind-trigger-${item.deviceId}`;
+	const triggerId = `configured-rebind-trigger-${controlKey}`;
 	const targetIdentity =
 		identities.find((identity) => identity.identityId === targetIdentityId)?.displayName ?? "";
 	const identitySignature = identities
@@ -907,14 +949,11 @@ function ConfiguredRebind({
 			setReviewConfirmed(false);
 			setDeviceCommitStatus("Identity reassignment completed.");
 			const refreshed = await options.onCommitted?.();
-			setDeviceCommitStatus(
-				refreshed === false
-					? "Identity reassignment completed, but refreshing Devices and Sharing failed. Refresh to see current state."
-					: refreshed === true
-						? "Identity reassignment completed. Devices and Sharing were refreshed."
-						: "Identity reassignment completed.",
-			);
-			(document.getElementById(triggerId) ?? document.getElementById("devices-heading"))?.focus();
+			setDeviceCommitStatus(rebindCommitStatus(refreshed));
+			(
+				document.getElementById(`device-actions-${item.deviceId}`) ??
+				document.getElementById("devices-heading")
+			)?.focus();
 		} catch (caught) {
 			setError(deviceIdentitySetupError(caught));
 		}
@@ -922,10 +961,8 @@ function ConfiguredRebind({
 	};
 	return (
 		<div className="device-identity-rebind">
-			<button
-				aria-expanded={open}
-				className="settings-button"
-				disabled={rebindBlocked}
+			<RebindTrigger
+				blocked={rebindBlocked}
 				id={triggerId}
 				onClick={() => {
 					reviewRevision.current += 1;
@@ -936,10 +973,9 @@ function ConfiguredRebind({
 					setError("");
 					setDeviceCommitStatus("");
 				}}
-				type="button"
-			>
-				Change Identity…
-			</button>
+				open={open}
+				triggerRef={triggerRef}
+			/>
 			{gate.recovery ? <p className="small">{gate.recovery}</p> : null}
 			{open ? (
 				<fieldset>
@@ -947,10 +983,10 @@ function ConfiguredRebind({
 					<p>
 						<strong>Suggested current Identity (unconfirmed):</strong> {previousIdentity}
 					</p>
-					<label htmlFor={`configured-rebind-${item.deviceId}`}>Target Identity</label>
+					<label htmlFor={`configured-rebind-${controlKey}`}>Target Identity</label>
 					<select
 						disabled={rebindBlocked}
-						id={`configured-rebind-${item.deviceId}`}
+						id={`configured-rebind-${controlKey}`}
 						onInput={(event) => {
 							reviewRevision.current += 1;
 							setBusy(false);
@@ -1038,6 +1074,349 @@ function ConfiguredRebind({
 	);
 }
 
+function rebindCommitStatus(refreshed: boolean | undefined): string {
+	if (refreshed === false) {
+		return "Identity reassignment completed, but refreshing Devices and Sharing failed. Refresh to see current state.";
+	}
+	if (refreshed === true) {
+		return "Identity reassignment completed. Devices and Sharing were refreshed.";
+	}
+	return "Identity reassignment completed.";
+}
+
+function availabilityPipState(availability: DeviceAvailabilityState) {
+	if (availability === "available") return "online" as const;
+	return availability;
+}
+
+function DeviceRowMenu({
+	device,
+	inventoryItem,
+	onDetails,
+	detailsId,
+	detailsOpen,
+	onRebind,
+	options,
+}: {
+	device: DeviceProjection;
+	inventoryItem?: DeviceIdentityInventoryItemV1;
+	onDetails: () => void;
+	detailsId: string;
+	detailsOpen: boolean;
+	onRebind: () => void;
+	options: DevicesRendererOptions;
+}) {
+	const menuRef = useRef<HTMLDetailsElement>(null);
+	const rebindBlocked =
+		!inventoryItem ||
+		!options.inventory ||
+		deviceIdentitySetupGate(options.inventory, inventoryItem).blocked ||
+		identityMutationsBlocked(options);
+	const select = (action: () => void) => {
+		if (menuRef.current) menuRef.current.open = false;
+		action();
+	};
+	return (
+		<details className="devices-row-menu" ref={menuRef}>
+			<summary
+				aria-label={`Actions for ${device.displayName}`}
+				className="feed-menu-trigger"
+				id={`device-actions-${device.deviceId}`}
+				ref={(element) => {
+					if (element) {
+						deviceActionFocusIdentities.set(element, {
+							control: "menu",
+							deviceId: device.deviceId,
+							target: device.action?.target,
+						});
+					}
+				}}
+			>
+				⋯
+			</summary>
+			<div className="feed-menu-panel">
+				{device.action && options.onNavigate ? (
+					<button
+						aria-label={`${device.action.label} for ${device.displayName}`}
+						className="feed-menu-item"
+						onClick={() => select(() => options.onNavigate?.(device.action?.target ?? "health"))}
+						ref={(element) => {
+							if (element && device.action) {
+								deviceActionFocusIdentities.set(element, {
+									control: "action",
+									deviceId: device.deviceId,
+									target: device.action.target,
+								});
+							}
+						}}
+						type="button"
+					>
+						{device.action.label}
+					</button>
+				) : null}
+				<button
+					aria-controls={detailsId}
+					aria-expanded={detailsOpen}
+					className="feed-menu-item"
+					onClick={() => select(onDetails)}
+					type="button"
+				>
+					Details
+				</button>
+				{inventoryItem ? (
+					<button
+						className="feed-menu-item"
+						disabled={rebindBlocked}
+						onClick={() => select(onRebind)}
+						type="button"
+					>
+						Change Identity…
+					</button>
+				) : null}
+			</div>
+		</details>
+	);
+}
+
+function DeviceTableRow({
+	device,
+	intent,
+	inventoryItem,
+	options,
+}: {
+	device: DeviceProjection;
+	intent: RecipientPolicyIntentGraphV1;
+	inventoryItem?: DeviceIdentityInventoryItemV1;
+	options: DevicesRendererOptions;
+}) {
+	const [detailsOpen, setDetailsOpen] = useState(false);
+	const rebindTriggerRef = useRef<HTMLButtonElement>(null);
+	const detailsId = `device-details-${device.deviceId}`;
+	return (
+		<>
+			<tr
+				className="devices-table-row"
+				id={`device-identity-card-${device.deviceId}`}
+				tabIndex={-1}
+			>
+				<td>
+					<PresencePip
+						aria-label={device.availabilityLabel}
+						size={6}
+						state={availabilityPipState(device.availability)}
+					/>
+				</td>
+				<td className="devices-table-device">
+					<strong>{device.displayName}</strong>
+					{inventoryItem?.isLocal ? (
+						<Chip tone="actor-badge local" variant="badge">
+							This device
+						</Chip>
+					) : null}
+				</td>
+				<td className="devices-table-availability" data-label="Availability">
+					{device.availabilityLabel}
+				</td>
+				<td className="devices-table-version" data-label="Version">
+					{device.reportedRuntimeVersion ?? "—"}
+				</td>
+				<td>
+					<DeviceRowMenu
+						device={device}
+						detailsId={detailsId}
+						detailsOpen={detailsOpen}
+						inventoryItem={inventoryItem}
+						onDetails={() => setDetailsOpen((open) => !open)}
+						onRebind={() => {
+							setDetailsOpen(true);
+							queueMicrotask(() => {
+								const trigger = rebindTriggerRef.current;
+								if (trigger?.getAttribute("aria-expanded") !== "true") {
+									trigger?.click();
+									return;
+								}
+								document.getElementById(`configured-rebind-${device.deviceId}`)?.focus();
+							});
+						}}
+						options={options}
+					/>
+				</td>
+			</tr>
+			<tr className="devices-table-details" hidden={!detailsOpen} id={detailsId}>
+				<td colSpan={5}>
+					<p>
+						<strong>{device.statusLabel}</strong> — {device.statusCopy}
+					</p>
+					<ProjectList empty="No direct shares" projects={device.directProjects} />
+					{device.unavailableProjectCount > 0 ? (
+						<p className="small" role="status">
+							Some Project names are unavailable.
+						</p>
+					) : null}
+					{inventoryItem && options.inventory ? (
+						<ConfiguredRebind
+							controlKey={device.deviceId}
+							intent={intent}
+							inventory={options.inventory}
+							item={inventoryItem}
+							options={options}
+							previousIdentityName={device.identityName}
+							triggerRef={rebindTriggerRef}
+						/>
+					) : null}
+				</td>
+			</tr>
+		</>
+	);
+}
+
+function DeviceIdentityGroup({
+	devices,
+	intent,
+	options,
+}: {
+	devices: DeviceProjection[];
+	intent: RecipientPolicyIntentGraphV1;
+	options: DevicesRendererOptions;
+}) {
+	const first = devices[0];
+	if (!first) return null;
+	const inventoryItems = new Map(
+		(options.inventory?.items ?? []).flatMap((item) =>
+			item.state === "configured"
+				? item.evidenceDeviceIds.map((deviceId) => [deviceId, item] as const)
+				: [],
+		),
+	);
+	const directShares = new Set(
+		devices.flatMap((device) =>
+			device.directProjects.map((project) => project.canonicalProjectIdentity),
+		),
+	).size;
+	return (
+		<section className="devices-identity-group">
+			<div className="devices-identity-header">
+				<strong>
+					{first.identityName}{" "}
+					<span>
+						· {devices.length} {devices.length === 1 ? "device" : "devices"}
+					</span>
+				</strong>
+				<span className="small">
+					Direct shares: {directShares || "none"} ·{" "}
+					<button
+						className="sync-subview-link"
+						onClick={() => options.onNavigate?.("sharing_teams")}
+						type="button"
+					>
+						Team projects →
+					</button>
+				</span>
+			</div>
+			<table aria-label={`${first.identityName} devices`} className="devices-table">
+				<thead>
+					<tr className="devices-table-head">
+						<th aria-label="Status" />
+						<th>Device</th>
+						<th>Availability</th>
+						<th>Version</th>
+						<th aria-label="Actions" />
+					</tr>
+				</thead>
+				<tbody>
+					{devices.map((device) => (
+						<DeviceTableRow
+							device={device}
+							intent={intent}
+							inventoryItem={inventoryItems.get(device.deviceId)}
+							key={device.deviceId}
+							options={options}
+						/>
+					))}
+				</tbody>
+			</table>
+		</section>
+	);
+}
+
+function deviceSummaryCounts(devices: DeviceProjection[], unknownFallbackCount: number) {
+	return {
+		available: devices.filter((device) => device.availability === "available").length,
+		offline: devices.filter((device) => device.availability === "offline").length,
+		unknown:
+			devices.filter((device) => device.availability === "unknown").length + unknownFallbackCount,
+	};
+}
+
+function DeviceSummaryBar({
+	counts,
+	onNavigate,
+}: {
+	counts: ReturnType<typeof deviceSummaryCounts>;
+	onNavigate?: DevicesRendererOptions["onNavigate"];
+}) {
+	return (
+		<div className="devices-summary-bar">
+			<div className="devices-summary-counts">
+				{(["available", "offline", "unknown"] as const).map((availability) => (
+					<span key={availability}>
+						<PresencePip
+							aria-label={`${counts[availability]} ${availability}`}
+							size={6}
+							state={availabilityPipState(availability)}
+						/>
+						{counts[availability]} {availability}
+					</span>
+				))}
+			</div>
+			{onNavigate ? (
+				<button className="settings-button" onClick={() => onNavigate("health")} type="button">
+					Check device health
+				</button>
+			) : null}
+		</div>
+	);
+}
+
+function ConfiguredDeviceInventory({
+	devices,
+	intent,
+	options,
+	unknownFallbackCount,
+}: {
+	devices: DeviceProjection[];
+	intent: RecipientPolicyIntentGraphV1;
+	options: DevicesRendererOptions;
+	unknownFallbackCount: number;
+}) {
+	const groups = new Map<string, DeviceProjection[]>();
+	for (const device of devices) {
+		groups.set(device.identityId, [...(groups.get(device.identityId) ?? []), device]);
+	}
+	return (
+		<>
+			<DeviceSummaryBar
+				counts={deviceSummaryCounts(devices, unknownFallbackCount)}
+				onNavigate={options.onNavigate}
+			/>
+			{[...groups.values()].map((group) => (
+				<DeviceIdentityGroup
+					devices={group}
+					intent={intent}
+					key={group[0]?.identityId}
+					options={options}
+				/>
+			))}
+			{devices.some((device) => device.deliveredCopiesMayRemain) ? (
+				<p className="small devices-delivered-copy-warning">
+					Changing access stops future delivery. Delivered copies may remain on a device or in
+					backups.
+				</p>
+			) : null}
+		</>
+	);
+}
+
 function DevicesView({
 	intent,
 	options,
@@ -1106,6 +1485,7 @@ function DevicesView({
 								<strong>Owning Identity:</strong> {previousIdentityName}
 							</p>
 							<ConfiguredRebind
+								controlKey={item.deviceId}
 								intent={intent}
 								inventory={options.inventory}
 								item={item}
@@ -1167,6 +1547,10 @@ function DevicesView({
 				{inventoryUnavailable}
 				{coordinatorAttention}
 				{inventoryWorkflow}
+				<DeviceSummaryBar
+					counts={deviceSummaryCounts([], configuredFallbackItems.length + setupItems.length)}
+					onNavigate={options.onNavigate}
+				/>
 				{configuredFallbackWorkflow}
 				<p className="small" role="status">
 					{configuredFallbackItems.length > 0
@@ -1188,109 +1572,12 @@ function DevicesView({
 			{coordinatorAttention}
 			{inventoryWorkflow}
 			{configuredFallbackWorkflow}
-			<ul className="recipient-policy-sharing-grid recipient-policy-sharing-responsive-grid">
-				{visibleProjectedDevices.map((device, index) => {
-					const titleId = `devices-card-title-${index}`;
-					const action = device.action;
-					const matchedInventoryItem = options.inventory?.items.find(
-						(item) =>
-							item.state === "configured" && item.evidenceDeviceIds.includes(device.deviceId),
-					);
-					const inventoryItem = matchedInventoryItem;
-					return (
-						<li key={device.deviceId}>
-							<article
-								aria-labelledby={titleId}
-								className="peer-card peer-card--padded recipient-policy-sharing-card"
-								id={`device-identity-card-${device.deviceId}`}
-								tabIndex={-1}
-							>
-								<div className="peer-title recipient-policy-sharing-card-title">
-									<h3 id={titleId}>{device.displayName}</h3>
-									<span className="badge actor-badge">
-										{identityMutationsBlocked(options) ? "Device" : "Configured"} ·{" "}
-										{device.availabilityLabel}
-									</span>
-								</div>
-								<dl className="recipient-policy-sharing-details">
-									<div>
-										<dt>Owning Identity</dt>
-										<dd>{device.identityName}</dd>
-									</div>
-									<div>
-										<dt>Availability</dt>
-										<dd>{device.availabilityLabel}</dd>
-									</div>
-									{device.isPairedPeer ? (
-										<div>
-											<dt>Codemem version</dt>
-											<dd>{device.reportedRuntimeVersion ?? "Not reported"}</dd>
-										</div>
-									) : null}
-									<div>
-										<dt>Sharing status</dt>
-										<dd>
-											<strong>{device.statusLabel}</strong> — {device.statusCopy}
-										</dd>
-									</div>
-								</dl>
-								<section aria-labelledby={`${titleId}-direct`}>
-									<h4 id={`${titleId}-direct`}>Direct Projects</h4>
-									<ProjectList
-										empty="No Projects are shared directly."
-										projects={device.directProjects}
-									/>
-								</section>
-								<section aria-labelledby={`${titleId}-teams`}>
-									<h4 id={`${titleId}-teams`}>Projects through Teams</h4>
-									<ProjectList
-										empty="Per-device Team access is not shown because Team membership alone does not prove this device receives the Team’s Projects."
-										projects={device.inheritedProjects}
-									/>
-								</section>
-								{device.unavailableProjectCount > 0 ? (
-									<p className="small" role="status">
-										Some Project names are unavailable and are not shown.
-									</p>
-								) : null}
-								{device.deliveredCopiesMayRemain ? (
-									<p className="small">
-										<strong>Delivered copies:</strong> Changing access stops future delivery, but
-										copies already delivered may remain on this device or in backups.
-									</p>
-								) : null}
-								{action && options.onNavigate ? (
-									<button
-										aria-label={`${action.label} for ${device.displayName}`}
-										className="settings-button recipient-policy-sharing-target-24"
-										onClick={() => options.onNavigate?.(action.target)}
-										ref={(element) => {
-											if (element) {
-												deviceActionFocusIdentities.set(element, {
-													deviceId: device.deviceId,
-													target: action.target,
-												});
-											}
-										}}
-										type="button"
-									>
-										{action.label}
-									</button>
-								) : null}
-								{inventoryItem && options.inventory ? (
-									<ConfiguredRebind
-										intent={intent}
-										inventory={options.inventory}
-										item={inventoryItem}
-										options={options}
-										previousIdentityName={device.identityName}
-									/>
-								) : null}
-							</article>
-						</li>
-					);
-				})}
-			</ul>
+			<ConfiguredDeviceInventory
+				devices={visibleProjectedDevices}
+				intent={intent}
+				options={options}
+				unknownFallbackCount={configuredFallbackItems.length + setupItems.length}
+			/>
 			{projection.revokedDeviceCount > 0 ? (
 				<p className="small" role="status">
 					{projection.revokedDeviceCount.toLocaleString()} revoked{" "}
@@ -1300,6 +1587,92 @@ function DevicesView({
 			) : null}
 		</>
 	);
+}
+
+function DevicesRoot({
+	intent,
+	options,
+	projection,
+}: {
+	intent: RecipientPolicyIntentGraphV1;
+	options: DevicesRendererOptions;
+	projection: DevicesProjection;
+}) {
+	const visibleProjectedDevices = projection.devices.filter(
+		(device) =>
+			!options.inventory?.items.some(
+				(item) => item.state !== "configured" && item.evidenceDeviceIds.includes(device.deviceId),
+			),
+	);
+	const projectedDeviceIds = new Set(visibleProjectedDevices.map((device) => device.deviceId));
+	const configuredFallbackCount =
+		options.inventory?.items.filter(
+			(item) =>
+				item.state === "configured" &&
+				!item.evidenceDeviceIds.some((deviceId) => projectedDeviceIds.has(deviceId)),
+		).length ?? 0;
+	const visibleDeviceCount =
+		visibleProjectedDevices.length +
+		deviceIdentityAttentionItems(options.inventory).length +
+		configuredFallbackCount;
+	const showDeviceCount = !options.loading && !options.loadError;
+	return (
+		<section
+			aria-labelledby="devices-heading"
+			className="recipient-policy-sharing recipient-policy-sharing-responsive-surface"
+		>
+			<div className="recipient-policy-sharing-header">
+				<h2 id="devices-heading" tabIndex={-1}>
+					Devices{" "}
+					{showDeviceCount ? (
+						<span className="devices-heading-count">{visibleDeviceCount}</span>
+					) : null}
+				</h2>
+				{options.onNavigate ? (
+					<button
+						className="settings-save"
+						onClick={() => options.onNavigate?.("sharing")}
+						type="button"
+					>
+						Add a device
+					</button>
+				) : null}
+			</div>
+			<DevicesView intent={intent} options={options} projection={projection} />
+			<p aria-live="polite" id={DEVICE_COMMIT_STATUS_ID} role="status" />
+		</section>
+	);
+}
+
+function restoreDeviceActionFocus(
+	mount: HTMLElement,
+	focusedAction: DeviceActionFocusIdentity,
+	focusedElement: Element | null,
+): void {
+	if (focusedElement?.isConnected && document.activeElement === focusedElement) return;
+	const focusTargets = [
+		...mount.querySelectorAll<HTMLElement>(".feed-menu-trigger, .feed-menu-item"),
+	];
+	const matchingAction = focusTargets.find((element) => {
+		const identity = deviceActionFocusIdentities.get(element);
+		return (
+			identity?.control === focusedAction.control &&
+			identity.deviceId === focusedAction.deviceId &&
+			identity.target === focusedAction.target
+		);
+	});
+	const fallbackMenu = focusTargets.find((element) => {
+		const identity = deviceActionFocusIdentities.get(element);
+		return identity?.control === "menu" && identity.deviceId === focusedAction.deviceId;
+	});
+	(matchingAction ?? fallbackMenu ?? document.getElementById("tabBtn-devices"))?.focus();
+}
+
+function deviceFocusIdentity(element: Element): DeviceActionFocusIdentity | undefined {
+	const direct = deviceActionFocusIdentities.get(element as HTMLElement);
+	if (direct) return direct;
+	const summary = element.closest(".devices-row-menu")?.querySelector<HTMLElement>("summary");
+	return summary ? deviceActionFocusIdentities.get(summary) : undefined;
 }
 
 export function mountDevices(
@@ -1312,9 +1685,7 @@ export function mountDevices(
 ): void {
 	const focusedElement = document.activeElement;
 	const hadDevicesFocus = focusedElement instanceof HTMLElement && mount.contains(focusedElement);
-	const focusedAction = hadDevicesFocus
-		? deviceActionFocusIdentities.get(focusedElement)
-		: undefined;
+	const focusedAction = hadDevicesFocus ? deviceFocusIdentity(focusedElement) : undefined;
 	const projection = projectDevices(
 		intent,
 		reconciliation,
@@ -1322,24 +1693,7 @@ export function mountDevices(
 		availability,
 		options.peerRuntimeMetadata,
 	);
-	render(
-		<section
-			aria-labelledby="devices-heading"
-			className="recipient-policy-sharing recipient-policy-sharing-responsive-surface"
-		>
-			<div className="recipient-policy-sharing-header">
-				<h2 id="devices-heading" tabIndex={-1}>
-					Devices
-				</h2>
-				<p className="small">
-					See where Codemem runs and which Projects each active device receives.
-				</p>
-			</div>
-			<DevicesView intent={intent} options={options} projection={projection} />
-			<p aria-live="polite" id={DEVICE_COMMIT_STATUS_ID} role="status" />
-		</section>,
-		mount,
-	);
+	render(<DevicesRoot intent={intent} options={options} projection={projection} />, mount);
 	setDeviceCommitStatus("");
 	if (!options.loading && state.pendingDeviceIdentityFocus !== undefined) {
 		const deviceId = state.pendingDeviceIdentityFocus;
@@ -1370,11 +1724,5 @@ export function mountDevices(
 		}
 	}
 	if (!focusedAction) return;
-	const matchingAction = [...mount.querySelectorAll<HTMLElement>("button")].find((element) => {
-		const identity = deviceActionFocusIdentities.get(element);
-		return (
-			identity?.deviceId === focusedAction.deviceId && identity.target === focusedAction.target
-		);
-	});
-	(matchingAction ?? document.getElementById("tabBtn-devices"))?.focus();
+	restoreDeviceActionFocus(mount, focusedAction, focusedElement);
 }
