@@ -81,7 +81,9 @@ describe("project-first navigation layout", () => {
 		expect(html).toContain('aria-label="Advanced sections" role="group"');
 		expect(advanced).toContain('id="coordinatorAdminLegacyNoticeTitle" tabindex="-1"');
 	});
+});
 
+describe("project-first navigation layout", () => {
 	it("keeps the legacy notice visible when technical controls are collapsed", () => {
 		const panelStart = html.indexOf('id="advancedTeamsContent"');
 		const disclosureStart = html.indexOf("<details", panelStart);
@@ -171,7 +173,9 @@ describe("project-first navigation layout", () => {
 		expect(coordinatorGroupsSource).not.toContain('"Create Team"');
 		expect(coordinatorGroupsSource).not.toContain('"Manage Team"');
 	});
+});
 
+describe("project-first navigation layout", () => {
 	it("marks only the initial Feed control with aria-current", () => {
 		const navigation = html.slice(
 			html.indexOf('<nav class="tab-bar"'),
@@ -220,7 +224,7 @@ describe("project-first navigation layout", () => {
 		expect(primary).not.toContain("Space");
 	});
 
-	it("keeps legacy device controls available but outside the primary project-sharing flow", () => {
+	it("keeps legacy identity controls available without a second pairing workflow", () => {
 		const primary = html.indexOf('id="syncProjectShareOperations"');
 		const advanced = html.indexOf("Manual device and identity controls");
 		const assignment = html.indexOf('id="syncActorCreateButton"');
@@ -230,10 +234,13 @@ describe("project-first navigation layout", () => {
 		expect(advanced).toBeGreaterThan(primary);
 		expect(assignment).toBeGreaterThan(advanced);
 		expect(diagnostics).toBeGreaterThan(assignment);
-		expect(html.slice(advanced, diagnostics)).toContain("Connect another device");
+		expect(html.slice(advanced, diagnostics)).not.toContain("Connect another device");
+		expect(html.slice(advanced, diagnostics)).not.toContain("syncPairingDisclosureMount");
 		expect(html.slice(advanced, diagnostics)).toContain("Create person");
 	});
+});
 
+describe("project-first navigation layout", () => {
 	it("keeps the legacy upgrade review destination available", () => {
 		expect(html).toContain('id="syncSharingReview"');
 	});
