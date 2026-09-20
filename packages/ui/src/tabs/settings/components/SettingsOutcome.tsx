@@ -1,0 +1,168 @@
+import { INPUT_TO_CONFIG_KEY } from "../data/constants";
+import { settingsState, settingsView } from "../data/state";
+
+export type SettingsOutcomeDetails = {
+	controlId: string;
+	existingData: string;
+	scope: string;
+	stage: string;
+	timing: string;
+};
+
+export type SettingsOutcomeContext = {
+	observerRuntime?: string;
+};
+
+function observationOutcome(controlId: string): SettingsOutcomeDetails {
+	return {
+		controlId,
+		existingData: "Stored memories stay unchanged; no backfill runs.",
+		scope: "Queued and future model requests on this device",
+		stage: "Observation processing",
+		timing: "After viewer restart",
+	};
+}
+
+function processingOutcome(controlId: string): SettingsOutcomeDetails {
+	return {
+		controlId,
+		existingData: "Stored memories stay unchanged; no reprocessing runs.",
+		scope: "Queued and future events on this device",
+		stage: "Observation processing",
+		timing: "After viewer restart",
+	};
+}
+
+function packOutcome(controlId: string): SettingsOutcomeDetails {
+	return {
+		controlId,
+		existingData: "Stored memories and existing packs stay unchanged; the value is saved only.",
+		scope: "No current effect",
+		stage: "Saved setting",
+		timing: "Not used when Codemem creates context packs",
+	};
+}
+
+function syncOutcome(controlId: string, scope: string): SettingsOutcomeDetails {
+	return {
+		controlId,
+		existingData:
+			"Existing memories are not reprocessed locally, but eligible memories may be sent to or received from trusted peers.",
+		scope,
+		stage: "Device sync",
+		timing: "After viewer restart",
+	};
+}
+
+function sidecarAuthOutcome(controlId: string): SettingsOutcomeDetails {
+	return {
+		controlId,
+		existingData:
+			"Stored memories stay unchanged. Local Claude and Codex sessions authenticate through their CLI logins instead.",
+		scope: "No effect while Connection mode uses a local Claude or Codex session",
+		stage: "Sidecar authentication",
+		timing: "Not used by local Claude or Codex sessions",
+	};
+}
+
+const SIDECAR_AUTH_CONTROL_IDS = new Set([
+	"observerAuthSource",
+	"observerAuthTimeoutMs",
+	"observerAuthCacheTtlS",
+]);
+
+function isSidecarRuntime(runtime: string | undefined): boolean {
+	return runtime === "claude_sidecar" || runtime === "codex_sidecar";
+}
+
+const OUTCOMES_BY_CONTROL_ID: Record<string, SettingsOutcomeDetails> = Object.fromEntries(
+	[
+		...[
+			"observerProvider",
+			"observerModel",
+			"observerRuntime",
+			"observerMaxChars",
+			"observerAuthSource",
+			"observerAuthTimeoutMs",
+			"observerAuthCacheTtlS",
+		].map(observationOutcome),
+		...[
+			"observerTierRoutingEnabled",
+			"observerSimpleModel",
+			"observerSimpleTemperature",
+			"observerReasoningEffort",
+			"observerReasoningSummary",
+			"observerRichModel",
+			"observerRichTemperature",
+			"observerRichReasoningEffort",
+			"observerRichReasoningSummary",
+			"observerRichMaxOutputTokens",
+		].map(processingOutcome),
+		packOutcome("packObservationLimit"),
+		packOutcome("packSessionLimit"),
+		{
+			controlId: "rawEventsSweeperIntervalS",
+			existingData: "Processed events stay unchanged; no backfill runs.",
+			scope: "Background queue on this viewer",
+			stage: "Queue processing",
+			timing: "Immediately after save",
+		},
+		syncOutcome("syncEnabled", "Future sync cycles on this device"),
+		syncOutcome("syncInterval", "Future sync cycles on this device"),
+		syncOutcome("syncHost", "Incoming peer connections to this device"),
+		syncOutcome("syncPort", "Incoming peer connections to this device"),
+		syncOutcome("syncMdns", "Local-network peer discovery on this device"),
+		syncOutcome(
+			"syncCoordinatorGroup",
+			"Fallback coordinator discovery when no coordinator group list is configured",
+		),
+		syncOutcome("syncCoordinatorTimeout", "Future coordinator requests"),
+		syncOutcome("syncCoordinatorPresenceTtl", "Future coordinator presence checks"),
+	].map((outcome) => [outcome.controlId, outcome]),
+);
+
+export function settingsOutcomeFor(
+	controlId: string,
+	context: SettingsOutcomeContext = {},
+): SettingsOutcomeDetails | undefined {
+	const outcome = OUTCOMES_BY_CONTROL_ID[controlId];
+	if (!outcome) return undefined;
+	const observerRuntime =
+		context.observerRuntime ?? settingsView.value.renderState.values.observerRuntime;
+	if (SIDECAR_AUTH_CONTROL_IDS.has(controlId) && isSidecarRuntime(observerRuntime)) {
+		return sidecarAuthOutcome(controlId);
+	}
+	if (outcome.scope === "No current effect") return outcome;
+	const configKey = INPUT_TO_CONFIG_KEY[controlId as keyof typeof INPUT_TO_CONFIG_KEY];
+	const override = configKey ? settingsState.envOverrides[configKey] : undefined;
+	if (typeof override !== "string" || !override.trim()) return outcome;
+	return {
+		...outcome,
+		timing: `After removing ${override.trim()} and restarting the viewer`,
+	};
+}
+
+export function SettingsOutcome({
+	controlId,
+	existingData,
+	scope,
+	stage,
+	timing,
+}: SettingsOutcomeDetails) {
+	return (
+		<p className="settings-outcome" data-settings-outcome-for={controlId}>
+			<span>
+				<strong>Affects:</strong> {stage}
+			</span>
+			<span>
+				<strong>Scope:</strong> {scope}
+			</span>
+			<span>
+				<strong>Takes effect:</strong> {timing}
+			</span>
+			<span>
+				<strong>Existing data:</strong> {existingData}
+			</span>
+		</p>
+	);
+}
