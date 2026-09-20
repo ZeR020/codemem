@@ -6,7 +6,7 @@ import { humanPresentationLabel } from "../../../lib/identity-presentation";
 import { state } from "../../../lib/state";
 import type { FeedItem, FeedItemMetadata } from "../types";
 
-function isOwnedBySelf(item: FeedItem): boolean {
+export function isOwnedBySelf(item: FeedItem): boolean {
 	if (item.owned_by_self === true) return true;
 	const actorId = String(item.actor_id || "").trim();
 	return Boolean(actorId && actorId === state.viewerActorId);
@@ -98,6 +98,26 @@ export function trustStateLabel(trustState: string): string {
 	if (trustState === "legacy_unknown") return "legacy provenance";
 	if (trustState === "unreviewed") return "unreviewed";
 	return trustState.replace(/_/g, " ");
+}
+
+const ORIGIN_SOURCE_LABELS: Readonly<Record<string, string>> = {
+	claude: "Claude Code",
+	codex: "Codex",
+	"derive-batch": "Derived memory",
+	mcp: "MCP",
+	observer: "Observer",
+	observer_summary: "Session summary",
+	opencode: "OpenCode",
+	pi: "Pi",
+	plugin: "Plugin",
+};
+
+export function originSourceLabel(value: unknown): string {
+	const source = String(value || "")
+		.trim()
+		.toLowerCase();
+	if (!source) return "";
+	return ORIGIN_SOURCE_LABELS[source] || "Other source";
 }
 
 export function authorLabel(item: FeedItem): string {
