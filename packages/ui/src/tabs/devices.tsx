@@ -1512,6 +1512,7 @@ function ThisDeviceRow({
 	inventory?: DeviceIdentityInventoryV1;
 }) {
 	const localDevice = inventory?.items.find((item) => item.isLocal);
+	if (!localDevice) return null;
 	const identityName = intent.identities.find(
 		(identity) => identity.identityId === localDevice?.identityId && identity.status === "active",
 	)?.displayName;
@@ -1540,10 +1541,15 @@ function restorePairingControls(
 	visibility: { host: HTMLElement; wasHidden: HTMLElement["hidden"] },
 ): void {
 	if (panel.parentElement === visibility.host) panel.hidden = visibility.wasHidden;
-	if (restoreParent && panel.parentElement !== restoreParent) restoreParent.appendChild(panel);
-	if (!movedFeedback || !feedbackRestoreParent) return;
-	if (movedFeedback.parentElement === feedbackRestoreParent) return;
-	feedbackRestoreParent.appendChild(movedFeedback);
+	else if (panel.parentElement?.isConnected) restoreParent = panel.parentElement;
+	const liveParent = restoreParent?.isConnected
+		? restoreParent
+		: document.getElementById("syncJoinSection");
+	if (liveParent && panel.parentElement !== liveParent) liveParent.appendChild(panel);
+	const feedbackParent = feedbackRestoreParent?.isConnected ? feedbackRestoreParent : liveParent;
+	if (!movedFeedback || !feedbackParent) return;
+	if (movedFeedback.parentElement === feedbackParent) return;
+	feedbackParent.appendChild(movedFeedback);
 }
 
 function PairingAcceptancePanel() {
@@ -1552,8 +1558,8 @@ function PairingAcceptancePanel() {
 		const host = hostRef.current;
 		const panel = document.getElementById("syncJoinPanel");
 		if (!host || !panel) return;
-		const restoreParent = panel.parentElement;
-		const wasHidden = panel.hidden;
+		let restoreParent = panel.parentElement;
+		let wasHidden = panel.hidden;
 		let movedFeedback: HTMLElement | null = null;
 		let feedbackRestoreParent: HTMLElement | null = null;
 		const mountPairingControls = () => {
@@ -1564,7 +1570,11 @@ function PairingAcceptancePanel() {
 				});
 				return;
 			}
-			if (panel.parentElement !== host) host.appendChild(panel);
+			if (panel.parentElement !== host) {
+				restoreParent = panel.parentElement;
+				wasHidden = panel.hidden;
+				host.appendChild(panel);
+			}
 			panel.hidden = false;
 			const feedback = document.getElementById("syncJoinFeedback");
 			if (!feedback || feedback.parentElement === host) return;
@@ -1582,9 +1592,10 @@ function PairingAcceptancePanel() {
 		});
 		return () => {
 			observer.disconnect();
-			panel.hidden = wasHidden;
-			if (restoreParent) restoreParent.appendChild(panel);
-			if (movedFeedback && feedbackRestoreParent) feedbackRestoreParent.appendChild(movedFeedback);
+			restorePairingControls(panel, restoreParent, movedFeedback, feedbackRestoreParent, {
+				host,
+				wasHidden,
+			});
 		};
 	}, []);
 	return <div className="devices-pairing-accept" ref={hostRef} />;
@@ -1666,6 +1677,15 @@ function PairingPanel({
 					Paste a payload from a device you trust. Accepting it trusts that device.
 				</p>
 				<PairingAcceptancePanel />
+			</div>
+			<div className="devices-pairing-reciprocal">
+				<h4>Complete pairing on the other device</h4>
+				<p className="small">
+					On this device, enable sync and restart the server, then run{" "}
+					<code>codemem sync pair --payload-only</code>. On the other device, open Devices → Pair a
+					device and accept this device’s payload. Each device must accept the other’s payload
+					before they can exchange memories.
+				</p>
 			</div>
 		</aside>
 	);
