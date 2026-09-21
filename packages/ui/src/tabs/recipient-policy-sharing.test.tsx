@@ -1,7 +1,9 @@
+/// <reference types="vite/client" />
 import { type ComponentChildren, render } from "preact";
 import { useEffect, useRef } from "preact/hooks";
 import { act } from "preact/test-utils";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import html from "../../static/index.html?raw";
 
 const openManagement = vi.hoisted(() => vi.fn());
 
@@ -52,6 +54,7 @@ vi.mock("./recipient-policy-management", async (importOriginal) => {
 });
 
 import type {
+	DeviceIdentityInventoryV1,
 	LegacyTeamSetupSummaryResponseV1,
 	RecipientPolicyIntentGraphV1,
 } from "../lib/api/sync";
@@ -457,6 +460,12 @@ function testRecipientFocusedSetupAndKeyboard() {
 			).click(),
 		);
 		expect(onReviewDevices).toHaveBeenCalledWith("setup");
+		act(() => tab("Identities").click());
+		const adam = [...visiblePanel().querySelectorAll("article")].find(
+			(card) => card.querySelector("h3")?.textContent === "Adam",
+		);
+		expect(adam?.textContent).toContain("Devices · 2");
+		expect(adam?.textContent).toContain("configured");
 	});
 
 	it("supports automatic keyboard tab activation, wraparound, Home, End, and focus", () => {
@@ -504,9 +513,50 @@ function testRecipientFocusedSetupAndKeyboard() {
 
 describe("recipient-focused Sharing setup", testRecipientFocusedSetupAndKeyboard);
 
+describe("Sharing long member names", () => {
+	registerRecipientFocusedSharingLifecycle();
+	it.each([1, 2, 3])("keeps %i long member names accessible", (count) => {
+		const graph = intent();
+		const names = Array.from({ length: count }, (_, index) =>
+			`Member ${index} ${"Long name ".repeat(30)}`.trim(),
+		);
+		graph.identities = names.map((displayName, index) => ({
+			...graph.identities[0],
+			displayName,
+			identityId: `identity-${index}`,
+		}));
+		graph.teamMemberships = graph.identities.map(({ identityId }) => ({
+			version: 1,
+			teamId: "team-example",
+			identityId,
+			role: "member",
+			status: "active",
+		}));
+		mount(graph);
+		const preview = visiblePanel().querySelector(".sharing-member-preview");
+		const disclosure = preview?.closest("details");
+		if (count <= 2) {
+			expect(disclosure).toBeNull();
+			for (const name of names) expect(preview?.textContent).toContain(name);
+		} else {
+			expect(disclosure?.querySelector("summary")?.textContent).toContain("+1 more");
+			for (const name of names) expect(disclosure?.querySelector("p")?.textContent).toContain(name);
+		}
+		const rules = [...html.matchAll(/([^{}]+)\{([^{}]+)\}/g)];
+		const previewRules = rules.filter((rule) => rule[1].includes(".sharing-member-preview"));
+		expect(previewRules).toHaveLength(2);
+		for (const rule of previewRules) {
+			if (!rule[2].includes("line-clamp")) continue;
+			expect(rule[1].trim()).toBe(".sharing-member-names .sharing-member-preview");
+		}
+		expect(
+			previewRules.find((rule) => rule[1].trim() === ".sharing-member-preview")?.[2],
+		).toContain("overflow-wrap: anywhere");
+	});
+});
+
 function testRecipientFocusedTeamViews() {
 	registerRecipientFocusedSharingLifecycle();
-
 	it("shows Team members, current devices, shared Projects, and future-member inheritance", () => {
 		const graph = intent();
 		graph.identities = graph.identities.map((identity) => ({
@@ -588,14 +638,253 @@ function testRecipientFocusedTeamViews() {
 		});
 
 		expect(visiblePanel().textContent).toContain("Adam, Brian, Casey, Devon");
+		const disclosure = visiblePanel().querySelector<HTMLDetailsElement>(".sharing-member-names");
+		expect(disclosure?.open).toBe(false);
+		expect(disclosure?.querySelector("summary")?.textContent).toContain("+2 more");
+		expect(disclosure?.querySelector("summary")?.textContent).not.toContain("Devon");
 		expect(visiblePanel().querySelector(".recipient-policy-sharing-name-details")).toBeNull();
 	});
 }
 
 describe("recipient-focused Sharing Team views", testRecipientFocusedTeamViews);
 
+function configuredInventory(
+	items: { deviceId: string; identityId: string; evidenceDeviceIds?: string[] }[],
+): DeviceIdentityInventoryV1 {
+	return {
+		version: 1,
+		truncated: false,
+		coordinatorEvidence: { availability: "available", safeErrorCode: null },
+		items: items.map(({ deviceId, identityId, evidenceDeviceIds = [deviceId] }) => ({
+			version: 1,
+			deviceId,
+			identityId,
+			evidenceDeviceIds,
+			displayName: `Inventory ${deviceId}`,
+			state: "configured",
+			suggestedIdentityId: null,
+			validatedFingerprint: null,
+			isLocal: false,
+			sources: ["sync_peer"],
+			conflictCodes: [],
+		})),
+	};
+}
+
+describe("Sharing merged device summaries", () => {
+	registerRecipientFocusedSharingLifecycle();
+	it.each(["device-adam-1", "reassigned-alias"])(
+		"keeps intent ownership when successful inventory disagrees for %s",
+		(deviceId) => {
+			mount(intent(), {
+				refreshError: false,
+				deviceInventoryUnavailable: false,
+				deviceInventory: configuredInventory([
+					{ deviceId, identityId: "identity-brian", evidenceDeviceIds: ["device-adam-1"] },
+				]),
+			});
+			expect(visiblePanel().textContent).toContain("2Registered devices");
+			clickTab("Identities");
+			const cards = [...visiblePanel().querySelectorAll(".recipient-policy-sharing-identity-card")];
+			expect(cards[0]?.textContent).toContain("Devices · 1Adam’s Mac");
+			expect(cards[1]?.textContent).toContain("Devices · 1Brian’s PC");
+			expect(visiblePanel().textContent).not.toContain(`Inventory ${deviceId}`);
+		},
+	);
+	it("counts fallback devices once across Team members and duplicate memberships", () => {
+		const graph = intent();
+		graph.teamMemberships.push({ ...graph.teamMemberships[0] });
+		mount(graph, {
+			deviceInventory: configuredInventory([
+				{ deviceId: "fallback", identityId: "identity-adam", evidenceDeviceIds: ["shared-alias"] },
+				{ deviceId: "shared-alias", identityId: "identity-brian" },
+			]),
+		});
+		expect(visiblePanel().textContent).toContain("3Registered devices");
+		clickTab("Identities");
+		const cards = [...visiblePanel().querySelectorAll(".recipient-policy-sharing-identity-card")];
+		expect(cards[0]?.textContent).toContain("Devices · 2");
+		expect(cards[0]?.textContent).toContain("Inventory fallback");
+		expect(cards[1]?.textContent).toContain("Devices · 1");
+		expect(cards[1]?.textContent).not.toContain("Inventory shared-alias");
+	});
+	it.each(["refreshError", "deviceInventoryUnavailable"])(
+		"excludes fallback from both views on %s",
+		(error) => {
+			mount(intent(), {
+				[error]: true,
+				deviceInventory: configuredInventory([
+					{ deviceId: "fallback", identityId: "identity-adam" },
+				]),
+			});
+			expect(visiblePanel().textContent).toContain("2Registered devices");
+			clickTab("Identities");
+			expect(visiblePanel().textContent).not.toContain("Inventory fallback");
+		},
+	);
+});
+
+describe("Sharing revoked intent devices", () => {
+	registerRecipientFocusedSharingLifecycle();
+	it.each(["device-adam-old", "stale-alias"])(
+		"does not restore revoked intent from successful stale inventory for %s",
+		(deviceId) => {
+			mount(intent(), {
+				refreshError: false,
+				deviceInventoryUnavailable: false,
+				deviceInventory: configuredInventory([
+					{ deviceId, identityId: "identity-adam", evidenceDeviceIds: ["device-adam-old"] },
+				]),
+			});
+			expect(visiblePanel().textContent).toContain("2Registered devices");
+			clickTab("Identities");
+			const cards = [...visiblePanel().querySelectorAll(".recipient-policy-sharing-identity-card")];
+			expect(cards[0]?.textContent).toContain("Devices · 1Adam’s Mac");
+			expect(cards[1]?.textContent).toContain("Devices · 1Brian’s PC");
+			expect(visiblePanel().textContent).not.toContain(`Inventory ${deviceId}`);
+		},
+	);
+	it("retains active intent when inventory groups active and revoked aliases", () => {
+		mount(intent(), {
+			deviceInventory: configuredInventory([
+				{
+					deviceId: "stale-alias",
+					identityId: "identity-brian",
+					evidenceDeviceIds: ["device-adam-old", "device-adam-1"],
+				},
+			]),
+		});
+		expect(visiblePanel().textContent).toContain("2Registered devices");
+		clickTab("Identities");
+		const cards = [...visiblePanel().querySelectorAll(".recipient-policy-sharing-identity-card")];
+		expect(cards[0]?.textContent).toContain("Devices · 1Adam’s Mac");
+		expect(cards[1]?.textContent).toContain("Devices · 1Brian’s PC");
+		expect(visiblePanel().textContent).not.toContain("Inventory stale-alias");
+	});
+	it("does not let an earlier revoked binding hide an active binding for the same ID", () => {
+		const graph = intent();
+		graph.identityDevices.unshift({ ...graph.identityDevices[0], status: "revoked" });
+		mount(graph);
+		expect(visiblePanel().textContent).toContain("2Registered devices");
+		clickTab("Identities");
+		expect(visiblePanel().textContent).toContain("Devices · 1Adam’s Mac");
+	});
+});
+
+describe("Sharing intent aliases", () => {
+	registerRecipientFocusedSharingLifecycle();
+	it.each(["identity-adam", "identity-brian"])(
+		"collapses same-owner intent aliases without adopting inventory owner %s",
+		(identityId) => {
+			const graph = intent();
+			graph.identityDevices.push({
+				...graph.identityDevices[0],
+				deviceId: "adam-alias",
+				displayName: "Alias laptop",
+			});
+			mount(graph, {
+				deviceInventory: configuredInventory([
+					{ deviceId: "canonical", identityId, evidenceDeviceIds: ["device-adam-1", "adam-alias"] },
+				]),
+			});
+			expect(visiblePanel().textContent).toContain("2Registered devices");
+			clickTab("Identities");
+			const cards = [...visiblePanel().querySelectorAll(".recipient-policy-sharing-identity-card")];
+			expect(cards[0]?.textContent).toContain("Devices · 1Adam’s Mac");
+			expect(cards[1]?.textContent).toContain("Devices · 1Brian’s PC");
+			expect(visiblePanel().textContent).not.toContain("Alias laptop");
+			expect(visiblePanel().textContent).not.toContain("Inventory canonical");
+		},
+	);
+	it("retains conflicting intent owners without adding the inventory owner", () => {
+		const graph = intent();
+		graph.identities.push({
+			...graph.identities[0],
+			identityId: "identity-casey",
+			displayName: "Casey",
+		});
+		const activeDeviceIds = graph.identityDevices
+			.filter((device) => device.status === "active")
+			.map((device) => device.deviceId);
+		mount(graph, {
+			deviceInventory: configuredInventory([
+				{ deviceId: "canonical", identityId: "identity-casey", evidenceDeviceIds: activeDeviceIds },
+			]),
+		});
+		expect(visiblePanel().textContent).toContain("2Registered devices");
+		clickTab("Identities");
+		const cards = [...visiblePanel().querySelectorAll(".recipient-policy-sharing-identity-card")];
+		expect(cards[0]?.textContent).toContain("Devices · 1Adam’s Mac");
+		expect(cards[1]?.textContent).toContain("Devices · 1Brian’s PC");
+		expect(cards[2]?.textContent).toContain("Devices · 0");
+		expect(visiblePanel().textContent).not.toContain("Inventory canonical");
+	});
+});
+
 function testRecipientFocusedIdentityViews() {
 	registerRecipientFocusedSharingLifecycle();
+	it("does not combine cached intent with fresh reassigned inventory after a required refresh fails", () => {
+		const graph = intent();
+		mount(graph);
+		clickTab("Identities");
+		mount(graph, {
+			refreshError: true,
+			deviceInventoryUnavailable: false,
+			deviceInventory: {
+				version: 1,
+				truncated: false,
+				coordinatorEvidence: { availability: "available", safeErrorCode: null },
+				items: [
+					{
+						version: 1,
+						deviceId: "device-adam-1",
+						evidenceDeviceIds: ["device-adam-1"],
+						displayName: "Reassigned laptop",
+						state: "configured",
+						identityId: "identity-brian",
+						suggestedIdentityId: null,
+						validatedFingerprint: null,
+						isLocal: false,
+						sources: ["sync_peer"],
+						conflictCodes: [],
+					},
+				],
+			},
+		});
+		const cards = [...visiblePanel().querySelectorAll(".recipient-policy-sharing-identity-card")];
+		expect(cards[0]?.textContent).toContain("Devices · 1Adam’s Mac");
+		expect(cards[1]?.textContent).toContain("Devices · 1");
+		expect(cards[1]?.textContent).not.toContain("Devices · 2");
+		expect(visiblePanel().textContent).not.toContain("Reassigned laptop");
+	});
+	it("does not add cached configured devices after inventory refresh fails", () => {
+		mount(intent({ identityDevices: [] }), {
+			deviceInventoryUnavailable: true,
+			deviceInventory: {
+				version: 1,
+				truncated: false,
+				coordinatorEvidence: { availability: "available", safeErrorCode: null },
+				items: [
+					{
+						version: 1,
+						deviceId: "removed-device",
+						evidenceDeviceIds: ["removed-device"],
+						displayName: "Removed laptop",
+						state: "configured",
+						identityId: "identity-adam",
+						suggestedIdentityId: null,
+						validatedFingerprint: null,
+						isLocal: false,
+						sources: ["sync_peer"],
+						conflictCodes: [],
+					},
+				],
+			},
+		});
+		act(() => tab("Identities").click());
+		expect(visiblePanel().textContent).toContain("Devices · 0");
+		expect(visiblePanel().textContent).not.toContain("Removed laptop");
+	});
 
 	it("does not infer per-Identity Team access from membership intent", () => {
 		mount();

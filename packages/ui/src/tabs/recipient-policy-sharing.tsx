@@ -274,10 +274,17 @@ function SharingTabPanelContent({
 		);
 	}
 
+	const devices = sharingDevices(
+		intent,
+		options.refreshError || options.deviceInventoryUnavailable
+			? undefined
+			: options.deviceInventory,
+	);
 	switch (tabId) {
 		case "teams":
 			return (
 				<TeamsView
+					devices={devices}
 					disableMutations={options.refreshError === true}
 					intent={intent}
 					onTeamRenamed={options.onTeamRenamed}
@@ -288,6 +295,7 @@ function SharingTabPanelContent({
 		case "identities":
 			return (
 				<IdentitiesView
+					devices={devices}
 					disableMutations={options.refreshError === true}
 					intent={intent}
 					projects={projects}
@@ -392,12 +400,14 @@ function RecipientActions({
 }
 
 function TeamsView({
+	devices,
 	disableMutations,
 	intent,
 	onTeamRenamed,
 	projects,
 	renameTeam,
 }: {
+	devices: SharingDevice[];
 	disableMutations: boolean;
 	intent: RecipientPolicyIntentGraphV1;
 	onTeamRenamed?: () => Promise<unknown> | unknown;
@@ -440,11 +450,9 @@ function TeamsView({
 					(identityId) =>
 						activeIdentitiesById.get(identityId)?.displayName.trim() || "Unknown member",
 				);
-				const activeDeviceCount = new Set(
-					intent.identityDevices
-						.filter((device) => device.status === "active" && memberIds.includes(device.identityId))
-						.map((device) => device.deviceId),
-				).size;
+				const activeDeviceCount = devices.filter((device) =>
+					memberIds.includes(device.identityId),
+				).length;
 				const projectNames = activeProjectNames(
 					intent.projectRecipients
 						.filter(
@@ -491,10 +499,7 @@ function TeamsView({
 						<div className="recipient-policy-sharing-stats">
 							<div>
 								<strong>{memberNames.length}</strong>
-								<span>
-									{memberNames.length === 1 ? "Member" : "Members"} ·{" "}
-									{memberNames.join(", ") || "None"}
-								</span>
+								<MemberNames names={memberNames} />
 							</div>
 							<div>
 								<strong>{activeDeviceCount}</strong>
@@ -516,11 +521,72 @@ function TeamsView({
 	);
 }
 
+function MemberNames({ names }: { names: string[] }) {
+	if (names.length <= 2)
+		return (
+			<span className="sharing-member-preview">
+				{names.length === 1 ? "Member" : "Members"} · {names.join(", ") || "None"}
+			</span>
+		);
+	return (
+		<details className="sharing-member-names">
+			<summary>
+				<span className="sharing-member-preview">Members · {names.slice(0, 2).join(", ")}</span> +
+				{names.length - 2} more
+			</summary>
+			<p>{names.join(", ")}</p>
+		</details>
+	);
+}
+
+type SharingDevice = { deviceId: string; displayName: string; identityId: string };
+
+function sharingDevices(
+	intent: RecipientPolicyIntentGraphV1,
+	inventory?: DeviceIdentityInventoryV1,
+): SharingDevice[] {
+	let result: SharingDevice[] = [];
+	const known = new Set<string>();
+	for (const device of intent.identityDevices) {
+		if (device.status !== "active" || known.has(device.deviceId)) continue;
+		result.push(device);
+		known.add(device.deviceId);
+	}
+	// Revoked intent also blocks fallback, without hiding an active binding for the same ID.
+	for (const device of intent.identityDevices) known.add(device.deviceId);
+	// Intent ownership wins even when successful requests straddle a reassignment.
+	for (const item of inventory?.items ?? []) {
+		if (item.state !== "configured" || !item.identityId) continue;
+		const aliases = [item.deviceId, ...item.evidenceDeviceIds];
+		const alreadyKnown = aliases.some((id) => known.has(id));
+		for (const id of aliases) known.add(id);
+		if (alreadyKnown) {
+			// Alias evidence deduplicates devices, but cannot choose between intent owners.
+			const owners = new Set<string>();
+			result = result.filter((device) => {
+				if (!aliases.includes(device.deviceId)) return true;
+				if (owners.has(device.identityId)) return false;
+				owners.add(device.identityId);
+				return true;
+			});
+			continue;
+		}
+		result.push({
+			deviceId: item.deviceId,
+			displayName: item.displayName,
+			identityId: item.identityId,
+		});
+	}
+	return result;
+}
+
 function IdentitiesView({
+	devices,
 	disableMutations,
 	intent,
 	projects,
 }: {
+	devices: SharingDevice[];
 	disableMutations: boolean;
 	intent: RecipientPolicyIntentGraphV1;
 	projects: RecipientPolicyManagementProject[];
@@ -544,9 +610,7 @@ function IdentitiesView({
 	return (
 		<div className="recipient-policy-sharing-grid recipient-policy-sharing-responsive-grid">
 			{activeIdentities.map((identity, index) => {
-				const activeDevices = intent.identityDevices.filter(
-					(device) => device.status === "active" && device.identityId === identity.identityId,
-				);
+				const activeDevices = devices.filter((device) => device.identityId === identity.identityId);
 				const teamIds = [
 					...new Set(
 						intent.teamMemberships
