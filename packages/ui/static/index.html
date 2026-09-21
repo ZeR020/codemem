@@ -2667,6 +2667,12 @@
         background: var(--surface-2);
         color: var(--text-tertiary);
       }
+      .feed-item .feed-meta-line > *, .feed-item .feed-expanded-provenance > * {
+        min-width: 0;
+        max-width: 100%;
+        white-space: normal;
+        overflow-wrap: anywhere;
+      }
       .provenance-chip.mine { background: var(--accent-subtle); color: var(--accent); border-color: rgba(43, 122, 176, 0.18); }
       .provenance-chip.author { color: var(--text-secondary); }
       .provenance-chip.private { background: rgba(140, 140, 140, 0.12); color: var(--text-secondary); }

@@ -1,9 +1,8 @@
 import { h, type TargetedEvent } from "preact";
-import { useEffect, useRef, useState } from "preact/hooks";
+import { useEffect, useLayoutEffect, useRef, useState } from "preact/hooks";
 import { Chip } from "../../../components/primitives/chip";
 import { Tooltip } from "../../../components/primitives/tooltip";
 import * as api from "../../../lib/api";
-import { highlightText } from "../../../lib/dom";
 import { formatDate, formatRelativeTime } from "../../../lib/format";
 import { showGlobalNotice } from "../../../lib/notice";
 import { setPreferredFeedViewMode, state } from "../../../lib/state";
@@ -17,6 +16,8 @@ import {
 	buildFeedCardViewModel,
 	type FeedCardMode,
 	hiddenSearchMatch,
+	highlightFeedText,
+	normalizeFeedQuery,
 	preferredAvailableMode,
 	visibleSkimPrefixLength,
 } from "../data/card-view-model";
@@ -121,16 +122,30 @@ function usePollingModeState(input: {
 	}, [input]);
 }
 
-function shouldShowSearchMatch(
-	searchMatch: ReturnType<typeof hiddenSearchMatch>,
-	expanded: boolean,
-	activeMode: FeedCardMode | undefined,
-	query: string,
-) {
-	if (!searchMatch) return false;
-	if (searchMatch.mode === null) return true;
-	if (!expanded || !activeMode) return true;
-	return !activeMode.searchText.toLocaleLowerCase().includes(query.trim().toLocaleLowerCase());
+function renderedSearchText(node: Node): string {
+	if (node.nodeType === Node.TEXT_NODE) return node.textContent ?? "";
+	if (!(node instanceof Element)) return "";
+	const text = Array.from(node.childNodes, renderedSearchText).join("");
+	// Keep inline words intact, but never join text across rendered blocks or breaks.
+	if (
+		node.matches(
+			"p, div, li, ul, ol, blockquote, pre, h1, h2, h3, h4, h5, h6, table, tr, th, td, hr, br",
+		)
+	) {
+		return `\n${text}\n`;
+	}
+	return text;
+}
+
+function useRenderedSearchMatch(cardRef: { current: HTMLElement | null }) {
+	const [visible, setVisible] = useState(false);
+	useLayoutEffect(() => {
+		const query = normalizeFeedQuery(state.feedQuery);
+		const body = cardRef.current?.querySelector(".feed-detail .feed-body");
+		const text = body ? renderedSearchText(body) : "";
+		setVisible(Boolean(query && text.toLowerCase().includes(query)));
+	});
+	return visible;
 }
 
 type VisibilitySelection = "private" | "shared" | "unknown";
@@ -202,6 +217,20 @@ function useNewItemState(rowKey: string): boolean {
 	return isNew;
 }
 
+function useTitleFocusRecovery(cardRef: { current: HTMLElement | null }) {
+	const titleWasFocused =
+		cardRef.current?.querySelector("button.feed-title") === document.activeElement;
+	useLayoutEffect(() => {
+		if (
+			titleWasFocused &&
+			document.activeElement === document.body &&
+			!cardRef.current?.querySelector("button.feed-title")
+		) {
+			cardRef.current?.focus();
+		}
+	});
+}
+
 type FeedCardDisclosureState = {
 	activeMode: ItemViewMode;
 	cardRef: { current: HTMLElement | null };
@@ -226,6 +255,7 @@ function useFeedCardDisclosureState(
 	const [activeMode, setActiveMode] = useState<ItemViewMode>(initialMode);
 	const [expanded, setExpanded] = useState(state.itemExpandState.get(model.rowKey) === true);
 	const cardRef = useRef<HTMLElement | null>(null);
+	useTitleFocusRecovery(cardRef);
 	const focusedModeRef = useRef<ItemViewMode | null>(null);
 	const restoreModeFocusRef = useRef(false);
 	usePollingModeState({
@@ -469,6 +499,7 @@ type FeedCardRenderInput = {
 	onToggleDetail: () => void;
 	savingVisibility: boolean;
 	searchMatch: ReturnType<typeof hiddenSearchMatch>;
+	renderedSearchMatch: boolean;
 	selectedVisibility: VisibilitySelection;
 	visibilityKnown: boolean;
 };
@@ -477,7 +508,7 @@ function renderFeedCardTitle(input: FeedCardRenderInput) {
 	const titleProps = {
 		className: "feed-title title",
 		dangerouslySetInnerHTML: {
-			__html: highlightText(input.model.displayTitle, state.feedQuery),
+			__html: highlightFeedText(input.model.displayTitle, state.feedQuery),
 		},
 	};
 	if (!input.hasDisclosure) return h("div", titleProps);
@@ -491,10 +522,7 @@ function renderFeedCardTitle(input: FeedCardRenderInput) {
 }
 
 function renderFeedSearchMatch(input: FeedCardRenderInput) {
-	if (
-		!input.searchMatch ||
-		!shouldShowSearchMatch(input.searchMatch, input.expanded, input.activeModeData, state.feedQuery)
-	) {
+	if (!input.searchMatch || (input.searchMatch.mode !== null && input.renderedSearchMatch)) {
 		return null;
 	}
 	return h(
@@ -503,7 +531,7 @@ function renderFeedSearchMatch(input: FeedCardRenderInput) {
 		h("span", { className: "feed-search-match-label" }, `${input.searchMatch.label} match`),
 		h("span", {
 			dangerouslySetInnerHTML: {
-				__html: highlightText(input.searchMatch.excerpt, state.feedQuery),
+				__html: highlightFeedText(input.searchMatch.excerpt, state.feedQuery),
 			},
 		}),
 	);
@@ -594,7 +622,7 @@ function renderFeedCardBody(input: FeedCardRenderInput) {
 			? h("div", {
 					className: "feed-summary",
 					dangerouslySetInnerHTML: {
-						__html: highlightText(input.model.skimSummary, state.feedQuery),
+						__html: highlightFeedText(input.model.skimSummary, state.feedQuery),
 					},
 				})
 			: null,
@@ -731,6 +759,7 @@ export function FeedItemCard({
 	const metadata = mergeMetadata(item.metadata_json);
 	const details = buildFeedCardDetails(item, model, metadata);
 	const disclosure = useFeedCardDisclosureState(model, details.hasSupplementalDetail);
+	const renderedSearchMatch = useRenderedSearchMatch(disclosure.cardRef);
 	const visibility = useFeedCardVisibilityState(details.visibility);
 	const actions = useFeedCardActions({
 		item,
@@ -775,6 +804,7 @@ export function FeedItemCard({
 		onToggleDetail: toggleDetail,
 		savingVisibility: actions.savingVisibility,
 		searchMatch,
+		renderedSearchMatch,
 		selectedVisibility: visibility.selectedVisibility,
 		visibilityKnown: visibility.visibilityKnown,
 	});
