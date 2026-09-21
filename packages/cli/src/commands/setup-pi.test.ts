@@ -498,6 +498,23 @@ describe("installPi — observer partial overrides", () => {
 		expect(config).not.toHaveProperty("observer_openai_use_responses");
 	});
 
+	it("keeps the saved file coherent when the env provider overrides a conflicting file provider", () => {
+		// File pins anthropic while the env temporarily forces openai — exactly
+		// what pi resolves. Persisting pi's model would strand an anthropic/openai
+		// tuple once the override disappears, so nothing may be derived.
+		seedPiCustomGatewayInstall(piHome);
+		writeJson(configPath, { observer_provider: "anthropic" });
+		process.env.CODEMEM_OBSERVER_PROVIDER = "openai";
+
+		expect(installPi({ force: false })).toBe(true);
+
+		const config = readJson(configPath);
+		expect(config.observer_provider).toBe("anthropic");
+		expect(config).not.toHaveProperty("observer_model");
+		expect(config).not.toHaveProperty("observer_base_url");
+		expect(config).not.toHaveProperty("observer_openai_use_responses");
+	});
+
 	it("does not derive a pi provider when only the env model is set", () => {
 		seedPiCustomGatewayInstall(piHome);
 		process.env.CODEMEM_OBSERVER_MODEL = "claude-haiku-4-5";

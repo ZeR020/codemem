@@ -1058,7 +1058,12 @@ function applyResolvedPiObserver(
 	// provider/model/endpoint set only when both identity fields are unset, or
 	// fill a missing model only when the explicit provider matches pi. Never
 	// combine pi's model or endpoint with a different explicit provider.
-	const explicitProvider = needs.envProvider || needs.fileProvider;
+	// Env overrides are temporary and, unlike core (which re-derives in
+	// memory per run), setup persists: never write pi-derived identity while
+	// a provider/model env override is active — it would strand the persisted
+	// tuple next to the override's provider once the env is removed.
+	if (needs.envProvider || needs.envModel) return;
+	const explicitProvider = needs.fileProvider;
 	if (explicitProvider) {
 		if (needs.model && explicitProvider.toLowerCase() === String(resolved.provider).toLowerCase()) {
 			next.observer_model = resolved.model;
@@ -1068,7 +1073,7 @@ function applyResolvedPiObserver(
 	}
 	// Model set without a provider: leave provider unset so the client infers
 	// it from the model instead of routing that model through pi.
-	if (needs.envModel || needs.fileModel) return;
+	if (needs.fileModel) return;
 	next.observer_provider = resolved.provider;
 	updated.push("observer_provider");
 	next.observer_model = resolved.model;
