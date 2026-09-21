@@ -234,6 +234,41 @@ it("renders the four compact health tiles in contract order", () => {
 	expect(document.querySelector("#healthGrid .stat")).toBeNull();
 });
 
+it.each([0, 0.5])("counts tag coverage %s with active memories as an issue", (coverage) => {
+	const stats = statsPayload();
+	stats.database.active_memory_items = 10;
+	stats.database.tags_coverage = coverage;
+	state.healthStats = completeHealthLoad(stats);
+	renderHealthOverview();
+	expect(document.getElementById("healthMeta")?.textContent).toContain("1 issue");
+	expect(document.getElementById("healthMeta")?.textContent).toContain("low tag coverage");
+	expect(document.getElementById("healthActions")?.textContent).toContain(
+		"backfill-tags --dry-run",
+	);
+});
+
+it("does not recommend tag backfill for an empty database", () => {
+	state.healthStats = completeHealthLoad(statsPayload());
+	renderHealthOverview();
+	expect(document.getElementById("healthMeta")?.textContent).toContain("0 issues");
+	expect(document.getElementById("healthMeta")?.textContent).not.toContain("low tag coverage");
+	expect(document.getElementById("healthActions")?.textContent).not.toContain("backfill-tags");
+});
+
+it("does not claim no packs when aggregate usage has no recent timestamp", () => {
+	state.healthUsage = completeHealthLoad(
+		usagePayload({
+			events_global: [usageEvent({ event: "pack", total_tokens_read: 10 })],
+			recent_packs: [],
+		}),
+	);
+	renderHealthOverview();
+	const freshness = [...document.querySelectorAll("#healthGrid .health-tile")].find(
+		(node) => node.querySelector(".health-tile-label")?.textContent === "Data freshness",
+	);
+	expect(freshness?.textContent).toContain("Unknown");
+});
+
 it("marks pending pipeline work and the current sync problem as degraded", () => {
 	state.healthRawEvents = completeHealthLoad({ pending: 3, sessions: 1 });
 	state.lastSyncPeers = [{ peer_device_id: "peer-a" }];
