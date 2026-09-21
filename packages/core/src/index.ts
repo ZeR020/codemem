@@ -623,9 +623,11 @@ export type {
 } from "./observer-client.js";
 export {
 	loadObserverConfig,
+	normalizeObserverRuntime,
 	ObserverAuthError,
 	ObserverClient,
 	observerBaseUrlForProviderOverride,
+	resolveObserverRuntime,
 } from "./observer-client.js";
 export * from "./observer-concepts.js";
 export type {
@@ -644,6 +646,7 @@ export {
 	deleteCodememConfigFile,
 	getCodememConfigPath,
 	getCodememEnvOverrides,
+	getCodememEnvOverrideValues,
 	getOpenCodeProviderConfig,
 	getProviderApiKey,
 	getProviderBaseUrl,

@@ -9,6 +9,9 @@ import { loadAdvancedPreference } from "./value-helpers";
 export interface SettingsState {
 	previouslyFocused: HTMLElement | null;
 	baseline: Record<string, unknown>;
+	effectiveConfig: Record<string, unknown>;
+	resolvedObserverRuntime: string | null;
+	observerRuntimeByAuthSource: Record<string, string>;
 	envOverrides: Record<string, unknown>;
 	touchedKeys: Set<string>;
 	shellMounted: boolean;
@@ -21,6 +24,9 @@ export interface SettingsState {
 export const settingsState: SettingsState = {
 	previouslyFocused: null,
 	baseline: {},
+	effectiveConfig: {},
+	resolvedObserverRuntime: null,
+	observerRuntimeByAuthSource: {},
 	envOverrides: {},
 	touchedKeys: new Set<string>(),
 	shellMounted: false,

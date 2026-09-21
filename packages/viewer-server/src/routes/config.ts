@@ -6,15 +6,16 @@
  */
 
 import {
-	CODEMEM_CONFIG_ENV_OVERRIDES,
 	CodememConfigMutationError,
 	coerceObserverCommand,
 	getCodememConfigPath,
 	getCodememEnvOverrides,
+	getCodememEnvOverrideValues,
 	listObserverProviderOptions,
 	mutateCodememConfigFile,
 	type RawEventSweeper,
 	readCodememConfigFile,
+	resolveObserverRuntime,
 } from "@codemem/core";
 import { type Context, Hono } from "hono";
 
@@ -151,18 +152,23 @@ function getEffectiveConfig(configData: ConfigData): ConfigData {
 	for (const key of ["claude_command", "codex_command"] as const) {
 		effective[key] = coerceObserverCommand(effective[key]) ?? DEFAULTS[key];
 	}
-	for (const [key, envVar] of Object.entries(CODEMEM_CONFIG_ENV_OVERRIDES) as Array<
-		[string, string]
-	>) {
-		const val = process.env[envVar];
-		if (val == null || val === "") continue;
-		if (key === "claude_command" || key === "codex_command") {
-			effective[key] = coerceObserverCommand(val) ?? effective[key];
-		} else {
-			effective[key] = val;
-		}
-	}
+	Object.assign(effective, getCodememEnvOverrideValues());
 	return effective;
+}
+
+function observerRuntimeMetadata(configData: ConfigData) {
+	// Runtime and auth source are the only editable auto-selection inputs. Resolve
+	// every auth-source draft against the full saved config and server environment,
+	// including protected commands/files and credential availability, without auth.
+	return {
+		resolved_observer_runtime: resolveObserverRuntime(configData),
+		observer_runtime_by_auth_source: Object.fromEntries(
+			[...AUTH_SOURCES].map((source) => [
+				source,
+				resolveObserverRuntime({ ...configData, observer_auth_source: source }),
+			]),
+		),
+	};
 }
 
 function redactConfigValue(key: string, value: unknown): unknown {
@@ -488,6 +494,7 @@ function viewerConfigSavePayload(
 		path: savedPath,
 		config: sanitizeConfigForResponse(nextConfig),
 		effective: sanitizeConfigForResponse(afterEffective),
+		...observerRuntimeMetadata(nextConfig),
 		protected_keys: [...PROTECTED_WRITE_KEYS].sort(),
 		effects: {
 			saved_keys: savedChangedKeys,
@@ -534,6 +541,7 @@ export function configRoutes(opts: ConfigRouteOptions = {}) {
 			config: sanitizeConfigForResponse(configData),
 			defaults: DEFAULTS,
 			effective: sanitizeConfigForResponse(effective),
+			...observerRuntimeMetadata(configData),
 			env_overrides: getCodememEnvOverrides(),
 			protected_keys: [...PROTECTED_WRITE_KEYS].sort(),
 			providers: loadProviderOptions(),
