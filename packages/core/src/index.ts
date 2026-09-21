@@ -720,6 +720,13 @@ export {
 	resolvePiObserverConfig,
 } from "./pi-observer-config.js";
 export type {
+	PiSessionSearchMatch,
+	PiSessionSearchOptions,
+	PiSessionSearchResponse,
+	PiSessionTextEvent,
+} from "./pi-session-search.js";
+export { extractPiSessionText, searchPiSessions } from "./pi-session-search.js";
+export type {
 	ImportPiSessionsOptions,
 	ParsedPiSession,
 	PiImportProgress,
