@@ -137,9 +137,9 @@ function piPendingSessions(store: MemoryStore, attempted: Set<string>): string[]
 
 /** Human-readable summary line; per-file progress is streamed by the caller. */
 export function formatPiImportHuman(result: PiImportRunResult): string {
-	const s = result.summary;
+	const summary = result.summary;
 	const lines = [
-		`Scanned ${s.filesScanned} files: ${s.filesImported} imported, ${s.filesUnchanged} unchanged, ${s.filesEmpty} empty, ${s.filesErrored} errored — ${s.inserted} events inserted, ${s.skipped} skipped.`,
+		`Scanned ${summary.filesScanned} files: ${summary.filesImported} imported, ${summary.filesUnchanged} unchanged, ${summary.filesEmpty} empty, ${summary.filesErrored} errored — ${summary.inserted} events inserted, ${summary.skipped} skipped.`,
 	];
 	if (result.extractedEvents !== null) {
 		lines.push(`Extraction: observer flushed ${result.extractedEvents} events into memories.`);
