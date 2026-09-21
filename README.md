@@ -508,6 +508,14 @@ Disabling a device's enrollment for one coordinator group revokes future deliver
 - **Waiting** — acceptance, setup, or delivery is waiting; an offline device resumes on reconnect.
 - **Needs attention** — setup reached a terminal failure; use the displayed retry action.
 
+**Presence unavailable** means there is no current presence evidence, including when a coordinator announcement has expired; it does not mean the machine is powered off. A live paired connection or this viewer's local device is shown as **Available**, while an explicitly offline peer remains **Offline**. Devices without a known name appear as **Unnamed device**. Paired devices offer **Identify or rename in Sync…** in their action menu, using the existing Advanced controls.
+
+Older coordinator and migration records may contain generated labels such as **Enrolled device** or **Peer device**. For those source-tagged records, Devices prefers a name from current inventory evidence. Historical records did not track whether those exact labels were generated or entered by a person, so that distinction cannot always be recovered. This display fallback does not rename stored devices. If inventory refresh fails, cached aliases cannot supply fresh peer status, versions, or rename actions; direct device-ID matches still work.
+
+The viewer retains its canonical local device identity during inventory outages; aliases do not inherit **This device** status. Among validated peer aliases, Devices prefers a nonempty runtime version with the newest valid observation timestamp. Equal or missing timestamps prefer the direct device ID, then aliases sorted by ID; an undated version does not imply a fresh observation.
+
+If the entire Devices refresh fails, the viewer keeps the previous snapshot and its alias evidence while disabling Identity changes. A snapshot that already had unavailable inventory keeps alias joins disabled until inventory refresh succeeds.
+
 Use **Health** for the current status. Globally revoked identity devices are omitted from the active Devices list. A device disabled only for one coordinator group remains listed; use **Advanced → Team administration** to review or re-enable that group enrollment. Removing access prevents future delivery, but cannot erase a copy already delivered to another device.
 
 ### Advanced and compatibility
