@@ -266,3 +266,100 @@ describe("PI_CODING_AGENT_DIR resolution", () => {
 		}
 	});
 });
+
+describe("pi import skip state is per database", () => {
+	it("imports into a fresh database beside an imported one, and after recreation", () => {
+		const dir = mkdtempSync(join(tmpdir(), "codemem-pi-import-state-"));
+		cleanupPaths.push(dir);
+		const dbA = join(dir, "a.sqlite");
+		const dbB = join(dir, "b.sqlite");
+		for (const dbPath of [dbA, dbB]) {
+			const db = connect(dbPath);
+			initTestSchema(db);
+			db.close();
+		}
+		const agentDir = makeTempDir("codemem-pi-agent-");
+		writeSession(agentDir, "2026-09-15T09-00-00-000Z_state.jsonl", fixtureJsonl());
+
+		const first = importPiSessions({ dbPath: dbA, agentDir });
+		expect(first.inserted).toBe(2);
+
+		const intoA = importPiSessions({ dbPath: dbA, agentDir });
+		expect(intoA.filesUnchanged).toBe(1);
+		expect(intoA.inserted).toBe(0);
+
+		// A different database sharing the directory has no skip state.
+		const intoB = importPiSessions({ dbPath: dbB, agentDir });
+		expect(intoB.filesUnchanged).toBe(0);
+		expect(intoB.inserted).toBe(2);
+
+		// Recreating a database forgets its skip state: full re-import.
+		rmSync(dbB);
+		const recreated = connect(dbB);
+		initTestSchema(recreated);
+		recreated.close();
+		const intoFreshB = importPiSessions({ dbPath: dbB, agentDir });
+		expect(intoFreshB.filesUnchanged).toBe(0);
+		expect(intoFreshB.inserted).toBe(2);
+	});
+});
+
+describe("timestamp-less message discriminators", () => {
+	const TS_LESS_TEXT = "send the identical request again";
+
+	/** A user turn with NO message.timestamp, like live timestamp-less captures. */
+	function tsLessEntry(id: string): string {
+		return JSON.stringify({
+			type: "message",
+			id,
+			parentId: null,
+			timestamp: "2026-09-15T10:00:00.000Z",
+			message: {
+				role: "user",
+				content: [{ type: "text", text: TS_LESS_TEXT }],
+			},
+		});
+	}
+
+	it("assigns the live n:<seq> fallback so duplicate turns keep distinct ids", () => {
+		const parsed = parsePiSessionJsonl(
+			[SESSION_HEADER, tsLessEntry("no-ts-1"), tsLessEntry("no-ts-2")].join("\n"),
+		);
+		expect(parsed?.messages).toHaveLength(2);
+		expect(parsed?.messages[0]?.discriminator).toBe("n:1");
+		expect(parsed?.messages[1]?.discriminator).toBe("n:2");
+		expect(stablePiMessageEntryId(SESSION_ID, "user", TS_LESS_TEXT, "n:1")).not.toBe(
+			stablePiMessageEntryId(SESSION_ID, "user", TS_LESS_TEXT, "n:2"),
+		);
+	});
+
+	it("imports both duplicate turns and dedupes the live-captured n:1 counterpart", () => {
+		const dbPath = makeDbPath();
+		const agentDir = makeTempDir("codemem-pi-agent-");
+		writeSession(
+			agentDir,
+			"2026-09-15T10-00-00-000Z_noseq.jsonl",
+			[SESSION_HEADER, tsLessEntry("no-ts-1"), tsLessEntry("no-ts-2")].join("\n"),
+		);
+
+		// Seed the store as if the first timestamp-less turn was captured live:
+		// the extension's messageDiscriminator assigned it n:1.
+		const db = connect(dbPath);
+		const envelope = buildRawEventEnvelopeFromPiEvent({
+			piEvent: "message_end",
+			sessionId: SESSION_ID,
+			entryId: stablePiMessageEntryId(SESSION_ID, "user", TS_LESS_TEXT, "n:1"),
+			role: "user",
+			text: TS_LESS_TEXT,
+			ts: "2026-09-15T10:00:01.000Z",
+			cwd: "/tmp/repo",
+		});
+		const seeded = ingestRawEvents({ db }, requireEnvelope(envelope));
+		expect(seeded.inserted).toBe(1);
+		db.close();
+
+		const summary = importPiSessions({ dbPath, agentDir });
+		expect(summary.inserted).toBe(1);
+		expect(summary.skipped).toBe(1);
+	});
+});

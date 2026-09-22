@@ -15,7 +15,7 @@
  */
 
 import type { Database } from "./db.js";
-import { projectMatchesFilter } from "./project.js";
+import { projectColumnClause, projectMatchesFilter } from "./project.js";
 import { expandQuery } from "./search.js";
 
 export interface PiSessionTextEvent {
@@ -134,14 +134,21 @@ interface PiSessionEventRow {
 
 /**
  * Load candidate rows for the lexical scan: pi-source transcript events whose
- * stored payload JSON contains any query token, most-recent-first.
+ * stored payload JSON contains any query token, most-recent-first. The
+ * optional project filter is applied INSIDE this query (before the LIMIT)
+ * so the recency window is bounded within the requested scope.
  *
  * ponytail: LIKE scan over raw_events.payload_json — no FTS index or side
  * table by design (D1): per-user pi event volume is modest and this pass is
  * bounded by the recency window below. Upgrade to an FTS5 virtual table +
  * ingest triggers when measured slowness on real histories says so.
  */
-function loadCandidateRows(db: Database, tokens: string[], sessionId: string): PiSessionEventRow[] {
+function loadCandidateRows(
+	db: Database,
+	tokens: string[],
+	sessionId: string,
+	projectFilter: string,
+): PiSessionEventRow[] {
 	const likeClauses = tokens.map(() => "payload_json LIKE ? ESCAPE '\\'");
 	const params: unknown[] = tokens.map(likePattern);
 	let sql = `
@@ -150,6 +157,16 @@ function loadCandidateRows(db: Database, tokens: string[], sessionId: string): P
 		LEFT JOIN raw_event_sessions s ON s.source = r.source AND s.stream_id = r.stream_id
 		WHERE r.source = 'pi' AND r.event_type = 'pi.hook' AND (${likeClauses.join(" OR ")})
 	`;
+
+	// SQL-equivalent of projectMatchesFilter (same contract as memory
+	// search): keeps the scan window bounded within the requested project —
+	// without it, newer rows from other projects would fill the LIMIT and hide
+	// valid rows. Superset of the JS check, which still runs per row.
+	const projectPrefilter = projectColumnClause("s.project", projectFilter);
+	if (projectPrefilter.clause) {
+		sql += ` AND ${projectPrefilter.clause}`;
+		params.push(...projectPrefilter.params);
+	}
 	if (sessionId) {
 		sql += " AND r.stream_id = ?";
 		params.push(sessionId);
@@ -193,6 +210,11 @@ function collectMatches(
 		}
 		const textEvent = extractPiSessionText(payload);
 		if (!textEvent) continue;
+		// The payload_json prefilter also sees cwd/project/session metadata
+		// outside the message; require at least one effective token in the
+		// extracted conversation text before returning/counting the row.
+		const loweredText = textEvent.text.toLowerCase();
+		if (!loweredTokens.some((token) => loweredText.includes(token))) continue;
 		if (projectFilter && !projectMatchesFilter(projectFilter, row.project)) continue;
 		const snippet = buildSnippet(textEvent.text, loweredTokens, snippetChars);
 		matches.push({
@@ -242,7 +264,7 @@ export function searchPiSessions(
 	};
 	if (tokens.length === 0) return empty;
 
-	const rows = loadCandidateRows(db, tokens, parsed.sessionId);
+	const rows = loadCandidateRows(db, tokens, parsed.sessionId, parsed.projectFilter);
 	const windowSaturated = rows.length >= MAX_SCAN_ROWS;
 	const loweredTokens = tokens.map((token) => token.toLowerCase());
 	const matches = collectMatches(rows, loweredTokens, parsed.snippetChars, parsed.projectFilter);

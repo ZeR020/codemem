@@ -39,6 +39,7 @@ interface SeedMessage {
 	text: string;
 	ts: string;
 	project?: string;
+	cwd?: string;
 }
 
 function seedPiMessage(db: Database, seed: SeedMessage): void {
@@ -50,6 +51,7 @@ function seedPiMessage(db: Database, seed: SeedMessage): void {
 		text: seed.text,
 		ts: seed.ts,
 		...(seed.project ? { project: seed.project } : {}),
+		...(seed.cwd ? { cwd: seed.cwd } : {}),
 	});
 	if (!envelope) throw new Error("expected envelope for fixture");
 	ingestRawEvents(
@@ -312,6 +314,23 @@ describe("searchPiSessions filters and attribution", () => {
 	});
 });
 
+it("requires a token in the conversation text, not just envelope metadata", () => {
+	const db = makeDb();
+	seedPiMessage(db, {
+		sessionId: "s-meta",
+		entryId: "m1",
+		role: "user",
+		text: "an entirely unrelated ordinary sentence",
+		ts: "2026-04-01T12:00:00.000Z",
+		cwd: "/repos/metadata-needle-check",
+		project: "metadata-needle-project",
+	});
+	const response = searchPiSessions(db, "metadata needle");
+	expect(response.results).toEqual([]);
+	expect(response.total_matches).toBe(0);
+	expect(searchPiSessions(db, "ordinary").returned).toBe(1);
+});
+
 describe("searchPiSessions bounds", () => {
 	it("clamps limit to 1–20 and marks truncation when matches are dropped", () => {
 		const db = makeDb();
@@ -402,5 +421,32 @@ describe("searchPiSessions bounds", () => {
 		expect(response.truncated).toBe(true);
 		expect(JSON.stringify(response).length).toBeLessThanOrEqual(50_000);
 		expect(response.returned).toBeLessThan(20);
+	});
+
+	it("applies the project filter before the scan window bound", () => {
+		const db = makeDb();
+		// 1,005 newer rows from another project would fill the whole scan window…
+		for (let i = 0; i < 1005; i++) {
+			seedPiMessage(db, {
+				sessionId: `s-filler-${i}`,
+				entryId: `filler-${i}`,
+				role: "user",
+				text: `harbor filler note ${i}`,
+				ts: new Date(Date.UTC(2026, 3, 2, 12, 0, 0, i)).toISOString(),
+				project: PROJECT_B,
+			});
+		}
+		// …so the target project's only match is older than the window start.
+		seedPiMessage(db, {
+			sessionId: "s-target",
+			entryId: "target-1",
+			role: "user",
+			text: "harbor legacy note",
+			ts: "2026-04-01T12:00:00.000Z",
+			project: PROJECT_A,
+		});
+		const response = searchPiSessions(db, "harbor", { project: PROJECT_A });
+		expect(response.returned).toBe(1);
+		expect(response.results[0]?.session_id).toBe("s-target");
 	});
 });

@@ -17,10 +17,9 @@
  */
 
 import { createHash } from "node:crypto";
-import { type Dirent, mkdirSync, readdirSync, readFileSync, type Stats, statSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { type Dirent, readdirSync, readFileSync, type Stats, statSync } from "node:fs";
+import { join } from "node:path";
 import { connect, type Database } from "./db.js";
-import { atomicReplaceConfigFile } from "./observer-config.js";
 import { buildRawEventEnvelopeFromPiEvent, type PiHookRawEventEnvelope } from "./pi-hooks.js";
 import { resolvePiAgentDir } from "./pi-observer-config.js";
 import { ingestRawEvents } from "./raw-event-ingest.js";
@@ -31,8 +30,8 @@ export interface PiSessionMessage {
 	text: string;
 	/** Entry-level ISO timestamp; null when the entry carries none. */
 	ts: string | null;
-	/** Persisted message.timestamp (epoch ms) — the live entryId discriminator. */
-	discriminator: string | number | null;
+	/** Persisted message.timestamp (epoch ms), or the live `n:<seq>` fallback for timestamp-less messages. */
+	discriminator: string | number;
 }
 
 /** Parsed session file: header identity plus importable messages. */
@@ -64,18 +63,9 @@ export interface ImportPiSessionsOptions {
 	dbPath: string;
 	/** Pi agent dir override; defaults to resolvePiAgentDir() (PI_CODING_AGENT_DIR / ~/.pi/agent). */
 	agentDir?: string;
-	/** Import state file override; defaults to a JSON file beside the database. */
-	statePath?: string;
 	/** Called once per scanned file so the CLI can surface progress. */
 	onProgress?: (progress: PiImportProgress) => void;
 }
-
-interface PiImportStateEntry {
-	size: number;
-	mtimeMs: number;
-}
-
-type PiImportState = Record<string, PiImportStateEntry>;
 
 /**
  * Mirror of stableMessageEntryId (packages/pi-extension/src/payloads.ts):
@@ -123,7 +113,10 @@ function extractPiMessageText(message: Record<string, unknown>): string {
  * non-message entries, non-user/assistant roles (toolResult), and
  * messages without text blocks (thinking/toolCall/toolResult only).
  */
-function coercePiSessionMessage(entry: Record<string, unknown>): PiSessionMessage | null {
+function coercePiSessionMessage(
+	entry: Record<string, unknown>,
+	missingSeq: { n: number },
+): PiSessionMessage | null {
 	const rawMessage = entry.message;
 	if (rawMessage == null || typeof rawMessage !== "object" || Array.isArray(rawMessage)) {
 		return null;
@@ -136,10 +129,17 @@ function coercePiSessionMessage(entry: Record<string, unknown>): PiSessionMessag
 	const rawTs = entry.timestamp;
 	const ts = typeof rawTs === "string" && rawTs.trim() ? rawTs.trim() : null;
 	const rawDiscriminator = message.timestamp;
-	const discriminator =
-		typeof rawDiscriminator === "number" && Number.isFinite(rawDiscriminator)
-			? rawDiscriminator
-			: null;
+	let discriminator: string | number;
+	if (typeof rawDiscriminator === "number" && Number.isFinite(rawDiscriminator)) {
+		discriminator = rawDiscriminator;
+	} else {
+		// Mirror the live extension's messageDiscriminator fallback
+		// (packages/pi-extension/src/index.ts): timestamp-less messages get a
+		// per-session `n:<seq>` counter so imported ids collide with their live
+		// captured counterpart instead of each other (D2).
+		missingSeq.n += 1;
+		discriminator = `n:${missingSeq.n}`;
+	}
 	return { role, text, ts, discriminator };
 }
 
@@ -151,6 +151,7 @@ function coercePiSessionMessage(entry: Record<string, unknown>): PiSessionMessag
 function parsePiSessionLine(
 	record: Record<string, unknown>,
 	messages: PiSessionMessage[],
+	missingSeq: { n: number },
 ): { id: string; cwd: string | null } | null {
 	if (record.type === "session") {
 		const id = record.id;
@@ -164,7 +165,7 @@ function parsePiSessionLine(
 		return null;
 	}
 	if (record.type !== "message") return null;
-	const message = coercePiSessionMessage(record);
+	const message = coercePiSessionMessage(record, missingSeq);
 	if (message) messages.push(message);
 	return null;
 }
@@ -173,6 +174,7 @@ export function parsePiSessionJsonl(content: string): ParsedPiSession | null {
 	let sessionId: string | null = null;
 	let cwd: string | null = null;
 	const messages: PiSessionMessage[] = [];
+	const missingSeq = { n: 0 };
 	for (const line of content.split("\n")) {
 		const trimmed = line.trim();
 		if (!trimmed) continue;
@@ -183,7 +185,7 @@ export function parsePiSessionJsonl(content: string): ParsedPiSession | null {
 			continue;
 		}
 		if (entry == null || typeof entry !== "object" || Array.isArray(entry)) continue;
-		const header = parsePiSessionLine(entry as Record<string, unknown>, messages);
+		const header = parsePiSessionLine(entry as Record<string, unknown>, messages, missingSeq);
 		if (header) {
 			sessionId = header.id;
 			if (header.cwd) cwd = header.cwd;
@@ -275,32 +277,51 @@ function listPiSessionFiles(sessionsDir: string): string[] {
 	return files.sort();
 }
 
-function loadPiImportState(statePath: string): PiImportState {
-	try {
-		const parsed: unknown = JSON.parse(readFileSync(statePath, "utf-8"));
-		if (parsed == null || typeof parsed !== "object" || Array.isArray(parsed)) return {};
-		return parsed as PiImportState;
-	} catch {
-		return {};
-	}
+/**
+ * Per-database skip state (P1 review fix), stored inside the destination
+ * database itself: it can never suppress imports into a different or
+ * recreated database sharing the directory, and it dies with the database
+ * it describes. Losing it is safe — deterministic event ids dedupe
+ * reprocessing. Mirrors the pi_import_state table in schema.ts.
+ */
+function ensurePiImportStateTable(db: Database): void {
+	db.exec(`CREATE TABLE IF NOT EXISTS pi_import_state (
+		file_path TEXT PRIMARY KEY NOT NULL,
+		size_bytes INTEGER NOT NULL,
+		mtime_ms REAL NOT NULL,
+		updated_at TEXT NOT NULL
+	)`);
 }
 
-function savePiImportState(statePath: string, state: PiImportState): void {
-	mkdirSync(dirname(statePath), { recursive: true });
-	atomicReplaceConfigFile(statePath, JSON.stringify(state), undefined);
+function createPiImportState(db: Database) {
+	const unchanged = db.prepare(
+		"SELECT 1 FROM pi_import_state WHERE file_path = ? AND size_bytes = ? AND mtime_ms = ?",
+	);
+	const mark = db.prepare(
+		"INSERT OR REPLACE INTO pi_import_state(file_path, size_bytes, mtime_ms, updated_at) VALUES (?, ?, ?, ?)",
+	);
+	return {
+		isUnchanged(file: string, stat: Stats): boolean {
+			return unchanged.get(file, stat.size, stat.mtimeMs) !== undefined;
+		},
+		markProcessed(file: string, stat: Stats): void {
+			mark.run(file, stat.size, stat.mtimeMs, new Date().toISOString());
+		},
+	};
 }
 
-function isUnchanged(state: PiImportState, file: string, stat: Stats): boolean {
-	const entry = state[file];
-	return entry != null && entry.size === stat.size && entry.mtimeMs === stat.mtimeMs;
-}
+type PiImportStateQueries = ReturnType<typeof createPiImportState>;
 
 /**
  * Import one session file. Stat is taken BEFORE reading so a file appended
  * mid-import always records a stale (smaller) size and is reprocessed —
  * never skipped with unread tail lines.
  */
-function importPiSessionFile(db: Database, file: string, state: PiImportState): PiImportProgress {
+function importPiSessionFile(
+	db: Database,
+	file: string,
+	state: PiImportStateQueries,
+): PiImportProgress {
 	let stat: Stats;
 	try {
 		stat = statSync(file);
@@ -313,17 +334,17 @@ function importPiSessionFile(db: Database, file: string, state: PiImportState): 
 			error: error instanceof Error ? error.message : String(error),
 		};
 	}
-	if (isUnchanged(state, file, stat)) {
+	if (state.isUnchanged(file, stat)) {
 		return { file, status: "unchanged", inserted: 0, skipped: 0, error: null };
 	}
 	try {
 		const parsed = parsePiSessionJsonl(readFileSync(file, "utf-8"));
 		if (!parsed || parsed.messages.length === 0) {
-			state[file] = { size: stat.size, mtimeMs: stat.mtimeMs };
+			state.markProcessed(file, stat);
 			return { file, status: "empty", inserted: 0, skipped: 0, error: null };
 		}
 		const result = ingestPiSessionFile(db, parsed);
-		state[file] = { size: stat.size, mtimeMs: stat.mtimeMs };
+		state.markProcessed(file, stat);
 		return {
 			file,
 			status: "imported",
@@ -342,14 +363,10 @@ function importPiSessionFile(db: Database, file: string, state: PiImportState): 
 	}
 }
 
-/** Default persisted size/mtime state location: a JSON file beside the database. */
-function defaultPiImportStatePath(dbPath: string): string {
-	return join(dirname(dbPath), "pi-import-sessions.json");
-}
-
 /**
  * Import all pi session files under the resolved sessions dir. Idempotent:
- * unchanged files (size/mtime) are skipped via the persisted state, and
+ * unchanged files (size/mtime) are skipped via per-database state in the
+ * pi_import_state table, and
  * reprocessed files dedupe by deterministic event id in the raw_events
  * unique index. Returns a summary; per-file progress flows through onProgress.
  */
@@ -358,8 +375,6 @@ export function importPiSessions(options: ImportPiSessionsOptions): PiImportSumm
 		? resolvePiAgentDir({ piDir: options.agentDir })
 		: resolvePiAgentDir();
 	const sessionsDir = join(piDir, "sessions");
-	const statePath = options.statePath ?? defaultPiImportStatePath(options.dbPath);
-	const state = loadPiImportState(statePath);
 	const files = listPiSessionFiles(sessionsDir);
 	const summary: PiImportSummary = {
 		filesScanned: files.length,
@@ -371,6 +386,8 @@ export function importPiSessions(options: ImportPiSessionsOptions): PiImportSumm
 		skipped: 0,
 	};
 	const db = connect(options.dbPath);
+	ensurePiImportStateTable(db);
+	const state = createPiImportState(db);
 	try {
 		for (const file of files) {
 			const progress = importPiSessionFile(db, file, state);
@@ -385,6 +402,5 @@ export function importPiSessions(options: ImportPiSessionsOptions): PiImportSumm
 	} finally {
 		db.close();
 	}
-	savePiImportState(statePath, state);
 	return summary;
 }

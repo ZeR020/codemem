@@ -9,7 +9,6 @@ import {
 	mkdtempSync,
 	readdirSync,
 	rmSync,
-	statSync,
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -90,12 +89,15 @@ describe("importPiSessions orchestration", () => {
 		expect(piRowCount(dbPath)).toBe(1);
 	});
 
-	it("still dedupes by event id when the state file is removed", () => {
+	it("still dedupes by event id when the skip-state rows are cleared", () => {
 		const { agentDir, dbPath } = makeFixtureSession();
 		importPiSessions({ dbPath, agentDir });
-		rmSync(join(dbPath, "..", "pi-import-sessions.json"));
+		const db = connect(dbPath);
+		db.exec("DELETE FROM pi_import_state");
+		db.close();
 
 		const rerun = importPiSessions({ dbPath, agentDir });
+		expect(rerun.filesUnchanged).toBe(0);
 		expect(rerun.inserted).toBe(0);
 		expect(rerun.skipped).toBe(1);
 		expect(piRowCount(dbPath)).toBe(1);
@@ -133,6 +135,11 @@ describe("importPiSessions orchestration", () => {
 		expect(progress).toContain(`imported:1/0`);
 		expect(progress.filter((entry) => entry.startsWith("empty:"))).toHaveLength(2);
 		expect(readdirSync(join(agentDir, "sessions", "--tmp-repo--"))).toContain("empty.jsonl");
-		expect(statSync(join(dbPath, "..", "pi-import-sessions.json")).isFile()).toBe(true);
+		const db = connect(dbPath);
+		const stateRows = db.prepare("SELECT COUNT(*) AS n FROM pi_import_state").get() as {
+			n: number;
+		};
+		db.close();
+		expect(Number(stateRows.n)).toBe(3);
 	});
 });
