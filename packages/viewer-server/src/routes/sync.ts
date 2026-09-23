@@ -39,6 +39,8 @@ import {
 	ACCESS_CLEANUP_OP_TYPE,
 	addSyncScopeToBoundary,
 	analyzeProjectScopeMappingChangeGuardrails,
+	analyzeProjectScopeMappingChangesGuardrails,
+	analyzeProjectScopeMappingDeletionGuardrails,
 	applyReplicationOps,
 	buildAuthHeaders,
 	buildBaseUrl,
@@ -173,6 +175,7 @@ import {
 	updatePeerAddresses,
 	upsertCoordinatorGroupPreference,
 	upsertProjectScopeSettingsMapping,
+	upsertProjectScopeSettingsMappings,
 	VERSION,
 	verifyDirectPeerSignature,
 	verifyRecipientReviewedIntent,
@@ -625,6 +628,20 @@ function missingGuardrailConfirmations(
 			warning.requires_confirmation &&
 			(!warning.confirmation_token || !confirmed.has(warning.confirmation_token)),
 	);
+}
+
+function mappingGuardrailChallenge(
+	warnings: ProjectScopeGuardrailWarning[],
+	missing: ProjectScopeGuardrailWarning[],
+) {
+	return {
+		error: "guardrail_confirmation_required",
+		required_guardrails: [...new Set(missing.map((warning) => warning.code))],
+		required_guardrail_tokens: [
+			...new Set(missing.map((warning) => warning.confirmation_token)),
+		].filter((token): token is string => typeof token === "string" && token.length > 0),
+		guardrail_warnings: warnings,
+	};
 }
 
 function parseViewerProjectMappingInput(body: Record<string, unknown>) {
@@ -4826,6 +4843,48 @@ function serializeProjectScopeInventory(
 	};
 }
 
+function deleteProjectScopeMapping(
+	store: MemoryStore,
+	id: number,
+	deviceId: string,
+	confirmedGuardrailTokens: string[],
+): boolean {
+	return deleteProjectScopeSettingsMapping(store.db, id, { deviceId, confirmedGuardrailTokens });
+}
+
+async function deleteProjectScopeMappingRoute(c: Context, store: MemoryStore) {
+	const id = Number(c.req.param("id"));
+	let releasePublicationMutation: (() => void) | undefined;
+	try {
+		const body = c.req.header("content-type")?.includes("application/json")
+			? await parseViewerJsonBody(c)
+			: {};
+		if (!body) return c.json({ error: "invalid json" }, 400);
+		const confirmedGuardrailTokens = optionalViewerStringList(body, "confirmed_guardrail_tokens");
+		releasePublicationMutation = await claimRecipientPolicyPublicationMutation(store.db);
+		const [deviceId] = ensureDeviceIdentity(store.db, { keysDir: syncKeysDir() });
+		const warnings = analyzeProjectScopeMappingDeletionGuardrails(store.db, id, deviceId);
+		const missing = missingGuardrailConfirmations(warnings, confirmedGuardrailTokens);
+		if (missing.length > 0) {
+			return c.json(
+				{
+					error: "guardrail_confirmation_required",
+					required_guardrails: [...new Set(missing.map((warning) => warning.code))],
+					required_guardrail_tokens: missing.map((warning) => warning.confirmation_token),
+					guardrail_warnings: warnings,
+				},
+				409,
+			);
+		}
+		const deleted = deleteProjectScopeMapping(store, id, deviceId, confirmedGuardrailTokens);
+		return c.json({ ok: true, deleted });
+	} catch (error) {
+		return c.json({ error: error instanceof Error ? error.message : String(error) }, 400);
+	} finally {
+		releasePublicationMutation?.();
+	}
+}
+
 /**
  * Viewer-facing sync management routes (/api/sync/*).
  *
@@ -6084,7 +6143,11 @@ export function syncRoutes(
 			const confirmedGuardrailTokens = optionalViewerStringList(body, "confirmed_guardrail_tokens");
 			const mappingInput = parseViewerProjectMappingInput(body);
 			releasePublicationMutation = await claimRecipientPolicyPublicationMutation(store.db);
-			const analysis = analyzeProjectScopeMappingChangeGuardrails(store.db, mappingInput);
+			const [deviceId] = ensureDeviceIdentity(store.db, { keysDir: syncKeysDir() });
+			const analysis = analyzeProjectScopeMappingChangeGuardrails(store.db, {
+				...mappingInput,
+				deviceId,
+			});
 			if (analysis.requested_workspace_identity?.startsWith("unmapped:")) {
 				return c.json(
 					{
@@ -6101,21 +6164,8 @@ export function syncRoutes(
 				confirmedGuardrailTokens,
 			);
 			if (missingConfirmations.length > 0) {
-				const missingCodes = [...new Set(missingConfirmations.map((warning) => warning.code))];
-				const missingTokens = [
-					...new Set(missingConfirmations.map((warning) => warning.confirmation_token)),
-				].filter((token): token is string => typeof token === "string" && token.length > 0);
-				return c.json(
-					{
-						error: "guardrail_confirmation_required",
-						required_guardrails: missingCodes,
-						required_guardrail_tokens: missingTokens,
-						guardrail_warnings: analysis.warnings,
-					},
-					409,
-				);
+				return c.json(mappingGuardrailChallenge(analysis.warnings, missingConfirmations), 409);
 			}
-			const [deviceId] = ensureDeviceIdentity(store.db, { keysDir: syncKeysDir() });
 			const mapping = upsertProjectScopeSettingsMapping(store.db, {
 				deviceId,
 				...mappingInput,
@@ -6145,8 +6195,10 @@ export function syncRoutes(
 				return parseViewerProjectMappingInput(raw as Record<string, unknown>);
 			});
 			releasePublicationMutation = await claimRecipientPolicyPublicationMutation(store.db);
-			const analyses = mappingInputs.map((mappingInput) =>
-				analyzeProjectScopeMappingChangeGuardrails(store.db, mappingInput),
+			const [deviceId] = ensureDeviceIdentity(store.db, { keysDir: syncKeysDir() });
+			const analyses = analyzeProjectScopeMappingChangesGuardrails(
+				store.db,
+				mappingInputs.map((input) => ({ ...input, deviceId })),
 			);
 			const unmapped = analyses.find((analysis) =>
 				analysis.requested_workspace_identity?.startsWith("unmapped:"),
@@ -6166,29 +6218,17 @@ export function syncRoutes(
 				missingGuardrailConfirmations(analysis.warnings, []),
 			);
 			if (missingConfirmations.length > 0) {
-				const missingCodes = [...new Set(missingConfirmations.map((warning) => warning.code))];
-				const missingTokens = [
-					...new Set(missingConfirmations.map((warning) => warning.confirmation_token)),
-				].filter((token): token is string => typeof token === "string" && token.length > 0);
 				return c.json(
-					{
-						error: "guardrail_confirmation_required",
-						required_guardrails: missingCodes,
-						required_guardrail_tokens: missingTokens,
-						guardrail_warnings: analyses.flatMap((analysis) => analysis.warnings),
-					},
+					mappingGuardrailChallenge(
+						analyses.flatMap((analysis) => analysis.warnings),
+						missingConfirmations,
+					),
 					409,
 				);
 			}
-			const [deviceId] = ensureDeviceIdentity(store.db, { keysDir: syncKeysDir() });
-			const saveMappings = store.db.transaction(() =>
-				mappingInputs.map((mappingInput) =>
-					upsertProjectScopeSettingsMapping(store.db, { deviceId, ...mappingInput }),
-				),
-			);
 			return c.json({
 				ok: true,
-				mappings: saveMappings(),
+				mappings: upsertProjectScopeSettingsMappings(store.db, mappingInputs, { deviceId }),
 				guardrail_warnings: analyses.flatMap((analysis) => analysis.warnings),
 			});
 		} catch (error) {
@@ -6198,20 +6238,9 @@ export function syncRoutes(
 		}
 	});
 
-	app.delete("/api/sync/sharing-domains/project-mappings/:id", async (c) => {
-		const store = getStore();
-		const id = Number(c.req.param("id"));
-		let releasePublicationMutation: (() => void) | undefined;
-		try {
-			releasePublicationMutation = await claimRecipientPolicyPublicationMutation(store.db);
-			const deleted = deleteProjectScopeSettingsMapping(store.db, id);
-			return c.json({ ok: true, deleted });
-		} catch (error) {
-			return c.json({ error: error instanceof Error ? error.message : String(error) }, 400);
-		} finally {
-			releasePublicationMutation?.();
-		}
-	});
+	app.delete("/api/sync/sharing-domains/project-mappings/:id", (c) =>
+		deleteProjectScopeMappingRoute(c, getStore()),
+	);
 
 	app.post("/api/sync/peers/identity", async (c) => {
 		const store = getStore();

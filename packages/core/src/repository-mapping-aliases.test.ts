@@ -3,8 +3,24 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { connect } from "./db.js";
-import { listProjectScopeInventory } from "./project-scope-settings.js";
-import { resolveSessionScopeId } from "./scope-stamping.js";
+import { REPOSITORY_IDENTITY_METADATA_KEY } from "./project.js";
+import {
+	analyzeProjectScopeMappingChangeGuardrails,
+	analyzeProjectScopeMappingChangesGuardrails,
+	analyzeProjectScopeMappingDeletionGuardrails,
+	deleteProjectScopeSettingsMapping,
+	listProjectScopeCandidates,
+	listProjectScopeInventory,
+	upsertProjectScopeSettingsMapping,
+	upsertProjectScopeSettingsMappings,
+} from "./project-scope-settings.js";
+import {
+	hasConflictingRepositoryMappings,
+	repositoryIdentitiesByWorkspace,
+	withRepositoryMappingAliases,
+	withRepositoryMappingAliasesFromIdentities,
+} from "./repository-mapping-aliases.js";
+import { ensureMemoryScopeId, resolveSessionScopeId } from "./scope-stamping.js";
 import { MemoryStore } from "./store.js";
 import { initTestSchema } from "./test-utils.js";
 
@@ -28,6 +44,1377 @@ function insertMapping(store: MemoryStore, cwd: string, scopeId: string): void {
 			 ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
 		)
 		.run(cwd, cwd, scopeId, 10, "user", "2026-09-17", "2026-09-17");
+}
+
+function insertPatternMapping(store: MemoryStore, pattern: string, scopeId: string): void {
+	store.db
+		.prepare(
+			`INSERT INTO project_scope_mappings(
+			 workspace_identity, project_pattern, scope_id, priority, source, created_at, updated_at
+			 ) VALUES (NULL, ?, ?, ?, ?, ?, ?)`,
+		)
+		.run(pattern, scopeId, 10, "user", "2026-09-17", "2026-09-17");
+}
+
+function insertScope(store: MemoryStore, scopeId: string): void {
+	store.db
+		.prepare(
+			`INSERT INTO replication_scopes(
+			 scope_id, label, kind, authority_type, membership_epoch, status, created_at, updated_at
+			 ) VALUES (?, ?, 'team', 'coordinator', 1, 'active', ?, ?)`,
+		)
+		.run(scopeId, scopeId, "2026-09-22", "2026-09-22");
+}
+
+function expectSiblingWorktreeMapping(store: MemoryStore, tmpDir: string): void {
+	const { mainRepo, worktree } = createLinkedWorktree(
+		tmpDir,
+		"historical",
+		"https://example.test/acme/historical.git",
+	);
+	insertMapping(store, mainRepo, "historical-scope");
+	store.startSession({ cwd: mainRepo, project: "historical" });
+	const worktreeSessionId = store.getOrCreateSessionForOpencodeSession({
+		opencodeSessionId: "session-new-worktree",
+		cwd: worktree,
+		project: "historical",
+	});
+	expect(resolveSessionScopeId(store.db, { sessionId: worktreeSessionId })).toBe(
+		"historical-scope",
+	);
+	const inventory = listProjectScopeInventory(store.db, { limit: 10 });
+	expect(inventory.projects).toHaveLength(1);
+	expect(inventory.projects[0]).toMatchObject({
+		resolved_scope_id: "historical-scope",
+		session_count: 2,
+		workspace_identity: "https://example.test/acme/historical.git",
+	});
+}
+
+function expectEquivalentCwdsGroupAsRepository(store: MemoryStore, tmpDir: string): void {
+	const cwd = join(tmpDir, "normalized-checkout");
+	const repositoryIdentity = "https://example.test/acme/normalized.git";
+	store.db
+		.prepare("INSERT INTO sessions(started_at, cwd, project, metadata_json) VALUES (?, ?, ?, ?)")
+		.run(
+			"2026-09-22T00:00:00.000Z",
+			cwd,
+			"normalized",
+			JSON.stringify({ [REPOSITORY_IDENTITY_METADATA_KEY]: repositoryIdentity }),
+		);
+	store.db
+		.prepare("INSERT INTO sessions(started_at, cwd, project, metadata_json) VALUES (?, ?, ?, '{}')")
+		.run("2026-09-21T00:00:00.000Z", `${cwd}/`, "normalized");
+	expect(listProjectScopeInventory(store.db, { limit: 10 }).projects).toMatchObject([
+		{
+			repository_identity: repositoryIdentity,
+			session_count: 2,
+			workspace_identity: repositoryIdentity,
+		},
+	]);
+}
+
+function expectPatternConflictsFailClosed(store: MemoryStore, tmpDir: string): void {
+	const { mainRepo, worktree } = createLinkedWorktree(
+		tmpDir,
+		"pattern-conflict",
+		"https://example.test/acme/pattern-conflict.git",
+	);
+	insertPatternMapping(store, `${mainRepo}*`, "narrow-scope");
+	insertPatternMapping(store, `${worktree}*`, "broad-scope");
+	insertScope(store, "pattern-conflict");
+	const mainSessionId = store.startSession({ cwd: mainRepo, project: "pattern-conflict" });
+	const worktreeSessionId = store.startSession({ cwd: worktree, project: "pattern-conflict" });
+	expect(resolveSessionScopeId(store.db, { sessionId: mainSessionId })).toBe("local-default");
+	expect(resolveSessionScopeId(store.db, { sessionId: worktreeSessionId })).toBe("local-default");
+	const project = listProjectScopeInventory(store.db, { limit: 10 }).projects.find(
+		(item) => item.workspace_identity === "https://example.test/acme/pattern-conflict.git",
+	);
+	expect(project).toMatchObject({
+		resolved_scope_id: "local-default",
+		suggested_scope_id: null,
+		suggestion_reason: null,
+		suggestion_signal: null,
+		statuses: expect.arrayContaining(["needs_attention"]),
+		guardrail_warnings: expect.arrayContaining([
+			expect.objectContaining({ code: "conflicting_repository_mappings" }),
+		]),
+	});
+}
+
+function expectExactConflictsFailClosed(store: MemoryStore, tmpDir: string): void {
+	const { mainRepo, worktree } = createLinkedWorktree(
+		tmpDir,
+		"conflicting",
+		"https://example.test/acme/conflicting.git",
+	);
+	insertMapping(store, mainRepo, "narrow-scope");
+	insertMapping(store, worktree, "broad-scope");
+	const sessionId = store.getOrCreateSessionForOpencodeSession({
+		opencodeSessionId: "session-conflicting-worktree",
+		cwd: worktree,
+		project: "conflicting",
+	});
+	expect(resolveSessionScopeId(store.db, { sessionId })).toBe("local-default");
+	const memoryId = store.remember(sessionId, "discovery", "conflict", "conflict");
+	store.db.prepare("UPDATE memory_items SET scope_id = NULL WHERE id = ?").run(memoryId);
+	expect(ensureMemoryScopeId(store.db, memoryId)).toBe("local-default");
+	const repositoryProject = listProjectScopeInventory(store.db, { limit: 10 }).projects.find(
+		(project) => project.workspace_identity === "https://example.test/acme/conflicting.git",
+	);
+	expect(repositoryProject).toMatchObject({
+		resolved_scope_id: "local-default",
+		statuses: expect.arrayContaining(["needs_attention"]),
+		guardrail_warnings: expect.arrayContaining([
+			expect.objectContaining({
+				code: "conflicting_repository_mappings",
+				requires_confirmation: true,
+			}),
+		]),
+	});
+	const candidate = listProjectScopeCandidates(store.db, { limit: null }).find(
+		(item) => item.workspace_identity === "https://example.test/acme/conflicting.git",
+	);
+	expect(candidate).toMatchObject({
+		resolved_scope_id: "local-default",
+		guardrail_warnings: expect.arrayContaining([
+			expect.objectContaining({ code: "conflicting_repository_mappings" }),
+		]),
+	});
+}
+
+function expectConflictPropagationFailsClosed(store: MemoryStore, tmpDir: string): void {
+	const { mainRepo, worktree } = createLinkedWorktree(
+		tmpDir,
+		"propagation-conflict",
+		"https://example.test/acme/propagation-conflict.git",
+	);
+	insertScope(store, "propagation-a");
+	insertScope(store, "propagation-b");
+	const sessionId = store.startSession({ cwd: mainRepo, project: "propagation-conflict" });
+	const worktreeSessionId = store.startSession({ cwd: worktree, project: "propagation-conflict" });
+	const memoryId = store.remember(sessionId, "discovery", "propagation", "propagation");
+	const worktreeMemoryId = store.remember(
+		worktreeSessionId,
+		"discovery",
+		"worktree propagation",
+		"worktree propagation",
+	);
+	upsertProjectScopeSettingsMapping(store.db, {
+		deviceId: store.deviceId,
+		workspace_identity: mainRepo,
+		project_pattern: mainRepo,
+		scope_id: "propagation-a",
+	});
+	expect(
+		store.db.prepare("SELECT scope_id FROM memory_items WHERE id = ?").pluck().get(memoryId),
+	).toBe("propagation-a");
+	upsertProjectScopeSettingsMapping(store.db, {
+		deviceId: store.deviceId,
+		workspace_identity: worktree,
+		project_pattern: worktree,
+		scope_id: "propagation-b",
+	});
+	expect(
+		store.db.prepare("SELECT scope_id FROM memory_items WHERE id = ?").pluck().get(memoryId),
+	).toBe("local-default");
+	expect(
+		store.db
+			.prepare("SELECT scope_id FROM memory_items WHERE id = ?")
+			.pluck()
+			.get(worktreeMemoryId),
+	).toBe("local-default");
+	upsertProjectScopeSettingsMapping(store.db, {
+		deviceId: store.deviceId,
+		workspace_identity: mainRepo,
+		project_pattern: mainRepo,
+		scope_id: "propagation-b",
+	});
+	for (const id of [memoryId, worktreeMemoryId]) {
+		expect(store.db.prepare("SELECT scope_id FROM memory_items WHERE id = ?").pluck().get(id)).toBe(
+			"propagation-b",
+		);
+	}
+}
+
+function expectInsertedPatternClearsConflictForAllMemories(
+	store: MemoryStore,
+	tmpDir: string,
+): void {
+	const { mainRepo, worktree } = createLinkedWorktree(
+		tmpDir,
+		"insert-clears-conflict",
+		"https://example.test/acme/insert-clears-conflict.git",
+	);
+	insertScope(store, "insert-clear-a");
+	insertScope(store, "insert-clear-b");
+	insertPatternMapping(store, mainRepo, "insert-clear-a");
+	insertPatternMapping(store, worktree, "insert-clear-b");
+	const sessionIds = [mainRepo, worktree].map((cwd) =>
+		store.startSession({ cwd, project: "insert-clears-conflict" }),
+	);
+	const memoryIds = sessionIds.map((sessionId, index) =>
+		store.remember(sessionId, "discovery", `insert clear ${index}`, `insert clear ${index}`),
+	);
+	for (const memoryId of memoryIds) {
+		expect(
+			store.db.prepare("SELECT scope_id FROM memory_items WHERE id = ?").pluck().get(memoryId),
+		).toBe("local-default");
+	}
+
+	upsertProjectScopeSettingsMapping(store.db, {
+		deviceId: store.deviceId,
+		project_pattern: mainRepo,
+		scope_id: "insert-clear-b",
+		priority: 20,
+	});
+
+	for (const memoryId of memoryIds) {
+		expect(
+			store.db.prepare("SELECT scope_id FROM memory_items WHERE id = ?").pluck().get(memoryId),
+		).toBe("insert-clear-b");
+	}
+}
+
+function expectLegacyRemoteConflictsFailClosed(store: MemoryStore): void {
+	const repositoryIdentity = "https://example.test/acme/legacy-remote-conflict.git";
+	const main = "/workspace/legacy-remote-main";
+	const worktree = "/workspace/legacy-remote-worktree";
+	insertScope(store, "legacy-remote-a");
+	insertScope(store, "legacy-remote-b");
+	const sessionIds = [main, worktree].map((cwd, index) =>
+		Number(
+			store.db
+				.prepare(
+					`INSERT INTO sessions(started_at, cwd, project, git_remote, metadata_json)
+					 VALUES (?, ?, 'legacy-remote-conflict', ?, '{}')`,
+				)
+				.run(
+					`2026-09-23T0${index}:00:00.000Z`,
+					cwd,
+					index === 0 ? repositoryIdentity : `${repositoryIdentity}/`,
+				).lastInsertRowid,
+		),
+	);
+	const memoryIds = sessionIds.map((sessionId, index) =>
+		store.remember(sessionId, "discovery", `legacy remote ${index}`, `legacy remote ${index}`),
+	);
+
+	upsertProjectScopeSettingsMapping(store.db, {
+		deviceId: store.deviceId,
+		workspace_identity: main,
+		project_pattern: main,
+		scope_id: "legacy-remote-a",
+	});
+	for (const memoryId of memoryIds) {
+		expect(
+			store.db.prepare("SELECT scope_id FROM memory_items WHERE id = ?").pluck().get(memoryId),
+		).toBe("legacy-remote-a");
+	}
+	const analysis = analyzeProjectScopeMappingChangeGuardrails(store.db, {
+		project_pattern: worktree,
+		scope_id: "legacy-remote-b",
+	});
+	expect(analysis.warnings).toEqual(
+		expect.arrayContaining([
+			expect.objectContaining({
+				code: "conflicting_repository_mappings",
+				requires_confirmation: true,
+			}),
+		]),
+	);
+
+	upsertProjectScopeSettingsMapping(store.db, {
+		deviceId: store.deviceId,
+		workspace_identity: worktree,
+		project_pattern: worktree,
+		scope_id: "legacy-remote-b",
+	});
+	for (const sessionId of sessionIds) {
+		expect(resolveSessionScopeId(store.db, { sessionId })).toBe("local-default");
+	}
+	for (const memoryId of memoryIds) {
+		expect(
+			store.db.prepare("SELECT scope_id FROM memory_items WHERE id = ?").pluck().get(memoryId),
+		).toBe("local-default");
+	}
+	const project = listProjectScopeInventory(store.db, { limit: 10 }).projects.find(
+		(item) => item.workspace_identity === repositoryIdentity,
+	);
+	expect(project).toMatchObject({
+		resolved_scope_id: "local-default",
+		session_count: 2,
+		statuses: expect.arrayContaining(["needs_attention"]),
+		guardrail_warnings: expect.arrayContaining([
+			expect.objectContaining({ code: "conflicting_repository_mappings" }),
+		]),
+	});
+}
+
+function expectRequestedConflictWarning(store: MemoryStore, tmpDir: string): void {
+	const { mainRepo, worktree } = createLinkedWorktree(
+		tmpDir,
+		"requested-conflict",
+		"https://example.test/acme/requested-conflict.git",
+	);
+	insertScope(store, "requested-a");
+	insertScope(store, "requested-b");
+	insertScope(store, "requested-c");
+	store.startSession({ cwd: mainRepo, project: "requested-conflict" });
+	store.startSession({ cwd: worktree, project: "requested-conflict" });
+	insertMapping(store, mainRepo, "requested-a");
+
+	const analysis = analyzeProjectScopeMappingChangeGuardrails(store.db, {
+		workspace_identity: worktree,
+		project_pattern: worktree,
+		scope_id: "requested-b",
+	});
+
+	expect(analysis.warnings).toEqual(
+		expect.arrayContaining([
+			expect.objectContaining({
+				code: "conflicting_repository_mappings",
+				requires_confirmation: true,
+			}),
+		]),
+	);
+	const token = analysis.warnings.find(
+		(warning) => warning.code === "conflicting_repository_mappings",
+	)?.confirmation_token;
+	const changedRequest = analyzeProjectScopeMappingChangeGuardrails(store.db, {
+		workspace_identity: worktree,
+		project_pattern: worktree,
+		scope_id: "requested-c",
+	});
+	expect(
+		changedRequest.warnings.find((warning) => warning.code === "conflicting_repository_mappings")
+			?.confirmation_token,
+	).not.toBe(token);
+	store.db
+		.prepare("UPDATE project_scope_mappings SET priority = 11 WHERE workspace_identity = ?")
+		.run(mainRepo);
+	const changedConflict = analyzeProjectScopeMappingChangeGuardrails(store.db, {
+		workspace_identity: worktree,
+		project_pattern: worktree,
+		scope_id: "requested-b",
+	});
+	expect(
+		changedConflict.warnings.find((warning) => warning.code === "conflicting_repository_mappings")
+			?.confirmation_token,
+	).not.toBe(token);
+}
+
+function expectRequestedPatternConflictWarning(store: MemoryStore, tmpDir: string): void {
+	const { mainRepo, worktree } = createLinkedWorktree(
+		tmpDir,
+		"requested-pattern-conflict",
+		"https://example.test/acme/requested-pattern-conflict.git",
+	);
+	insertScope(store, "requested-pattern-a");
+	insertScope(store, "requested-pattern-b");
+	store.startSession({ cwd: mainRepo, project: "requested-pattern-conflict" });
+	store.startSession({ cwd: worktree, project: "requested-pattern-conflict" });
+	insertPatternMapping(store, mainRepo, "requested-pattern-a");
+
+	const analysis = analyzeProjectScopeMappingChangeGuardrails(store.db, {
+		project_pattern: worktree,
+		scope_id: "requested-pattern-b",
+	});
+
+	expect(analysis.warnings).toEqual(
+		expect.arrayContaining([
+			expect.objectContaining({
+				code: "conflicting_repository_mappings",
+				requires_confirmation: true,
+			}),
+		]),
+	);
+}
+
+function expectBulkRequestedConflictWarning(store: MemoryStore, tmpDir: string): void {
+	const { mainRepo, worktree } = createLinkedWorktree(
+		tmpDir,
+		"bulk-requested-conflict",
+		"https://example.test/acme/bulk-requested-conflict.git",
+	);
+	insertScope(store, "bulk-requested-a");
+	insertScope(store, "bulk-requested-b");
+	store.startSession({ cwd: mainRepo, project: "bulk-requested-conflict" });
+	store.startSession({ cwd: worktree, project: "bulk-requested-conflict" });
+
+	const analyses = analyzeProjectScopeMappingChangesGuardrails(store.db, [
+		{ project_pattern: mainRepo, scope_id: "bulk-requested-a" },
+		{ project_pattern: worktree, scope_id: "bulk-requested-b" },
+	]);
+
+	expect(analyses.flatMap((analysis) => analysis.warnings)).toEqual(
+		expect.arrayContaining([
+			expect.objectContaining({
+				code: "conflicting_repository_mappings",
+				requires_confirmation: true,
+			}),
+		]),
+	);
+}
+
+function expectSequentialBulkMoveConflictWarning(store: MemoryStore, tmpDir: string): void {
+	const { mainRepo, worktree } = createLinkedWorktree(
+		tmpDir,
+		"sequential-bulk-move-conflict",
+		"https://example.test/acme/sequential-bulk-move-conflict.git",
+	);
+	insertScope(store, "sequential-bulk-move-a");
+	insertScope(store, "sequential-bulk-move-b");
+	store.startSession({ cwd: mainRepo, project: "sequential-bulk-move-conflict" });
+	store.startSession({ cwd: worktree, project: "sequential-bulk-move-conflict" });
+	insertMapping(store, mainRepo, "sequential-bulk-move-a");
+	const mappingId = Number(
+		store.db
+			.prepare("SELECT id FROM project_scope_mappings WHERE workspace_identity = ?")
+			.pluck()
+			.get(mainRepo),
+	);
+
+	const analyses = analyzeProjectScopeMappingChangesGuardrails(store.db, [
+		{
+			id: mappingId,
+			workspace_identity: worktree,
+			project_pattern: worktree,
+			scope_id: "sequential-bulk-move-a",
+		},
+		{
+			workspace_identity: mainRepo,
+			project_pattern: mainRepo,
+			scope_id: "sequential-bulk-move-b",
+		},
+	]);
+
+	expect(analyses[1]?.existing_mapping).toBeNull();
+	expect(analyses.flatMap((analysis) => analysis.warnings)).toEqual(
+		expect.arrayContaining([
+			expect.objectContaining({
+				code: "conflicting_repository_mappings",
+				requires_confirmation: true,
+			}),
+		]),
+	);
+}
+
+function expectBulkInsertionOrderConflictWarning(store: MemoryStore, tmpDir: string): void {
+	const { mainRepo, worktree } = createLinkedWorktree(
+		tmpDir,
+		"bulk-insertion-order-conflict",
+		"https://example.test/acme/bulk-insertion-order-conflict.git",
+	);
+	insertScope(store, "bulk-insertion-order-a");
+	insertScope(store, "bulk-insertion-order-b");
+	store.startSession({ cwd: mainRepo, project: "bulk-insertion-order-conflict" });
+	store.startSession({ cwd: worktree, project: "bulk-insertion-order-conflict" });
+	insertMapping(store, mainRepo, "bulk-insertion-order-a");
+
+	const analyses = analyzeProjectScopeMappingChangesGuardrails(store.db, [
+		{ project_pattern: worktree, scope_id: "bulk-insertion-order-a" },
+		{ project_pattern: worktree, scope_id: "bulk-insertion-order-b" },
+	]);
+
+	expect(analyses.flatMap((analysis) => analysis.warnings)).toEqual(
+		expect.arrayContaining([
+			expect.objectContaining({
+				code: "conflicting_repository_mappings",
+				requires_confirmation: true,
+			}),
+		]),
+	);
+}
+
+function expectBulkRejectsNonPositiveIds(store: MemoryStore): void {
+	insertScope(store, "bulk-invalid-id");
+	expect(() =>
+		analyzeProjectScopeMappingChangesGuardrails(store.db, [
+			{ project_pattern: "/workspace/first", scope_id: "bulk-invalid-id" },
+			{ id: -1, project_pattern: "/workspace/second", scope_id: "bulk-invalid-id" },
+		]),
+	).toThrow("id must be a positive integer");
+}
+
+function expectBulkSimulationGuardrails(store: MemoryStore, tmpDir: string): void {
+	expectSequentialBulkMoveConflictWarning(store, tmpDir);
+	expectBulkInsertionOrderConflictWarning(store, tmpDir);
+	expectBulkRejectsNonPositiveIds(store);
+}
+
+function expectBulkSimulationPreservesNormalizedDuplicates(store: MemoryStore): void {
+	insertScope(store, "normalized-duplicate-a");
+	insertScope(store, "normalized-duplicate-b");
+	insertMapping(store, "/workspace/normalized-duplicate", "normalized-duplicate-a");
+	const olderId = Number(
+		store.db
+			.prepare("SELECT id FROM project_scope_mappings WHERE scope_id = 'normalized-duplicate-a'")
+			.pluck()
+			.get(),
+	);
+	insertMapping(store, "/workspace/normalized-duplicate/", "normalized-duplicate-b");
+	const newerId = Number(
+		store.db
+			.prepare("SELECT id FROM project_scope_mappings WHERE scope_id = 'normalized-duplicate-b'")
+			.pluck()
+			.get(),
+	);
+
+	const analyses = analyzeProjectScopeMappingChangesGuardrails(store.db, [
+		{
+			id: olderId,
+			workspace_identity: "/workspace/normalized-duplicate",
+			project_pattern: "/workspace/normalized-duplicate",
+			scope_id: "normalized-duplicate-a",
+		},
+		{
+			id: newerId,
+			workspace_identity: "/workspace/normalized-duplicate/",
+			project_pattern: "/workspace/normalized-duplicate/",
+			scope_id: "normalized-duplicate-b",
+		},
+	]);
+
+	expect(analyses[1]?.existing_mapping).toMatchObject({
+		id: newerId,
+		scope_id: "normalized-duplicate-b",
+	});
+}
+
+function expectBulkNormalizedLookupMatchesPersistence(store: MemoryStore): void {
+	insertScope(store, "normalized-existing");
+	insertMapping(store, "/workspace/normalized-existing/", "normalized-existing");
+	store.db
+		.prepare("UPDATE project_scope_mappings SET priority = 10 WHERE workspace_identity = ?")
+		.run("/workspace/normalized-existing/");
+	const input = {
+		workspace_identity: "/workspace/normalized-existing",
+		project_pattern: "/workspace/normalized-existing",
+		scope_id: "normalized-existing",
+	};
+	const [analysis] = analyzeProjectScopeMappingChangesGuardrails(store.db, [input]);
+	const saved = upsertProjectScopeSettingsMapping(store.db, input);
+	expect(saved).toMatchObject({ id: analysis?.existing_mapping?.id, priority: 10 });
+	expect(
+		store.db
+			.prepare("SELECT COUNT(*) FROM project_scope_mappings WHERE scope_id = ?")
+			.pluck()
+			.get("normalized-existing"),
+	).toBe(1);
+}
+
+function expectDeleteLocalOverrideRequiresConfirmation(store: MemoryStore, tmpDir: string): void {
+	const cwd = join(tmpDir, "delete-local-override");
+	insertScope(store, "delete-fallback-shared");
+	insertPatternMapping(store, `${tmpDir}/delete-local-*`, "delete-fallback-shared");
+	insertMapping(store, cwd, "local-default");
+	const id = Number(
+		store.db
+			.prepare("SELECT id FROM project_scope_mappings WHERE workspace_identity = ?")
+			.pluck()
+			.get(cwd),
+	);
+	const sessionId = store.startSession({ cwd, project: "delete-local-override" });
+	const memoryId = store.remember(sessionId, "discovery", "local override", "local override");
+	const warnings = analyzeProjectScopeMappingDeletionGuardrails(store.db, id, store.deviceId);
+	expect(warnings).toEqual([
+		expect.objectContaining({
+			code: "scope_reassignment_old_copies",
+			scope_id: "delete-fallback-shared",
+			requires_confirmation: true,
+			confirmation_token: expect.any(String),
+		}),
+	]);
+	expect(() =>
+		deleteProjectScopeSettingsMapping(store.db, id, { deviceId: store.deviceId }),
+	).toThrow("guardrail_confirmation_required");
+	expect(
+		store.db.prepare("SELECT scope_id FROM memory_items WHERE id = ?").pluck().get(memoryId),
+	).toBe("local-default");
+	store.remember(sessionId, "discovery", "new Local memory", "new Local memory");
+	expect(() =>
+		deleteProjectScopeSettingsMapping(store.db, id, {
+			deviceId: store.deviceId,
+			confirmedGuardrailTokens: [warnings[0]?.confirmation_token ?? ""],
+		}),
+	).toThrow("guardrail_confirmation_required");
+	const refreshedWarnings = analyzeProjectScopeMappingDeletionGuardrails(
+		store.db,
+		id,
+		store.deviceId,
+	);
+	expect(refreshedWarnings[0]?.confirmation_token).not.toBe(warnings[0]?.confirmation_token);
+	expect(
+		deleteProjectScopeSettingsMapping(store.db, id, {
+			deviceId: store.deviceId,
+			confirmedGuardrailTokens: [refreshedWarnings[0]?.confirmation_token ?? ""],
+		}),
+	).toBe(true);
+	expect(
+		store.db.prepare("SELECT scope_id FROM memory_items WHERE id = ?").pluck().get(memoryId),
+	).toBe("delete-fallback-shared");
+}
+
+function expectMappedRepositorySeedsCandidateDiscovery(store: MemoryStore, tmpDir: string): void {
+	const remote = "https://example.test/acme/mapping-seeded-candidate.git";
+	const { mainRepo, worktree } = createLinkedWorktree(tmpDir, "mapping-seeded-candidate", remote);
+	insertScope(store, "mapping-seeded-candidate");
+	insertMapping(store, remote, "mapping-seeded-candidate");
+	const sessionId = Number(
+		store.db
+			.prepare(
+				"INSERT INTO sessions(started_at, cwd, project, metadata_json) VALUES (?, ?, ?, '{}')",
+			)
+			.run("2026-09-24T00:00:00.000Z", mainRepo, "mapping-seeded-candidate").lastInsertRowid,
+	);
+	store.db
+		.prepare(
+			"INSERT INTO sessions(started_at, cwd, project, git_remote, metadata_json) VALUES (?, ?, ?, ?, ?)",
+		)
+		.run(
+			"2026-09-24T01:00:00.000Z",
+			mainRepo,
+			"mapping-seeded-candidate",
+			remote,
+			JSON.stringify({ [REPOSITORY_IDENTITY_METADATA_KEY]: 123 }),
+		);
+
+	expect(
+		listProjectScopeCandidates(store.db).find(
+			(candidate) => candidate.workspace_identity === remote,
+		),
+	).toMatchObject({ repository_identity: remote, resolved_scope_id: "mapping-seeded-candidate" });
+	const inventory = listProjectScopeInventory(store.db, { limit: 10 });
+	const matchingProjects = inventory.projects.filter((project) =>
+		[remote, mainRepo].includes(project.workspace_identity),
+	);
+	expect(matchingProjects).toHaveLength(1);
+	expect(matchingProjects[0]).toMatchObject({
+		workspace_identity: remote,
+		resolved_scope_id: "mapping-seeded-candidate",
+	});
+
+	const memoryId = store.remember(sessionId, "discovery", "mapped legacy", "mapped legacy");
+	expect(
+		store.db.prepare("SELECT scope_id FROM memory_items WHERE id = ?").pluck().get(memoryId),
+	).toBe("mapping-seeded-candidate");
+	const mappingId = Number(
+		store.db
+			.prepare("SELECT id FROM project_scope_mappings WHERE scope_id = ?")
+			.pluck()
+			.get("mapping-seeded-candidate"),
+	);
+	const deletionWarnings = analyzeProjectScopeMappingDeletionGuardrails(
+		store.db,
+		mappingId,
+		store.deviceId,
+	);
+	expect(
+		deleteProjectScopeSettingsMapping(store.db, mappingId, {
+			deviceId: store.deviceId,
+			confirmedGuardrailTokens: deletionWarnings.map((warning) => warning.confirmation_token ?? ""),
+		}),
+	).toBe(true);
+	expect(
+		store.db.prepare("SELECT scope_id FROM memory_items WHERE id = ?").pluck().get(memoryId),
+	).toBe("local-default");
+	insertScope(store, "mapping-seeded-conflict");
+	insertPatternMapping(store, mainRepo, "mapping-seeded-candidate");
+	insertPatternMapping(store, worktree, "mapping-seeded-conflict");
+	const worktreeSessionId = Number(
+		store.db
+			.prepare(
+				"INSERT INTO sessions(started_at, cwd, project, metadata_json) VALUES (?, ?, ?, '{}')",
+			)
+			.run("2026-09-25T00:00:00.000Z", worktree, "mapping-seeded-candidate").lastInsertRowid,
+	);
+	expect(resolveSessionScopeId(store.db, { sessionId })).toBe("local-default");
+	expect(resolveSessionScopeId(store.db, { sessionId: worktreeSessionId })).toBe("local-default");
+}
+
+function expectDiscoveredSiblingDraftRequiresConflictConfirmation(
+	store: MemoryStore,
+	tmpDir: string,
+): void {
+	const remote = "https://example.test/acme/discovered-draft-sibling.git";
+	const { mainRepo, worktree } = createLinkedWorktree(tmpDir, "discovered-draft-sibling", remote);
+	insertScope(store, "discovered-draft-a");
+	insertScope(store, "discovered-draft-b");
+	insertPatternMapping(store, mainRepo, "discovered-draft-a");
+	for (const cwd of [worktree, mainRepo]) {
+		store.db
+			.prepare("INSERT INTO sessions(started_at, cwd, project, metadata_json) VALUES (?, ?, ?, ?)")
+			.run(
+				"2026-09-24T00:00:00.000Z",
+				cwd,
+				"discovered-draft-sibling",
+				cwd === mainRepo ? JSON.stringify({ [REPOSITORY_IDENTITY_METADATA_KEY]: remote }) : "{}",
+			);
+	}
+	const analysis = analyzeProjectScopeMappingChangeGuardrails(store.db, {
+		project_pattern: worktree,
+		scope_id: "discovered-draft-b",
+	});
+	expect(analysis.warnings).toEqual(
+		expect.arrayContaining([expect.objectContaining({ code: "conflicting_repository_mappings" })]),
+	);
+}
+
+function expectPatternOnlyRepositorySeedFailsClosed(store: MemoryStore, tmpDir: string): void {
+	const remote = "https://example.test/acme/pattern-only-seed.git";
+	const { mainRepo, worktree } = createLinkedWorktree(tmpDir, "pattern-only-seed", remote);
+	insertScope(store, "pattern-only-a");
+	insertScope(store, "pattern-only-b");
+	insertPatternMapping(store, remote, "pattern-only-a");
+	insertPatternMapping(store, worktree, "pattern-only-b");
+	const sessions = [mainRepo, worktree].map((cwd) =>
+		Number(
+			store.db
+				.prepare(
+					"INSERT INTO sessions(started_at, cwd, project, metadata_json) VALUES (?, ?, ?, '{}')",
+				)
+				.run("2026-09-24T00:00:00.000Z", cwd, "pattern-only-seed").lastInsertRowid,
+		),
+	);
+	expect(
+		listProjectScopeCandidates(store.db).find(
+			(candidate) => candidate.repository_identity === remote,
+		),
+	).toMatchObject({ resolved_scope_id: "local-default" });
+	for (const sessionId of sessions) {
+		expect(resolveSessionScopeId(store.db, { sessionId })).toBe("local-default");
+	}
+}
+
+function expectMovedMappingAnalyzesPreviousRepository(store: MemoryStore, tmpDir: string): void {
+	const remote = "https://example.test/acme/moved-mapping.git";
+	const { mainRepo, worktree } = createLinkedWorktree(tmpDir, "moved-mapping", remote);
+	for (const scopeId of ["moved-main", "moved-worktree"]) {
+		insertScope(store, scopeId);
+	}
+	insertPatternMapping(store, mainRepo, "moved-main");
+	insertPatternMapping(store, worktree, "moved-worktree");
+	const overridingPattern = `${tmpDir}/moved-mapping*`;
+	insertPatternMapping(store, overridingPattern, "moved-main");
+	store.db
+		.prepare("UPDATE project_scope_mappings SET priority = 100 WHERE project_pattern = ?")
+		.run(overridingPattern);
+	for (const cwd of [mainRepo, worktree]) {
+		store.db
+			.prepare("INSERT INTO sessions(started_at, cwd, project, metadata_json) VALUES (?, ?, ?, ?)")
+			.run(
+				"2026-09-24T00:00:00.000Z",
+				cwd,
+				"moved-mapping",
+				JSON.stringify({ [REPOSITORY_IDENTITY_METADATA_KEY]: remote }),
+			);
+	}
+	const mappingId = Number(
+		store.db
+			.prepare("SELECT id FROM project_scope_mappings WHERE project_pattern = ?")
+			.pluck()
+			.get(overridingPattern),
+	);
+	const analysis = analyzeProjectScopeMappingChangeGuardrails(store.db, {
+		id: mappingId,
+		workspace_identity: null,
+		project_pattern: "/workspace/moved-destination",
+		scope_id: "moved-main",
+	});
+
+	expect(analysis.warnings).toEqual(
+		expect.arrayContaining([expect.objectContaining({ code: "conflicting_repository_mappings" })]),
+	);
+}
+
+function expectMovingMappingRequiresFallbackConfirmation(store: MemoryStore, tmpDir: string): void {
+	const cwd = join(tmpDir, "moving-fallback-a");
+	insertScope(store, "moving-fallback-x");
+	insertScope(store, "moving-fallback-y");
+	insertPatternMapping(store, cwd, "moving-fallback-y");
+	insertMapping(store, cwd, "moving-fallback-x");
+	const id = Number(
+		store.db
+			.prepare("SELECT id FROM project_scope_mappings WHERE workspace_identity = ?")
+			.pluck()
+			.get(cwd),
+	);
+	const sessionId = store.startSession({ cwd, project: "moving-fallback" });
+	const memoryId = store.remember(sessionId, "discovery", "moving fallback", "moving fallback");
+	expect(
+		store.db.prepare("SELECT scope_id FROM memory_items WHERE id = ?").pluck().get(memoryId),
+	).toBe("moving-fallback-x");
+	const analysis = analyzeProjectScopeMappingChangeGuardrails(store.db, {
+		id,
+		deviceId: store.deviceId,
+		workspace_identity: join(tmpDir, "moving-fallback-b"),
+		project_pattern: join(tmpDir, "moving-fallback-b"),
+		scope_id: "moving-fallback-x",
+	});
+	expect(analysis.warnings).toEqual(
+		expect.arrayContaining([
+			expect.objectContaining({
+				code: "scope_reassignment_old_copies",
+				previous_scope_id: "moving-fallback-x",
+				scope_id: "moving-fallback-y",
+				requires_confirmation: true,
+			}),
+		]),
+	);
+}
+
+function expectInsertMappingRequiresScopeConfirmation(store: MemoryStore, tmpDir: string): void {
+	const cwd = join(tmpDir, "inserting-shared-mapping");
+	insertScope(store, "insert-shared-confirmation");
+	const sessionId = store.startSession({ cwd, project: "inserting-shared-mapping" });
+	const memoryId = store.remember(sessionId, "discovery", "insert shared", "insert shared");
+	const input = {
+		deviceId: store.deviceId,
+		workspace_identity: cwd,
+		project_pattern: cwd,
+		scope_id: "insert-shared-confirmation",
+	};
+	const analysis = analyzeProjectScopeMappingChangeGuardrails(store.db, input);
+	expect(analysis.warnings).toEqual(
+		expect.arrayContaining([
+			expect.objectContaining({
+				code: "scope_reassignment_old_copies",
+				previous_scope_id: "local-default",
+				scope_id: "insert-shared-confirmation",
+				requires_confirmation: true,
+			}),
+		]),
+	);
+	expect(
+		store.db.prepare("SELECT scope_id FROM memory_items WHERE id = ?").pluck().get(memoryId),
+	).toBe("local-default");
+}
+
+function expectFailedMappingUpdateRollsBack(store: MemoryStore, tmpDir: string): void {
+	const cwd = join(tmpDir, "failed-mapping-update");
+	insertScope(store, "failed-update-a");
+	insertScope(store, "failed-update-b");
+	insertMapping(store, cwd, "failed-update-a");
+	const sessionId = store.startSession({ cwd, project: "failed-mapping-update" });
+	const memoryId = store.remember(sessionId, "discovery", "failed update", "failed update");
+	const id = Number(
+		store.db
+			.prepare("SELECT id FROM project_scope_mappings WHERE workspace_identity = ?")
+			.pluck()
+			.get(cwd),
+	);
+	store.db.exec(
+		`CREATE TRIGGER reject_scope_move BEFORE UPDATE OF scope_id ON memory_items WHEN NEW.id = ${memoryId} BEGIN SELECT RAISE(ABORT, 'forced scope update failure'); END`,
+	);
+	try {
+		expect(() =>
+			upsertProjectScopeSettingsMapping(store.db, {
+				id,
+				deviceId: store.deviceId,
+				workspace_identity: cwd,
+				project_pattern: cwd,
+				scope_id: "failed-update-b",
+			}),
+		).toThrow("forced scope update failure");
+		expect(
+			store.db.prepare("SELECT scope_id FROM project_scope_mappings WHERE id = ?").pluck().get(id),
+		).toBe("failed-update-a");
+		expect(
+			store.db.prepare("SELECT scope_id FROM memory_items WHERE id = ?").pluck().get(memoryId),
+		).toBe("failed-update-a");
+	} finally {
+		store.db.exec("DROP TRIGGER reject_scope_move");
+	}
+}
+
+function expectBulkSkipsIntermediateScopeExposure(store: MemoryStore, tmpDir: string): void {
+	const cwd = join(tmpDir, "bulk-intermediate-scope");
+	insertScope(store, "bulk-intermediate-a");
+	insertScope(store, "bulk-intermediate-b");
+	insertMapping(store, cwd, "bulk-intermediate-a");
+	insertPatternMapping(store, cwd, "bulk-intermediate-b");
+	store.db
+		.prepare("UPDATE project_scope_mappings SET priority = 9 WHERE scope_id = ?")
+		.run("bulk-intermediate-b");
+	const mappingId = Number(
+		store.db
+			.prepare("SELECT id FROM project_scope_mappings WHERE workspace_identity = ?")
+			.pluck()
+			.get(cwd),
+	);
+	const sessionId = store.startSession({ cwd, project: "bulk-intermediate-scope" });
+	const memoryId = store.remember(
+		sessionId,
+		"discovery",
+		"intermediate scope",
+		"intermediate scope",
+	);
+	const importKey = store.db
+		.prepare("SELECT import_key FROM memory_items WHERE id = ?")
+		.pluck()
+		.get(memoryId) as string;
+	const inputs = [0, 10].map((priority) => ({
+		id: mappingId,
+		workspace_identity: cwd,
+		project_pattern: cwd,
+		scope_id: "bulk-intermediate-a",
+		priority,
+	}));
+	const analyses = analyzeProjectScopeMappingChangesGuardrails(
+		store.db,
+		inputs.map((input) => ({ ...input, deviceId: store.deviceId })),
+	);
+	expect(
+		analyses
+			.flatMap((analysis) => analysis.warnings)
+			.some((warning) => warning.code === "scope_reassignment_old_copies"),
+	).toBe(false);
+	upsertProjectScopeSettingsMappings(store.db, inputs, { deviceId: store.deviceId });
+	expect(
+		store.db.prepare("SELECT scope_id FROM memory_items WHERE id = ?").pluck().get(memoryId),
+	).toBe("bulk-intermediate-a");
+	expect(
+		store.db
+			.prepare(
+				"SELECT COUNT(*) FROM replication_ops WHERE entity_id = ? AND scope_id = ? AND op_type = 'upsert'",
+			)
+			.pluck()
+			.get(importKey, "bulk-intermediate-b"),
+	).toBe(0);
+}
+
+function expectMovingSoleRepositoryMappingPreservesEvidence(
+	store: MemoryStore,
+	tmpDir: string,
+): void {
+	const remote = "https://example.test/acme/moving-sole-repository.git";
+	const { mainRepo, worktree } = createLinkedWorktree(tmpDir, "moving-sole-repository", remote);
+	insertScope(store, "moving-repository-a");
+	insertScope(store, "moving-repository-b");
+	insertMapping(store, remote, "moving-repository-a");
+	for (const cwd of [mainRepo, worktree])
+		store.db
+			.prepare(
+				"INSERT INTO sessions(started_at, cwd, project, metadata_json) VALUES (?, ?, ?, '{}')",
+			)
+			.run("2026-09-24T00:00:00.000Z", cwd, "moving-sole-repository");
+	const id = Number(
+		store.db
+			.prepare("SELECT id FROM project_scope_mappings WHERE workspace_identity = ?")
+			.pluck()
+			.get(remote),
+	);
+	upsertProjectScopeSettingsMapping(store.db, {
+		id,
+		workspace_identity: "/workspace/elsewhere",
+		project_pattern: "/workspace/elsewhere",
+		scope_id: "moving-repository-a",
+	});
+	insertPatternMapping(store, mainRepo, "moving-repository-a");
+	insertPatternMapping(store, worktree, "moving-repository-b");
+	for (const cwd of [mainRepo, worktree]) {
+		const sessionId = Number(
+			store.db
+				.prepare(
+					"INSERT INTO sessions(started_at, cwd, project, metadata_json) VALUES (?, ?, ?, '{}')",
+				)
+				.run("2026-09-24T01:00:00.000Z", cwd, "moving-sole-repository").lastInsertRowid,
+		);
+		expect(resolveSessionScopeId(store.db, { sessionId })).toBe("local-default");
+	}
+}
+
+function expectDeleteConflictPropagation(store: MemoryStore, tmpDir: string): void {
+	const { mainRepo, worktree } = createLinkedWorktree(
+		tmpDir,
+		"delete-conflict",
+		"https://example.test/acme/delete-conflict.git",
+	);
+	insertScope(store, "delete-a");
+	insertScope(store, "delete-b");
+	const memoryIds = [mainRepo, worktree].map((cwd, index) =>
+		store.remember(
+			store.startSession({ cwd, project: "delete-conflict" }),
+			"discovery",
+			`delete ${index}`,
+			`delete ${index}`,
+		),
+	);
+	insertMapping(store, mainRepo, "delete-a");
+	const conflicting = upsertProjectScopeSettingsMapping(store.db, {
+		deviceId: store.deviceId,
+		workspace_identity: worktree,
+		project_pattern: worktree,
+		scope_id: "delete-b",
+	});
+	const warnings = analyzeProjectScopeMappingDeletionGuardrails(
+		store.db,
+		conflicting.id,
+		store.deviceId,
+	);
+	expect(warnings.some((warning) => warning.code === "scope_reassignment_old_copies")).toBe(true);
+	expect(
+		deleteProjectScopeSettingsMapping(store.db, conflicting.id, {
+			deviceId: store.deviceId,
+			confirmedGuardrailTokens: warnings.map((warning) => warning.confirmation_token ?? ""),
+		}),
+	).toBe(true);
+	for (const memoryId of memoryIds) {
+		expect(
+			store.db.prepare("SELECT scope_id FROM memory_items WHERE id = ?").pluck().get(memoryId),
+		).toBe("delete-a");
+	}
+}
+
+function expectEquivalentRepositoryIdentityConflict(store: MemoryStore): void {
+	const repositoryIdentity = "https://example.test/acme/equivalent-conflict.git";
+	const main = "/workspace/equivalent-conflict-main";
+	const worktree = "/workspace/equivalent-conflict-worktree";
+	insertScope(store, "equivalent-conflict-a");
+	insertScope(store, "equivalent-conflict-b");
+	insertPatternMapping(store, main, "equivalent-conflict-a");
+	insertPatternMapping(store, worktree, "equivalent-conflict-b");
+	for (const [startedAt, cwd, recordedIdentity] of [
+		["2026-09-22T00:00:00.000Z", main, repositoryIdentity],
+		["2026-09-23T00:00:00.000Z", worktree, `${repositoryIdentity}/`],
+	]) {
+		store.db
+			.prepare("INSERT INTO sessions(started_at, cwd, project, metadata_json) VALUES (?, ?, ?, ?)")
+			.run(
+				startedAt,
+				cwd,
+				"equivalent-conflict",
+				JSON.stringify({ [REPOSITORY_IDENTITY_METADATA_KEY]: recordedIdentity }),
+			);
+	}
+
+	const candidate = listProjectScopeCandidates(store.db, { limit: null }).find(
+		(project) => project.workspace_identity === repositoryIdentity,
+	);
+	expect(candidate).toMatchObject({
+		resolved_scope_id: "local-default",
+		guardrail_warnings: expect.arrayContaining([
+			expect.objectContaining({ code: "conflicting_repository_mappings" }),
+		]),
+	});
+}
+
+function expectPartialPatternMappingFailsClosed(store: MemoryStore, tmpDir: string): void {
+	const { mainRepo, worktree } = createLinkedWorktree(
+		tmpDir,
+		"partially-mapped",
+		"https://example.test/acme/partially-mapped.git",
+	);
+	insertPatternMapping(store, `${mainRepo}*`, "shared-scope");
+	const mainSessionId = store.startSession({ cwd: mainRepo, project: "partially-mapped" });
+	const worktreeSessionId = store.startSession({ cwd: worktree, project: "partially-mapped" });
+	expect(resolveSessionScopeId(store.db, { sessionId: mainSessionId })).toBe("local-default");
+	expect(resolveSessionScopeId(store.db, { sessionId: worktreeSessionId })).toBe("local-default");
+}
+
+function expectDiscoveredSiblingConflictFailsClosed(store: MemoryStore, tmpDir: string): void {
+	const remote = "https://example.test/acme/discovered-sibling-conflict.git";
+	const { mainRepo, worktree } = createLinkedWorktree(
+		tmpDir,
+		"discovered-sibling-conflict",
+		remote,
+	);
+	insertScope(store, "discovered-main");
+	insertScope(store, "discovered-sibling");
+	insertPatternMapping(store, mainRepo, "discovered-main");
+	insertPatternMapping(store, worktree, "discovered-sibling");
+	const mainSessionId = store.getOrCreateSessionForOpencodeSession({
+		opencodeSessionId: "session-discovered-main",
+		cwd: mainRepo,
+		project: "discovered-sibling-conflict",
+		metadata: { [REPOSITORY_IDENTITY_METADATA_KEY]: remote },
+	});
+	store.db
+		.prepare("INSERT INTO sessions(started_at, cwd, project, metadata_json) VALUES (?, ?, ?, '{}')")
+		.run("2026-09-24T00:00:00.000Z", worktree, "discovered-sibling-conflict");
+
+	expect(resolveSessionScopeId(store.db, { sessionId: mainSessionId })).toBe("local-default");
+}
+
+function expectMalformedMetadataDoesNotCreateAmbiguity(store: MemoryStore): void {
+	const cwd = "/workspace/malformed-metadata";
+	const remote = "https://example.test/acme/malformed-metadata.git";
+	insertScope(store, "malformed-metadata");
+	insertPatternMapping(store, cwd, "malformed-metadata");
+	store.db
+		.prepare("INSERT INTO sessions(started_at, cwd, project, metadata_json) VALUES (?, ?, ?, ?)")
+		.run(
+			"2026-09-23T00:00:00.000Z",
+			cwd,
+			"malformed-metadata",
+			JSON.stringify({ [REPOSITORY_IDENTITY_METADATA_KEY]: "fatal: not a git repository" }),
+		);
+	const validSessionId = Number(
+		store.db
+			.prepare("INSERT INTO sessions(started_at, cwd, project, metadata_json) VALUES (?, ?, ?, ?)")
+			.run(
+				"2026-09-24T00:00:00.000Z",
+				cwd,
+				"malformed-metadata",
+				JSON.stringify({ [REPOSITORY_IDENTITY_METADATA_KEY]: remote }),
+			).lastInsertRowid,
+	);
+
+	expect(resolveSessionScopeId(store.db, { sessionId: validSessionId })).toBe("malformed-metadata");
+}
+
+function expectConflictingAliasIsDropped(store: MemoryStore, tmpDir: string): void {
+	const { mainRepo, worktree } = createLinkedWorktree(
+		tmpDir,
+		"alias-pattern-conflict",
+		"https://example.test/acme/alias-pattern-conflict.git",
+	);
+	insertMapping(store, mainRepo, "scope-a");
+	insertPatternMapping(store, `${worktree}*`, "scope-b");
+	const mainSessionId = store.startSession({ cwd: mainRepo, project: "alias-pattern-conflict" });
+	const worktreeSessionId = store.startSession({
+		cwd: worktree,
+		project: "alias-pattern-conflict",
+	});
+	expect(resolveSessionScopeId(store.db, { sessionId: mainSessionId })).toBe("local-default");
+	expect(resolveSessionScopeId(store.db, { sessionId: worktreeSessionId })).toBe("local-default");
+}
+
+function sessionIdForRepository(store: MemoryStore, cwd: string, repository: string): number {
+	return store.db
+		.prepare(
+			`SELECT id FROM sessions WHERE cwd = ?
+			 AND json_extract(metadata_json, '$.codemem_repository_identity') = ?`,
+		)
+		.pluck()
+		.get(cwd, repository) as number;
+}
+
+it("detects conflicts hidden by aliases or repository patterns", () => {
+	const repository = "https://example.test/acme/conflict.git";
+	const main = "/workspace/conflict-main";
+	const worktree = "/workspace/conflict-worktree";
+	const identities = new Map([
+		[main, repository],
+		[worktree, repository],
+	]);
+	const exactAndPattern = [
+		{ workspace_identity: main, project_pattern: main, scope_id: "scope-a", priority: 10 },
+		{
+			workspace_identity: null,
+			project_pattern: `${worktree}*`,
+			scope_id: "scope-b",
+			priority: 10,
+		},
+	];
+	const aliases = withRepositoryMappingAliasesFromIdentities(exactAndPattern, identities);
+	expect(hasConflictingRepositoryMappings(aliases, identities, repository)).toBe(true);
+	expect(
+		hasConflictingRepositoryMappings(
+			[
+				{ workspace_identity: null, project_pattern: `${repository}*`, scope_id: "scope-a" },
+				{
+					workspace_identity: null,
+					project_pattern: `${worktree}*`,
+					scope_id: "scope-b",
+					priority: 20,
+				},
+			],
+			identities,
+			repository,
+		),
+	).toBe(true);
+});
+
+it("ignores shadowed patterns when every repository member has the same winner", () => {
+	const repository = "https://example.test/acme/precedence.git";
+	const identities = new Map([
+		["/workspace/precedence-main", repository],
+		["/workspace/precedence-worktree", repository],
+	]);
+	expect(
+		hasConflictingRepositoryMappings(
+			[
+				{
+					workspace_identity: null,
+					project_pattern: "https://example.test/acme/*",
+					scope_id: "scope-a",
+					priority: 20,
+				},
+				{
+					workspace_identity: null,
+					project_pattern: "/workspace/*",
+					scope_id: "scope-b",
+					priority: 10,
+				},
+			],
+			identities,
+			repository,
+		),
+	).toBe(false);
+});
+
+it("normalizes repository identity before checking conflicts", () => {
+	const repository = "https://example.test/acme/normalized-conflict.git";
+	const identities = new Map([
+		["/workspace/normalized-main", repository],
+		["/workspace/normalized-worktree", repository],
+	]);
+	expect(
+		hasConflictingRepositoryMappings(
+			[
+				{ project_pattern: "/workspace/normalized-main", scope_id: "scope-a" },
+				{ project_pattern: "/workspace/normalized-worktree", scope_id: "scope-b" },
+			],
+			identities,
+			`${repository}/`,
+		),
+	).toBe(true);
+});
+
+it("treats an explicit Local winner as a repository conflict", () => {
+	const repository = "https://example.test/acme/local-conflict.git";
+	const main = "/workspace/local-main";
+	const worktree = "/workspace/local-worktree";
+	const identities = new Map([
+		[main, repository],
+		[worktree, repository],
+	]);
+	expect(
+		hasConflictingRepositoryMappings(
+			[
+				{ workspace_identity: main, project_pattern: main, scope_id: "scope-a" },
+				{ workspace_identity: null, project_pattern: worktree, scope_id: "local-default" },
+			],
+			identities,
+			repository,
+		),
+	).toBe(true);
+});
+
+function expectReusedCheckoutHistoryRemainsAmbiguous(store: MemoryStore, tmpDir: string): void {
+	const { mainRepo: cwd } = createLinkedWorktree(
+		tmpDir,
+		"reused-checkout",
+		"https://example.test/acme/first.git",
+	);
+	const firstRepository = "https://example.test/acme/first.git";
+	const secondRepository = "https://example.test/acme/second.git";
+	insertScope(store, "first-scope");
+	insertScope(store, "second-scope");
+	insertMapping(store, cwd, "first-scope");
+	insertMapping(store, secondRepository, "second-scope");
+	for (const repositoryIdentity of [firstRepository, secondRepository]) {
+		store.db
+			.prepare("INSERT INTO sessions(started_at, cwd, project, metadata_json) VALUES (?, ?, ?, ?)")
+			.run(
+				"2026-09-22T00:00:00.000Z",
+				cwd,
+				"reused",
+				JSON.stringify({ [REPOSITORY_IDENTITY_METADATA_KEY]: repositoryIdentity }),
+			);
+	}
+	const metadataLessSessionId = Number(
+		store.db
+			.prepare(
+				"INSERT INTO sessions(started_at, cwd, project, metadata_json) VALUES (?, ?, ?, '{}')",
+			)
+			.run("2026-09-21T00:00:00.000Z", cwd, "reused").lastInsertRowid,
+	);
+
+	expect(repositoryIdentitiesByWorkspace(store.db).has(cwd)).toBe(false);
+	writeFileSync(join(cwd, ".git", "config"), `[remote "origin"]\n\turl = ${secondRepository}\n`);
+	const mappings = store.db.prepare("SELECT * FROM project_scope_mappings").all() as Array<{
+		workspace_identity: string | null;
+		project_pattern: string;
+		scope_id: string;
+	}>;
+	expect(withRepositoryMappingAliases(store.db, mappings)).toHaveLength(2);
+	const identifiedSessionId = sessionIdForRepository(store, cwd, secondRepository);
+	expect(resolveSessionScopeId(store.db, { sessionId: identifiedSessionId })).toBe("second-scope");
+	expect(resolveSessionScopeId(store.db, { sessionId: metadataLessSessionId })).toBe(
+		"local-default",
+	);
+	const candidates = listProjectScopeCandidates(store.db, { limit: null });
+	expect(candidates.map((candidate) => candidate.workspace_identity)).toEqual(
+		expect.arrayContaining([cwd, firstRepository, secondRepository]),
+	);
+	expect(
+		candidates.find((candidate) => candidate.workspace_identity === secondRepository),
+	).toMatchObject({ resolved_scope_id: "second-scope" });
+	expect(candidates.find((candidate) => candidate.workspace_identity === cwd)).toMatchObject({
+		mapping_id: null,
+		resolved_scope_id: "local-default",
+	});
+	const memoryId = store.remember(identifiedSessionId, "discovery", "ambiguous", "ambiguous");
+	const remoteSessionId = Number(
+		store.db
+			.prepare(
+				`INSERT INTO sessions(started_at, cwd, project, git_remote, metadata_json)
+				 VALUES (?, ?, ?, ?, '{}')`,
+			)
+			.run("2026-09-21T01:00:00.000Z", cwd, "reused", secondRepository).lastInsertRowid,
+	);
+	const remoteMemoryId = store.remember(
+		remoteSessionId,
+		"discovery",
+		"ambiguous remote",
+		"ambiguous remote",
+	);
+	upsertProjectScopeSettingsMapping(store.db, {
+		deviceId: store.deviceId,
+		workspace_identity: cwd,
+		project_pattern: cwd,
+		scope_id: "first-scope",
+	});
+	expect(
+		store.db.prepare("SELECT scope_id FROM memory_items WHERE id = ?").pluck().get(memoryId),
+	).toBe("second-scope");
+	expect(
+		store.db.prepare("SELECT scope_id FROM memory_items WHERE id = ?").pluck().get(remoteMemoryId),
+	).toBe("second-scope");
+}
+
+function expectMetadataAndRemoteHistoryRemainsAmbiguous(store: MemoryStore): void {
+	const cwd = "/workspace/reused-mixed-evidence";
+	const metadataRepository = "https://example.test/acme/metadata-repository.git";
+	const remoteRepository = "https://example.test/acme/remote-repository.git";
+	insertScope(store, "metadata-scope");
+	insertScope(store, "remote-scope");
+	insertMapping(store, cwd, "metadata-scope");
+	insertMapping(store, remoteRepository, "remote-scope");
+	store.db
+		.prepare("INSERT INTO sessions(started_at, cwd, project, metadata_json) VALUES (?, ?, ?, ?)")
+		.run(
+			"2026-09-22T00:00:00.000Z",
+			cwd,
+			"reused-mixed-evidence",
+			JSON.stringify({ [REPOSITORY_IDENTITY_METADATA_KEY]: metadataRepository }),
+		);
+	const remoteSessionId = Number(
+		store.db
+			.prepare(
+				`INSERT INTO sessions(started_at, cwd, project, git_remote, metadata_json)
+				 VALUES (?, ?, ?, ?, '{}')`,
+			)
+			.run("2026-09-23T00:00:00.000Z", cwd, "reused-mixed-evidence", remoteRepository)
+			.lastInsertRowid,
+	);
+	const malformedRemoteSessionId = Number(
+		store.db
+			.prepare(
+				`INSERT INTO sessions(started_at, cwd, project, git_remote, metadata_json)
+				 VALUES (?, ?, ?, 'fatal: not a git repository', '{}')`,
+			)
+			.run("2026-09-24T00:00:00.000Z", cwd, "reused-mixed-evidence").lastInsertRowid,
+	);
+
+	expect(repositoryIdentitiesByWorkspace(store.db).has(cwd)).toBe(false);
+	expect(resolveSessionScopeId(store.db, { sessionId: remoteSessionId })).toBe("remote-scope");
+	expect(resolveSessionScopeId(store.db, { sessionId: malformedRemoteSessionId })).toBe(
+		"local-default",
+	);
 }
 
 function expectRecordedSiblingEvidence(store: MemoryStore, tmpDir: string): void {
@@ -72,7 +1459,7 @@ function expectLateCheckoutDiscovery(store: MemoryStore, tmpDir: string): void {
 function expectScopeStampingRefreshesRepositoryIdentity(store: MemoryStore, tmpDir: string): void {
 	const repositoryA = "https://example.test/acme/repository-a.git";
 	const repositoryB = "https://example.test/acme/repository-b.git";
-	const checkout = join(tmpDir, "reused-checkout");
+	const checkout = join(tmpDir, "reused-checkout-live");
 	mkdirSync(join(checkout, ".git"), { recursive: true });
 	writeFileSync(join(checkout, ".git", "config"), `[remote "origin"]\n\turl = ${repositoryA}\n`);
 	insertMapping(store, repositoryA, "scope-a");
@@ -97,7 +1484,7 @@ function expectScopeStampingRefreshesRepositoryIdentity(store: MemoryStore, tmpD
 	expect(resolveSessionScopeId(store.db, { sessionId })).toBe("scope-b");
 }
 
-function expectMergedPatternScopeConflict(store: MemoryStore): void {
+function expectPatternConflictInventory(store: MemoryStore): void {
 	const now = "2026-09-23T00:00:00Z";
 	for (const [scopeId, label] of [
 		["scope-a", "Scope A"],
@@ -132,6 +1519,7 @@ function expectMergedPatternScopeConflict(store: MemoryStore): void {
 			)
 			.run(now, cwd, JSON.stringify({ codemem_repository_identity: repositoryIdentity }));
 	}
+
 	const inventory = listProjectScopeInventory(store.db, { limit: 10 });
 	expect(inventory.projects).toHaveLength(1);
 	expect(inventory.projects[0]).toMatchObject({
@@ -174,61 +1562,94 @@ describe("repository mapping aliases", () => {
 	});
 
 	it("inherits a live main-checkout mapping when discovery starts in a sibling worktree", () => {
-		const { mainRepo, worktree } = createLinkedWorktree(
-			tmpDir,
-			"historical",
-			"https://example.test/acme/historical.git",
-		);
-		insertMapping(store, mainRepo, "historical-scope");
-		store.startSession({ cwd: mainRepo, project: "historical" });
-		const worktreeSessionId = store.getOrCreateSessionForOpencodeSession({
-			opencodeSessionId: "session-new-worktree",
-			cwd: worktree,
-			project: "historical",
-		});
-
-		expect(resolveSessionScopeId(store.db, { sessionId: worktreeSessionId })).toBe(
-			"historical-scope",
-		);
-		const inventory = listProjectScopeInventory(store.db, { limit: 10 });
-		expect(inventory.projects).toHaveLength(1);
-		expect(inventory.projects[0]).toMatchObject({
-			resolved_scope_id: "historical-scope",
-			session_count: 2,
-			workspace_identity: "https://example.test/acme/historical.git",
-		});
+		expectSiblingWorktreeMapping(store, tmpDir);
 	});
 
-	it("uses recorded sibling evidence for a metadata-less legacy worktree", () => {
-		expectRecordedSiblingEvidence(store, tmpDir);
-	});
+	it("uses recorded sibling evidence for a metadata-less legacy worktree", () =>
+		expectRecordedSiblingEvidence(store, tmpDir));
 
-	it("retries filesystem discovery after a checkout appears", () => {
-		expectLateCheckoutDiscovery(store, tmpDir);
-	});
+	it("retries filesystem discovery after a checkout appears", () =>
+		expectLateCheckoutDiscovery(store, tmpDir));
 
-	it("refreshes repository identity before stamping a reused checkout", () => {
-		expectScopeStampingRefreshesRepositoryIdentity(store, tmpDir);
-	});
+	it("refreshes identity before scope stamping", () =>
+		expectScopeStampingRefreshesRepositoryIdentity(store, tmpDir));
 
 	it("fails closed when worktrees have conflicting legacy Space mappings", () => {
-		const { mainRepo, worktree } = createLinkedWorktree(
-			tmpDir,
-			"conflicting",
-			"https://example.test/acme/conflicting.git",
-		);
-		insertMapping(store, mainRepo, "narrow-scope");
-		insertMapping(store, worktree, "broad-scope");
-		const sessionId = store.getOrCreateSessionForOpencodeSession({
-			opencodeSessionId: "session-conflicting-worktree",
-			cwd: worktree,
-			project: "conflicting",
-		});
+		expectExactConflictsFailClosed(store, tmpDir);
+	});
 
-		expect(resolveSessionScopeId(store.db, { sessionId })).toBe("local-default");
+	it("moves historical memories local when a mapping creates a repository conflict", () => {
+		expectConflictPropagationFailsClosed(store, tmpDir);
+	});
+
+	it("reconsiders every repository sibling when an inserted pattern clears a conflict", () => {
+		expectInsertedPatternClearsConflictForAllMemories(store, tmpDir);
+	});
+
+	it("fails closed for conflicting worktrees recorded only by git remote", () => {
+		expectLegacyRemoteConflictsFailClosed(store);
+	});
+
+	it("warns before a requested mapping creates a repository conflict", () => {
+		expectRequestedConflictWarning(store, tmpDir);
+	});
+
+	it("warns before a requested pattern creates a repository conflict", () => {
+		expectRequestedPatternConflictWarning(store, tmpDir);
+	});
+
+	it("evaluates bulk mapping drafts as one requested state", () => {
+		expectBulkRequestedConflictWarning(store, tmpDir);
+	});
+
+	it("resolves each bulk draft against preceding identity moves", () => {
+		expectBulkSimulationGuardrails(store, tmpDir);
+		expectBulkSimulationPreservesNormalizedDuplicates(store);
+		expectBulkNormalizedLookupMatchesPersistence(store);
+		expectDeleteLocalOverrideRequiresConfirmation(store, tmpDir);
+		expectDeleteConflictPropagation(store, tmpDir);
+		expectMappedRepositorySeedsCandidateDiscovery(store, tmpDir);
+		expectDiscoveredSiblingDraftRequiresConflictConfirmation(store, tmpDir);
+		expectPatternOnlyRepositorySeedFailsClosed(store, tmpDir);
+		expectMovedMappingAnalyzesPreviousRepository(store, tmpDir);
+		expectMovingSoleRepositoryMappingPreservesEvidence(store, tmpDir);
+		expectMovingMappingRequiresFallbackConfirmation(store, tmpDir);
+		expectInsertMappingRequiresScopeConfirmation(store, tmpDir);
+		expectFailedMappingUpdateRollsBack(store, tmpDir);
+		expectBulkSkipsIntermediateScopeExposure(store, tmpDir);
+	});
+
+	it("normalizes equivalent repository evidence before candidate conflict checks", () => {
+		expectEquivalentRepositoryIdentityConflict(store);
+	});
+
+	it("fails closed when worktrees match conflicting Space patterns", () => {
+		expectPatternConflictsFailClosed(store, tmpDir);
+		expectDiscoveredSiblingConflictFailsClosed(store, tmpDir);
+		expectMalformedMetadataDoesNotCreateAmbiguity(store);
+	});
+
+	it("fails closed when one mapped worktree has an unmatched sibling", () => {
+		expectPartialPatternMappingFailsClosed(store, tmpDir);
+	});
+
+	it("drops repository aliases when sibling patterns conflict", () => {
+		expectConflictingAliasIsDropped(store, tmpDir);
+	});
+
+	it("groups equivalent cwd spellings using recorded repository evidence", () => {
+		expectEquivalentCwdsGroupAsRepository(store, tmpDir);
+	});
+
+	it("does not infer metadata-less sessions when a cwd has conflicting repository history", () => {
+		expectReusedCheckoutHistoryRemainsAmbiguous(store, tmpDir);
+	});
+
+	it("preserves remote-only history beside metadata evidence for a reused cwd", () => {
+		expectMetadataAndRemoteHistoryRemainsAmbiguous(store);
 	});
 
 	it("surfaces worktrees that resolve to different pattern scopes", () => {
-		expectMergedPatternScopeConflict(store);
+		expectPatternConflictInventory(store);
 	});
 });

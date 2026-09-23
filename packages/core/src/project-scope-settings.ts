@@ -1,12 +1,16 @@
 import { createHash } from "node:crypto";
 import { type Database, fromJson, toJson } from "./db.js";
 import { hasLocalInventoryIdentity } from "./local-project-inventory.js";
-import { repositoryIdentityFromMetadata } from "./project.js";
+import { REPOSITORY_IDENTITY_METADATA_KEY, repositoryIdentityFromMetadata } from "./project.js";
 import { cleanProjectIdentity } from "./project-identity.js";
 import {
+	hasConflictingRepositoryMappings,
+	hasRecordedRepositoryWorkspace,
+	normalizeRepositoryWorkspaceIdentity,
 	repositoryIdentitiesByWorkspace,
 	repositoryIdentityForWorkspace,
 	withRepositoryMappingAliases,
+	withRepositoryMappingAliasesFromIdentities,
 } from "./repository-mapping-aliases.js";
 import { ensureScopeBackfillScopes, LEGACY_SHARED_REVIEW_SCOPE_ID } from "./scope-backfill.js";
 import {
@@ -15,6 +19,7 @@ import {
 	resolveProjectScope,
 	type ScopeMapping,
 	type ScopeResolutionReason,
+	scopeIdsMatchingProjectPatterns,
 	type WorkspaceIdentitySource,
 } from "./scope-resolution.js";
 import { SYNC_BOOTSTRAP_CWD_PREFIX } from "./sync-bootstrap-constants.js";
@@ -50,6 +55,7 @@ export type ProjectScopeGuardrailCode =
 	| "conflicting_repository_mappings"
 	| "broad_org_domain_pattern"
 	| "home_directory_org_domain_pattern"
+	| "conflicting_repository_mappings"
 	| "scope_reassignment_old_copies";
 
 export type ProjectScopeGuardrailSeverity = "info" | "warning";
@@ -67,6 +73,7 @@ export interface ProjectScopeGuardrailWarning {
 	related_workspace_identities?: string[];
 	related_projects?: string[];
 	confirmation_token?: string;
+	conflict_state?: string;
 }
 
 export interface ProjectScopeCandidate {
@@ -199,10 +206,17 @@ function originDevicesForCandidate(row: ProjectScopeCandidateRow): Array<{ devic
 		.map((deviceId) => ({ device_id: deviceId }));
 }
 
+function explicitRepositoryIdentityForRow(row: ProjectScopeCandidateRow): string | null {
+	return normalizeRepositoryWorkspaceIdentity(
+		cleanProjectIdentity(row.repository_identity) ??
+			cleanProjectIdentity(repositoryIdentityFromMetadata(row.metadata_json)),
+	);
+}
+
 function repositoryIdentityForRow(row: ProjectScopeCandidateRow): string | null {
 	return (
-		cleanProjectIdentity(row.repository_identity) ??
-		repositoryIdentityFromMetadata(row.metadata_json)
+		explicitRepositoryIdentityForRow(row) ??
+		normalizeRepositoryWorkspaceIdentity(cleanProjectIdentity(row.git_remote))
 	);
 }
 
@@ -210,7 +224,7 @@ function workspaceIdentityForRow(row: ProjectScopeCandidateRow) {
 	return canonicalWorkspaceIdentity({
 		gitRemote: row.git_remote,
 		gitBranch: row.git_branch,
-		repositoryIdentity: repositoryIdentityForRow(row),
+		repositoryIdentity: explicitRepositoryIdentityForRow(row),
 		cwd: row.cwd,
 		project: row.project,
 		workspaceId: row.workspace_id,
@@ -221,31 +235,69 @@ function identifyRepositoryRow(
 	row: ProjectScopeCandidateRow,
 	repositoryIdentityByCwd: Map<string, string>,
 ): ProjectScopeCandidateRow {
-	const discoveredRepositoryIdentity = repositoryIdentityForRow(row);
-	const cwd = cleanProjectIdentity(row.cwd);
+	const discoveredRepositoryIdentity = explicitRepositoryIdentityForRow(row);
+	const cwd = normalizeRepositoryWorkspaceIdentity(row.cwd);
 	const explicitRemote = cleanProjectIdentity(row.git_remote);
-	if (discoveredRepositoryIdentity && cwd) {
+	const ambiguousWorkspace = Boolean(
+		cwd &&
+			hasRecordedRepositoryWorkspace(repositoryIdentityByCwd, cwd) &&
+			!repositoryIdentityByCwd.has(cwd),
+	);
+	if (discoveredRepositoryIdentity && cwd && !ambiguousWorkspace) {
 		repositoryIdentityByCwd.set(cwd, discoveredRepositoryIdentity);
 	}
 	return {
 		...row,
 		repository_identity:
 			discoveredRepositoryIdentity ??
-			(!explicitRemote && cwd ? repositoryIdentityByCwd.get(cwd) : null),
+			(!explicitRemote && cwd && !ambiguousWorkspace
+				? (repositoryIdentityByCwd.get(cwd) ?? null)
+				: null),
 	};
 }
 
 function repositoryIdentitiesByCwd(
 	db: Database,
-	rows: ProjectScopeCandidateRow[],
+	_rows: ProjectScopeCandidateRow[],
+	mappings: ProjectScopeSettingsMapping[] = [],
 ): Map<string, string> {
-	const identities = repositoryIdentitiesByWorkspace(db);
+	return repositoryIdentitiesByWorkspace(db, {
+		knownRepositoryIdentities: knownRepositoryIdentitiesForMappings(mappings),
+	});
+}
+
+function knownRepositoryIdentitiesForMappings(
+	mappings: ProjectScopeSettingsMapping[],
+): Array<string | null> {
+	return mappings.flatMap((mapping) => [mapping.workspace_identity, mapping.project_pattern]);
+}
+
+function persistMappedRepositoryIdentityEvidence(
+	db: Database,
+	mappings: ProjectScopeSettingsMapping[],
+): void {
+	const identities = repositoryIdentitiesByWorkspace(db, {
+		knownRepositoryIdentities: knownRepositoryIdentitiesForMappings(mappings),
+	});
+	const rows = db
+		.prepare(
+			"SELECT id, cwd, metadata_json FROM sessions WHERE cwd IS NOT NULL AND TRIM(cwd) <> ''",
+		)
+		.all() as Array<{ id: number; cwd: string; metadata_json: string | null }>;
+	const update = db.prepare("UPDATE sessions SET metadata_json = ? WHERE id = ?");
 	for (const row of rows) {
-		const repositoryIdentity = repositoryIdentityForRow(row);
-		const cwd = cleanProjectIdentity(row.cwd);
-		if (repositoryIdentity && cwd) identities.set(cwd, repositoryIdentity);
+		const cwd = normalizeRepositoryWorkspaceIdentity(row.cwd);
+		const repositoryIdentity = cwd ? identities.get(cwd) : null;
+		if (!repositoryIdentity) continue;
+		const metadata = fromJson(row.metadata_json);
+		if (cleanProjectIdentity(repositoryIdentityFromMetadata(row.metadata_json))) {
+			continue;
+		}
+		update.run(
+			toJson({ ...metadata, [REPOSITORY_IDENTITY_METADATA_KEY]: repositoryIdentity }),
+			row.id,
+		);
 	}
-	return identities;
 }
 
 function mergeWorktree(project: ProjectScopeInventoryProject, row: ProjectScopeCandidateRow): void {
@@ -413,6 +465,7 @@ function isHomeDirectoryRootPattern(pattern: string): boolean {
 function guardrailConfirmationToken(warning: ProjectScopeGuardrailWarning): string {
 	const payload = JSON.stringify({
 		code: warning.code,
+		conflict_state: warning.conflict_state ?? null,
 		mapping_id: warning.mapping_id ?? null,
 		project_pattern: warning.project_pattern ?? null,
 		previous_scope_id: warning.previous_scope_id ?? null,
@@ -525,10 +578,10 @@ function withCandidateGuardrails<T extends ProjectScopeCandidate>(candidates: T[
 	const collisions = candidateCollisionMap(candidates);
 	return candidates.map((candidate) => ({
 		...candidate,
-		guardrail_warnings: [
+		guardrail_warnings: dedupeGuardrailWarnings([
 			...candidate.guardrail_warnings,
 			...projectScopeCandidateGuardrailWarnings(candidate, collisions),
-		],
+		]),
 	}));
 }
 
@@ -613,10 +666,31 @@ function projectMatchesInventoryQuery(
 		.some((value) => value.toLowerCase().includes(normalized));
 }
 
+function repositoryConflictWarnings(
+	conflicting: boolean,
+	workspaceIdentity: string,
+): ProjectScopeGuardrailWarning[] {
+	if (!conflicting) return [];
+	return [
+		{
+			code: "conflicting_repository_mappings",
+			severity: "warning",
+			message:
+				"Repository worktrees resolve to conflicting Sharing domains. Memories stay Local only until the mappings agree.",
+			requires_confirmation: true,
+			workspace_identity: workspaceIdentity,
+		},
+	];
+}
+
 function buildProjectScopeCandidate(
 	row: ProjectScopeCandidateRow,
 	mappings: ProjectScopeSettingsMapping[],
 	scopes: SharingDomainSettingsScope[],
+	options: {
+		ambiguousRepositoryWorkspace?: boolean;
+		conflictingRepositoryMappings?: boolean;
+	} = {},
 ): ProjectScopeCandidateWithOrigins {
 	const project = cleanProjectIdentity(row.project);
 	const cwd = cleanProjectIdentity(row.cwd);
@@ -624,14 +698,17 @@ function buildProjectScopeCandidate(
 	const gitBranch = cleanProjectIdentity(row.git_branch);
 	const repositoryIdentity = repositoryIdentityForRow(row);
 	const identity = workspaceIdentityForRow(row);
+	const conflicting = options.conflictingRepositoryMappings === true;
+	const ambiguousWorkspace = options.ambiguousRepositoryWorkspace === true;
 	const resolution = resolveProjectScope({
+		allowRepositoryCwdFallback: !ambiguousWorkspace && !conflicting,
 		gitRemote: row.git_remote,
 		gitBranch: row.git_branch,
 		repositoryIdentity,
 		cwd: row.cwd,
 		project: row.project,
 		workspaceId: row.workspace_id,
-		mappings,
+		mappings: conflicting ? [] : mappings,
 	});
 	const baseCandidate = {
 		workspace_identity: identity.value,
@@ -653,8 +730,9 @@ function buildProjectScopeCandidate(
 		suggested_scope_id: null,
 		suggestion_reason: null,
 		suggestion_signal: null,
-		guardrail_warnings: [],
+		guardrail_warnings: repositoryConflictWarnings(conflicting, identity.value),
 	} satisfies ProjectScopeCandidateWithOrigins;
+	if (conflicting) return baseCandidate;
 	const suggestion = suggestProjectScope(baseCandidate, scopes);
 	return {
 		...baseCandidate,
@@ -662,6 +740,40 @@ function buildProjectScopeCandidate(
 		suggestion_reason: suggestion?.reason ?? null,
 		suggestion_signal: suggestion?.signal ?? null,
 	};
+}
+
+function buildConflictAwareCandidate(
+	row: ProjectScopeCandidateRow,
+	mappings: ProjectScopeSettingsMapping[],
+	scopes: SharingDomainSettingsScope[],
+	repositoryIdentities: ReadonlyMap<string, string>,
+	conflictsByRepository?: Map<string, boolean>,
+): ProjectScopeCandidateWithOrigins {
+	const repositoryIdentity = repositoryIdentityForRow(row);
+	const cwd = normalizeRepositoryWorkspaceIdentity(row.cwd);
+	const ambiguousWorkspace = Boolean(
+		cwd &&
+			hasRecordedRepositoryWorkspace(repositoryIdentities, cwd) &&
+			!repositoryIdentities.has(cwd),
+	);
+	let conflicting = false;
+	if (repositoryIdentity) {
+		if (conflictsByRepository?.has(repositoryIdentity)) {
+			conflicting = conflictsByRepository.get(repositoryIdentity) ?? false;
+		} else {
+			conflicting = hasConflictingRepositoryMappings(
+				mappings,
+				repositoryIdentities,
+				repositoryIdentity,
+			);
+			conflictsByRepository?.set(repositoryIdentity, conflicting);
+		}
+	}
+	const unresolvedAmbiguousWorkspace = ambiguousWorkspace && !repositoryIdentity;
+	return buildProjectScopeCandidate(row, unresolvedAmbiguousWorkspace ? [] : mappings, scopes, {
+		ambiguousRepositoryWorkspace: ambiguousWorkspace,
+		conflictingRepositoryMappings: conflicting,
+	});
 }
 
 function dedupeGuardrailWarnings(
@@ -776,22 +888,6 @@ function getProjectScopeSettingsMappingById(
 	return row ? rowToMapping(row) : null;
 }
 
-function getProjectScopeSettingsMappingByWorkspaceIdentity(
-	db: Database,
-	workspaceIdentity: string,
-): ProjectScopeSettingsMapping | null {
-	const row = db
-		.prepare(
-			`SELECT id, workspace_identity, project_pattern, scope_id, priority, source, created_at, updated_at
-			 FROM project_scope_mappings
-			 WHERE workspace_identity = ?
-			 ORDER BY priority DESC, updated_at DESC, id DESC
-			 LIMIT 1`,
-		)
-		.get(workspaceIdentity) as Record<string, unknown> | undefined;
-	return row ? rowToMapping(row) : null;
-}
-
 function assertActiveScope(db: Database, scopeId: string): void {
 	if (scopeId === LEGACY_SHARED_REVIEW_SCOPE_ID) {
 		throw new Error("legacy-shared-review is a review bucket, not an assignable Sharing domain");
@@ -805,6 +901,7 @@ function assertActiveScope(db: Database, scopeId: string): void {
 interface ProjectScopeMappingDraft {
 	deviceId: string | null;
 	existing: ProjectScopeSettingsMapping | null;
+	mappingId: number | null;
 	workspaceIdentity: string | null;
 	projectPattern: string | null;
 	scopeId: string;
@@ -812,17 +909,43 @@ interface ProjectScopeMappingDraft {
 	source: string;
 }
 
+function projectScopeMappingById(
+	db: Database,
+	mappings: ProjectScopeSettingsMapping[] | undefined,
+	id: number | null,
+): ProjectScopeSettingsMapping | null {
+	if (!id || !Number.isInteger(id)) return null;
+	if (mappings) return mappings.find((mapping) => mapping.id === id) ?? null;
+	return getProjectScopeSettingsMappingById(db, id);
+}
+
+function projectScopeMappingByWorkspace(
+	db: Database,
+	mappings: ProjectScopeSettingsMapping[] | undefined,
+	workspaceIdentity: string | null,
+): ProjectScopeSettingsMapping | null {
+	if (!workspaceIdentity) return null;
+	return (
+		(mappings ?? listProjectScopeSettingsMappings(db)).find(
+			(mapping) =>
+				normalizeRepositoryWorkspaceIdentity(mapping.workspace_identity) === workspaceIdentity,
+		) ?? null
+	);
+}
+
 function resolveProjectScopeMappingDraft(
 	db: Database,
 	input: UpsertProjectScopeMappingInput,
+	mappings?: ProjectScopeSettingsMapping[],
 ): ProjectScopeMappingDraft {
 	const id = input.id == null ? null : Number(input.id);
-	const byId = id && Number.isInteger(id) ? getProjectScopeSettingsMappingById(db, id) : null;
+	if (id != null && (!Number.isSafeInteger(id) || id <= 0)) {
+		throw new Error("id must be a positive integer");
+	}
+	const byId = projectScopeMappingById(db, mappings, id);
 	const workspaceIdentity =
 		normalizeWorkspaceIdentity(input.workspace_identity) ?? byId?.workspace_identity ?? null;
-	const byWorkspace = workspaceIdentity
-		? getProjectScopeSettingsMappingByWorkspaceIdentity(db, workspaceIdentity)
-		: null;
+	const byWorkspace = projectScopeMappingByWorkspace(db, mappings, workspaceIdentity);
 	const existing = byId ?? byWorkspace;
 	const projectPattern =
 		clean(input.project_pattern) ?? existing?.project_pattern ?? workspaceIdentity;
@@ -830,6 +953,7 @@ function resolveProjectScopeMappingDraft(
 	return {
 		deviceId: clean(input.deviceId),
 		existing,
+		mappingId: existing?.id ?? null,
 		workspaceIdentity,
 		projectPattern,
 		scopeId: clean(input.scope_id) ?? "",
@@ -856,19 +980,43 @@ function resolveSourceOwnedMemoryScope(
 	row: SourceOwnedMemoryScopeRow,
 	mappings: ProjectScopeSettingsMapping[],
 	repositoryIdentities: ReadonlyMap<string, string>,
+	conflictsByRepository: Map<string, boolean>,
 ) {
+	const repositoryIdentity = repositoryIdentityForWorkspace(repositoryIdentities, {
+		cwd: row.cwd,
+		gitRemote: row.git_remote,
+		metadataJson: row.session_metadata_json,
+	});
+	const cwd = normalizeRepositoryWorkspaceIdentity(row.cwd);
+	const ambiguousWorkspace = Boolean(
+		cwd &&
+			hasRecordedRepositoryWorkspace(repositoryIdentities, cwd) &&
+			!repositoryIdentities.has(cwd),
+	);
+	let conflicting = false;
+	if (repositoryIdentity) {
+		const cached = conflictsByRepository.get(repositoryIdentity);
+		if (cached == null) {
+			conflicting = hasConflictingRepositoryMappings(
+				mappings,
+				repositoryIdentities,
+				repositoryIdentity,
+			);
+			conflictsByRepository.set(repositoryIdentity, conflicting);
+		} else {
+			conflicting = cached;
+		}
+	}
+	const unresolvedAmbiguousWorkspace = ambiguousWorkspace && !repositoryIdentity;
 	return resolveProjectScope({
+		allowRepositoryCwdFallback: !ambiguousWorkspace && !conflicting,
 		gitBranch: row.git_branch,
 		gitRemote: row.git_remote,
-		repositoryIdentity: repositoryIdentityForWorkspace(repositoryIdentities, {
-			cwd: row.cwd,
-			gitRemote: row.git_remote,
-			metadataJson: row.session_metadata_json,
-		}),
+		repositoryIdentity,
 		cwd: row.cwd,
 		project: row.project,
 		workspaceId: row.workspace_id,
-		mappings,
+		mappings: conflicting || unresolvedAmbiguousWorkspace ? [] : mappings,
 	});
 }
 
@@ -956,28 +1104,97 @@ function recordSourceOwnedMemoryScopeMove(
 	});
 }
 
-function propagateProjectScopeMappingToSourceOwnedMemories(
+function mappingChangeAffectsSourceOwnedMemory(
+	mappingIds: ReadonlySet<number>,
+	repositoryIdentity: string | null,
+	previousResolution: ReturnType<typeof resolveProjectScope>,
+	resolution: ReturnType<typeof resolveProjectScope>,
+	previousConflicts: ReadonlyMap<string, boolean>,
+	conflicts: ReadonlyMap<string, boolean>,
+): boolean {
+	if (repositoryIdentity) {
+		if (previousConflicts.get(repositoryIdentity) || conflicts.get(repositoryIdentity)) return true;
+	}
+	return (
+		(previousResolution.mapping?.id != null && mappingIds.has(previousResolution.mapping.id)) ||
+		(resolution.mapping?.id != null && mappingIds.has(resolution.mapping.id))
+	);
+}
+
+function changedMappingIdForScopeMove(
+	changedMappings: ProjectScopeSettingsMapping[],
+	previousResolution: ReturnType<typeof resolveProjectScope>,
+	resolution: ReturnType<typeof resolveProjectScope>,
+	fallbackMappingId: number,
+): number {
+	const selectedId = resolution.mapping?.id ?? previousResolution.mapping?.id;
+	return changedMappings.find((mapping) => mapping.id === selectedId)?.id ?? fallbackMappingId;
+}
+
+function resolveSourceOwnedMemoryMappingTransition(
+	row: SourceOwnedMemoryScopeRow,
+	oldMappings: ProjectScopeSettingsMapping[],
+	mappings: ProjectScopeSettingsMapping[],
+	repositoryIdentities: ReadonlyMap<string, string>,
+	oldConflicts: Map<string, boolean>,
+	conflicts: Map<string, boolean>,
+) {
+	return {
+		previousResolution: resolveSourceOwnedMemoryScope(
+			row,
+			oldMappings,
+			repositoryIdentities,
+			oldConflicts,
+		),
+		resolution: resolveSourceOwnedMemoryScope(row, mappings, repositoryIdentities, conflicts),
+		repositoryIdentity: repositoryIdentityForWorkspace(repositoryIdentities, {
+			cwd: row.cwd,
+			gitRemote: row.git_remote,
+			metadataJson: row.session_metadata_json,
+		}),
+	};
+}
+
+function propagateProjectScopeMappingsToSourceOwnedMemories(
 	db: Database,
-	mapping: ProjectScopeSettingsMapping,
+	changedMappings: ProjectScopeSettingsMapping[],
 	deviceId: string | null,
 	previousMappings?: ProjectScopeSettingsMapping[],
 ): number {
-	if (!deviceId) return 0;
+	const firstMapping = changedMappings[0];
+	if (!deviceId || !firstMapping) return 0;
+	const mappingIds = new Set(changedMappings.map((mapping) => mapping.id));
 	const mappings = withRepositoryMappingAliases(db, listProjectScopeSettingsMappings(db));
 	const oldMappings = previousMappings
 		? withRepositoryMappingAliases(db, previousMappings)
 		: mappings;
 	const now = new Date().toISOString();
-	const repositoryIdentities = repositoryIdentitiesByWorkspace(db);
+	const repositoryIdentities = repositoryIdentitiesByWorkspace(db, {
+		knownRepositoryIdentities: knownRepositoryIdentitiesForMappings([...oldMappings, ...mappings]),
+	});
+	const oldConflictsByRepository = new Map<string, boolean>();
+	const conflictsByRepository = new Map<string, boolean>();
 	let moved = 0;
 	for (const row of sourceOwnedMemoryRowsForScopePropagation(db, deviceId)) {
-		const previousResolution = resolveSourceOwnedMemoryScope(
-			row,
-			oldMappings,
-			repositoryIdentities,
-		);
-		const resolution = resolveSourceOwnedMemoryScope(row, mappings, repositoryIdentities);
-		if (previousResolution.mapping?.id !== mapping.id && resolution.mapping?.id !== mapping.id) {
+		const { previousResolution, resolution, repositoryIdentity } =
+			resolveSourceOwnedMemoryMappingTransition(
+				row,
+				oldMappings,
+				mappings,
+				repositoryIdentities,
+				oldConflictsByRepository,
+				conflictsByRepository,
+			);
+		if (
+			!mappingChangeAffectsSourceOwnedMemory(
+				mappingIds,
+				repositoryIdentity,
+				previousResolution,
+				resolution,
+				oldConflictsByRepository,
+				conflictsByRepository,
+			)
+		) {
 			continue;
 		}
 		const oldScopeId = clean(row.scope_id) ?? LOCAL_DEFAULT_SCOPE_ID;
@@ -985,7 +1202,12 @@ function propagateProjectScopeMappingToSourceOwnedMemories(
 		if (oldScopeId === newScopeId) continue;
 		recordSourceOwnedMemoryScopeMove(db, row, {
 			deviceId,
-			mappingId: mapping.id,
+			mappingId: changedMappingIdForScopeMove(
+				changedMappings,
+				previousResolution,
+				resolution,
+				firstMapping.id,
+			),
 			newScopeId,
 			now,
 			oldScopeId,
@@ -995,13 +1217,321 @@ function propagateProjectScopeMappingToSourceOwnedMemories(
 	return moved;
 }
 
-export function analyzeProjectScopeMappingChangeGuardrails(
+function propagateProjectScopeMappingToSourceOwnedMemories(
 	db: Database,
-	input: UpsertProjectScopeMappingInput,
+	mapping: ProjectScopeSettingsMapping,
+	deviceId: string | null,
+	previousMappings?: ProjectScopeSettingsMapping[],
+): number {
+	return propagateProjectScopeMappingsToSourceOwnedMemories(
+		db,
+		[mapping],
+		deviceId,
+		previousMappings,
+	);
+}
+
+function changedScopesAfterMappingTransition(
+	db: Database,
+	id: number,
+	deviceId: string,
+	oldMappings: ProjectScopeSettingsMapping[],
+	newMappings: ProjectScopeSettingsMapping[],
+): Set<string> {
+	const identities = repositoryIdentitiesByWorkspace(db, {
+		knownRepositoryIdentities: knownRepositoryIdentitiesForMappings([
+			...oldMappings,
+			...newMappings,
+		]),
+	});
+	const oldAliases = withRepositoryMappingAliasesFromIdentities(oldMappings, identities, {
+		discoverFilesystem: true,
+	});
+	const newAliases = withRepositoryMappingAliasesFromIdentities(newMappings, identities, {
+		discoverFilesystem: true,
+	});
+	const oldConflicts = new Map<string, boolean>();
+	const newConflicts = new Map<string, boolean>();
+	const changes = new Set<string>();
+	for (const row of sourceOwnedMemoryRowsForScopePropagation(db, deviceId)) {
+		const oldScopeId = clean(row.scope_id) ?? LOCAL_DEFAULT_SCOPE_ID;
+		const before = resolveSourceOwnedMemoryScope(row, oldAliases, identities, oldConflicts);
+		const after = resolveSourceOwnedMemoryScope(row, newAliases, identities, newConflicts);
+		const repository = repositoryIdentityForWorkspace(identities, {
+			cwd: row.cwd,
+			gitRemote: row.git_remote,
+			metadataJson: row.session_metadata_json,
+		});
+		if (
+			!mappingChangeAffectsSourceOwnedMemory(
+				new Set([id]),
+				repository,
+				before,
+				after,
+				oldConflicts,
+				newConflicts,
+			)
+		)
+			continue;
+		if (after.scopeId !== oldScopeId) changes.add(JSON.stringify([oldScopeId, after.scopeId]));
+	}
+	return changes;
+}
+
+function mappingConfirmationState(mappings: ProjectScopeSettingsMapping[]): string {
+	const state = JSON.stringify(
+		mappings
+			.map((row) => [
+				row.id,
+				row.workspace_identity,
+				row.project_pattern,
+				row.scope_id,
+				row.priority,
+			])
+			.toSorted((left, right) => Number(left[0]) - Number(right[0])),
+	);
+	return createHash("sha256").update(state).digest("hex");
+}
+
+function deletionConfirmationState(
+	db: Database,
+	deviceId: string,
+	mappings: ProjectScopeSettingsMapping[],
+): string {
+	const memories = sourceOwnedMemoryRowsForScopePropagation(db, deviceId)
+		.toSorted((left, right) => left.id - right.id)
+		.map((row) => [
+			row.id,
+			row.scope_id,
+			row.cwd,
+			row.git_remote,
+			row.session_metadata_json,
+			row.workspace_id,
+		]);
+	return createHash("sha256")
+		.update(JSON.stringify([mappingConfirmationState(mappings), memories]))
+		.digest("hex");
+}
+
+export function analyzeProjectScopeMappingDeletionGuardrails(
+	db: Database,
+	id: number,
+	deviceId: string | null,
+): ProjectScopeGuardrailWarning[] {
+	if (!Number.isInteger(id) || id <= 0) throw new Error("id must be a positive integer");
+	const mapping = getProjectScopeSettingsMappingById(db, id);
+	if (!mapping || !deviceId) return [];
+	const oldMappings = listProjectScopeSettingsMappings(db);
+	const changes = changedScopesAfterMappingTransition(
+		db,
+		id,
+		deviceId,
+		oldMappings,
+		oldMappings.filter((row) => row.id !== id),
+	);
+	return [...changes].sort().map((change) => {
+		const [previousScopeId, scopeId] = JSON.parse(change) as [string, string];
+		return withGuardrailConfirmationToken({
+			code: "scope_reassignment_old_copies",
+			severity: "warning",
+			message:
+				previousScopeId === LOCAL_DEFAULT_SCOPE_ID
+					? "Removing this Local assignment shares existing memories through the fallback Sharing domain. Review access before continuing; old copies may remain on devices and backups."
+					: "Removing this assignment moves existing memories into a fallback scope. Review access before continuing; old copies may remain on devices and backups.",
+			requires_confirmation: true,
+			mapping_id: id,
+			previous_scope_id: previousScopeId,
+			scope_id: scopeId,
+			workspace_identity: mapping.workspace_identity,
+			project_pattern: mapping.project_pattern,
+			conflict_state: deletionConfirmationState(db, deviceId, oldMappings),
+		});
+	});
+}
+
+function projectScopeMappingFromDraft(
+	draft: ProjectScopeMappingDraft,
+	syntheticId: number,
+): ProjectScopeSettingsMapping | null {
+	if (!draft.projectPattern || !draft.scopeId) return null;
+	const now = new Date().toISOString();
+	return {
+		id: draft.existing?.id ?? syntheticId,
+		workspace_identity: draft.workspaceIdentity,
+		project_pattern: draft.projectPattern,
+		scope_id: draft.scopeId,
+		priority: draft.priority,
+		source: draft.source,
+		created_at: draft.existing?.created_at ?? now,
+		updated_at: now,
+		guardrail_warnings: [],
+	};
+}
+
+function applyProjectScopeDraft(
+	mappings: ProjectScopeSettingsMapping[],
+	draft: ProjectScopeMappingDraft,
+	syntheticId: number,
+): ProjectScopeSettingsMapping[] {
+	const requested = projectScopeMappingFromDraft(draft, syntheticId);
+	if (!requested) return mappings;
+	if (!draft.existing) return [...mappings, requested];
+	return mappings.map((mapping) => (mapping.id === draft.existing?.id ? requested : mapping));
+}
+
+function resolveProjectScopeMappingDrafts(
+	db: Database,
+	scopes: SharingDomainSettingsScope[],
+	inputs: UpsertProjectScopeMappingInput[],
+): { drafts: ProjectScopeMappingDraft[]; mappings: ProjectScopeSettingsMapping[] } {
+	let mappings = listProjectScopeSettingsMappingsForScopes(db, scopes);
+	const drafts: ProjectScopeMappingDraft[] = [];
+	let nextSyntheticId = Math.max(0, ...mappings.map((mapping) => mapping.id)) + 1;
+	for (const input of inputs) {
+		const draft = resolveProjectScopeMappingDraft(db, input, mappings);
+		draft.mappingId = draft.existing?.id ?? nextSyntheticId;
+		drafts.push(draft);
+		mappings = applyProjectScopeDraft(mappings, draft, nextSyntheticId);
+		if (!draft.existing) nextSyntheticId += 1;
+	}
+	return { drafts, mappings };
+}
+
+function candidateMatchesProjectScopeDraft(
+	candidate: ProjectScopeCandidate,
+	mapping: ProjectScopeSettingsMapping,
+	repositoryIdentities: ReadonlyMap<string, string>,
+	workspacesByRepository: Map<string, ReadonlySet<string>>,
+): boolean {
+	const normalizedWorkspace = normalizeRepositoryWorkspaceIdentity(mapping.workspace_identity);
+	if (normalizedWorkspace) {
+		const candidateWorkspace = normalizeRepositoryWorkspaceIdentity(candidate.workspace_identity);
+		if (candidateWorkspace === normalizedWorkspace) return true;
+		const repositoryIdentity = repositoryIdentities.get(normalizedWorkspace);
+		return repositoryIdentity != null && candidate.repository_identity === repositoryIdentity;
+	}
+	const identities = new Set(
+		[
+			candidate.workspace_identity,
+			candidate.cwd,
+			candidate.git_remote,
+			candidate.repository_identity,
+		].filter((identity): identity is string => identity != null),
+	);
+	if (candidate.repository_identity) {
+		for (const workspace of workspacesByRepository.get(candidate.repository_identity) ?? []) {
+			identities.add(workspace);
+		}
+	}
+	return scopeIdsMatchingProjectPatterns([mapping], identities).size > 0;
+}
+
+function candidatesForProjectScopeDraft(
+	db: Database,
+	draft: ProjectScopeMappingDraft,
+	scopes: SharingDomainSettingsScope[],
+	mappings: ProjectScopeSettingsMapping[],
+): ProjectScopeCandidate[] {
+	if (!draft.projectPattern || !draft.scopeId) return [];
+	const requested = projectScopeMappingFromDraft(draft, -1);
+	if (!requested) return [];
+	const effectiveMappings = withRepositoryMappingAliases(db, mappings);
+	const affectedMappings = draft.existing ? [requested, draft.existing] : [requested];
+	const repositoryIdentities = repositoryIdentitiesByWorkspace(db, {
+		knownRepositoryIdentities: knownRepositoryIdentitiesForMappings([
+			...effectiveMappings,
+			...affectedMappings,
+		]),
+	});
+	const workspacesByRepository = new Map<string, Set<string>>();
+	for (const [workspace, repository] of repositoryIdentities) {
+		const workspaces = workspacesByRepository.get(repository) ?? new Set<string>();
+		workspaces.add(workspace);
+		workspacesByRepository.set(repository, workspaces);
+	}
+	const candidates = withCandidateGuardrails(
+		collectProjectScopeCandidates(db, {
+			candidateCeiling: null,
+			excludePeerReceived: false,
+			mappings: effectiveMappings,
+			scopes,
+		}),
+	);
+	return candidates.filter((candidate) =>
+		affectedMappings.some((mapping) =>
+			candidateMatchesProjectScopeDraft(
+				candidate,
+				mapping,
+				repositoryIdentities,
+				workspacesByRepository,
+			),
+		),
+	);
+}
+
+function bindDraftConflictWarning(
+	warning: ProjectScopeGuardrailWarning,
+	draft: ProjectScopeMappingDraft,
+	conflictState: string,
+): ProjectScopeGuardrailWarning {
+	if (warning.code !== "conflicting_repository_mappings") return warning;
+	return {
+		...warning,
+		mapping_id: draft.existing?.id ?? null,
+		project_pattern: draft.projectPattern,
+		scope_id: draft.scopeId,
+		conflict_state: conflictState,
+	};
+}
+
+function mappingTransitionGuardrailWarnings(
+	db: Database,
+	draft: ProjectScopeMappingDraft,
+	scopes: SharingDomainSettingsScope[],
+	mappings: ProjectScopeSettingsMapping[],
+): ProjectScopeGuardrailWarning[] {
+	const deviceId = draft.deviceId;
+	if (!draft.mappingId || !deviceId) return [];
+	const oldMappings = listProjectScopeSettingsMappingsForScopes(db, scopes);
+	const transitionState = createHash("sha256")
+		.update(
+			JSON.stringify([
+				mappingConfirmationState(oldMappings),
+				deletionConfirmationState(db, deviceId, mappings),
+			]),
+		)
+		.digest("hex");
+	const changes = changedScopesAfterMappingTransition(
+		db,
+		draft.mappingId,
+		deviceId,
+		oldMappings,
+		mappings,
+	);
+	return [...changes].sort().map((change) => {
+		const [previousScopeId, scopeId] = JSON.parse(change) as [string, string];
+		return {
+			code: "scope_reassignment_old_copies",
+			severity: "warning",
+			message:
+				"Assigning this mapping changes the Sharing domain for existing memories. Review access before continuing; old copies may remain on devices and backups.",
+			requires_confirmation: true,
+			mapping_id: draft.mappingId,
+			previous_scope_id: previousScopeId,
+			scope_id: scopeId,
+			workspace_identity: draft.existing?.workspace_identity ?? draft.workspaceIdentity,
+			project_pattern: draft.existing?.project_pattern ?? draft.projectPattern,
+			conflict_state: transitionState,
+		};
+	});
+}
+
+function analyzeProjectScopeMappingDraftGuardrails(
+	db: Database,
+	draft: ProjectScopeMappingDraft,
+	scopes: SharingDomainSettingsScope[],
+	mappings: ProjectScopeSettingsMapping[],
 ): ProjectScopeMappingChangeGuardrailAnalysis {
-	ensureScopeBackfillScopes(db);
-	const draft = resolveProjectScopeMappingDraft(db, input);
-	const scopes = listSharingDomainSettingsScopes(db);
 	const scopesById = scopeLookup(scopes);
 	const warnings: ProjectScopeGuardrailWarning[] = [];
 	if (draft.projectPattern && draft.scopeId) {
@@ -1017,19 +1547,19 @@ export function analyzeProjectScopeMappingChangeGuardrails(
 			),
 		);
 	}
-	const candidate = draft.workspaceIdentity
-		? listProjectScopeCandidates(db, { limit: null }).find(
-				(project) => project.workspace_identity === draft.workspaceIdentity,
-			)
-		: null;
 	const requestedScope = scopesById.get(draft.scopeId);
-	if (candidate) {
+	const conflictState = mappingConfirmationState(mappings);
+	for (const candidate of candidatesForProjectScopeDraft(db, draft, scopes, mappings)) {
 		warnings.push(
-			...candidate.guardrail_warnings.filter(
-				(warning) => warning.code !== "basename_collision_review" || isOrgLikeScope(requestedScope),
-			),
+			...candidate.guardrail_warnings
+				.filter(
+					(warning) =>
+						warning.code !== "basename_collision_review" || isOrgLikeScope(requestedScope),
+				)
+				.map((warning) => bindDraftConflictWarning(warning, draft, conflictState)),
 		);
 	}
+	warnings.push(...mappingTransitionGuardrailWarnings(db, draft, scopes, mappings));
 	if (draft.scopeId && draft.existing && draft.existing.scope_id !== draft.scopeId) {
 		const oldScope = scopeDisplayName(
 			scopesById.get(draft.existing.scope_id),
@@ -1057,6 +1587,31 @@ export function analyzeProjectScopeMappingChangeGuardrails(
 	};
 }
 
+export function analyzeProjectScopeMappingChangesGuardrails(
+	db: Database,
+	inputs: UpsertProjectScopeMappingInput[],
+): ProjectScopeMappingChangeGuardrailAnalysis[] {
+	ensureScopeBackfillScopes(db);
+	const scopes = listSharingDomainSettingsScopes(db);
+	const { drafts, mappings } = resolveProjectScopeMappingDrafts(db, scopes, inputs);
+	for (const draft of drafts) {
+		if (!draft.scopeId) throw new Error("scope_id must be a non-empty string");
+		assertActiveScope(db, draft.scopeId);
+	}
+	return drafts.map((draft) =>
+		analyzeProjectScopeMappingDraftGuardrails(db, draft, scopes, mappings),
+	);
+}
+
+export function analyzeProjectScopeMappingChangeGuardrails(
+	db: Database,
+	input: UpsertProjectScopeMappingInput,
+): ProjectScopeMappingChangeGuardrailAnalysis {
+	const analysis = analyzeProjectScopeMappingChangesGuardrails(db, [input])[0];
+	if (!analysis) throw new Error("project_scope_mapping_analysis_missing");
+	return analysis;
+}
+
 /**
  * How many distinct candidates the scan must observe before it may stop.
  *
@@ -1070,6 +1625,95 @@ export function analyzeProjectScopeMappingChangeGuardrails(
 function candidateWalkCeiling(limit: number | null, maxScannedRows: number | null): number | null {
 	if (maxScannedRows != null) return maxScannedRows + 1;
 	return limit;
+}
+
+function candidatePageQueries(db: Database, excludePeerReceived: boolean) {
+	const pageSize = 500;
+	const filter = `(
+		COALESCE(TRIM(s.git_remote), TRIM(s.cwd), TRIM(s.project), '') <> ''
+		OR EXISTS (SELECT 1 FROM memory_items candidate WHERE candidate.session_id = s.id)
+	)${
+		excludePeerReceived
+			? ` AND (s.cwd IS NULL OR substr(s.cwd, 1, length(?)) <> ?)
+				AND COALESCE(s.tool_version, '') <> 'sync_replication'`
+			: ""
+	}`;
+	const columns = `s.id, s.started_at, s.cwd, s.project, s.git_remote, s.git_branch,
+		s.metadata_json, (SELECT mi.workspace_id FROM memory_items mi
+		WHERE mi.session_id = s.id AND mi.workspace_id IS NOT NULL
+		AND TRIM(mi.workspace_id) <> '' ORDER BY mi.id DESC LIMIT 1) AS workspace_id`;
+	return {
+		filterParameters: excludePeerReceived
+			? [SYNC_BOOTSTRAP_CWD_PREFIX, SYNC_BOOTSTRAP_CWD_PREFIX]
+			: [],
+		pageSize,
+		selectFirstPage: db.prepare(`SELECT ${columns} FROM sessions s WHERE ${filter}
+			ORDER BY s.started_at DESC, s.id DESC LIMIT ?`),
+		selectNextPage: db.prepare(`SELECT * FROM (
+			SELECT ${columns} FROM sessions s WHERE s.started_at = ? AND s.id < ? AND ${filter}
+			ORDER BY s.id DESC LIMIT ?
+		) UNION ALL SELECT * FROM (
+			SELECT ${columns} FROM sessions s WHERE s.started_at < ? AND ${filter}
+			ORDER BY s.started_at DESC, s.id DESC LIMIT ?
+		) ORDER BY started_at DESC, id DESC LIMIT ?`),
+	};
+}
+
+function collectProjectScopeCandidates(
+	db: Database,
+	input: {
+		candidateCeiling: number | null;
+		excludePeerReceived: boolean;
+		mappings: ProjectScopeSettingsMapping[];
+		scopes: SharingDomainSettingsScope[];
+	},
+): ProjectScopeCandidate[] {
+	const queries = candidatePageQueries(db, input.excludePeerReceived);
+	const seen = new Set<string>();
+	const repositories = repositoryIdentitiesByWorkspace(db, {
+		knownRepositoryIdentities: knownRepositoryIdentitiesForMappings(input.mappings),
+	});
+	const conflictsByRepository = new Map<string, boolean>();
+	const candidates: ProjectScopeCandidate[] = [];
+	let cursor: { startedAt: string; id: number } | null = null;
+	const ceilingReached = () =>
+		input.candidateCeiling != null && candidates.length >= input.candidateCeiling;
+	pages: while (!ceilingReached()) {
+		const rows = (
+			cursor
+				? queries.selectNextPage.all(
+						cursor.startedAt,
+						cursor.id,
+						...queries.filterParameters,
+						queries.pageSize,
+						cursor.startedAt,
+						...queries.filterParameters,
+						queries.pageSize,
+						queries.pageSize,
+					)
+				: queries.selectFirstPage.all(...queries.filterParameters, queries.pageSize)
+		) as ProjectScopeCandidateRow[];
+		if (rows.length === 0) break;
+		for (const row of rows) {
+			const identifiedRow = identifyRepositoryRow(row, repositories);
+			const candidate = buildConflictAwareCandidate(
+				identifiedRow,
+				input.mappings,
+				input.scopes,
+				repositories,
+				conflictsByRepository,
+			);
+			if (seen.has(candidate.workspace_identity)) continue;
+			seen.add(candidate.workspace_identity);
+			candidates.push(candidate);
+			if (ceilingReached()) break pages;
+		}
+		if (rows.length < queries.pageSize) break;
+		const last = rows.at(-1);
+		if (!last || last.started_at == null) break;
+		cursor = { startedAt: last.started_at, id: last.id };
+	}
+	return candidates;
 }
 
 export function listProjectScopeCandidates(
@@ -1111,106 +1755,12 @@ export function listProjectScopeCandidates(
 		db,
 		listProjectScopeSettingsMappingsForScopes(db, scopes),
 	);
-	const excludePeerReceived = options.excludePeerReceived === true;
-	// Newest-first by started_at so the first row seen per identity carries the
-	// true latest_session_at; id is only a tiebreaker. sessions.id and
-	// started_at are not monotonic together (imports backdate started_at), so
-	// the keyset cursor must be the composite (started_at, id).
-	const pageSize = 500;
-	// The first page has no lower keyset bound. started_at is free-form NOT
-	// NULL text (raw-event ingestion does not enforce ISO-8601), so no sentinel
-	// string is guaranteed to sort above every stored value in SQLite's byte
-	// collation. Later pages bound on the last (started_at, id) actually seen.
-	const candidateFilterSql = `(
-			       COALESCE(TRIM(s.git_remote), TRIM(s.cwd), TRIM(s.project), '') <> ''
-			    OR EXISTS (SELECT 1 FROM memory_items mi_candidate WHERE mi_candidate.session_id = s.id)
-			 )${
-					excludePeerReceived
-						? `
-			   AND (s.cwd IS NULL OR substr(s.cwd, 1, length(?)) <> ?)
-			   AND COALESCE(s.tool_version, '') <> 'sync_replication'`
-						: ""
-}`;
-	const selectColumnsSql = `s.id,
-				s.started_at,
-				s.cwd,
-				s.project,
-				s.git_remote,
-				s.git_branch,
-				s.metadata_json,
-				(
-					SELECT mi.workspace_id
-					FROM memory_items mi
-					WHERE mi.session_id = s.id
-					  AND mi.workspace_id IS NOT NULL
-					  AND TRIM(mi.workspace_id) <> ''
-					ORDER BY mi.id DESC
-					LIMIT 1
-				) AS workspace_id`;
-	const selectFirstPage = db.prepare(`SELECT ${selectColumnsSql}
-			 FROM sessions s
-			 WHERE ${candidateFilterSql}
-			 ORDER BY s.started_at DESC, s.id DESC
-			 LIMIT ?`);
-	// A single `a < x OR (a = x AND b < y)` predicate cannot use the composite
-	// index for a range seek: SQLite plans it as a full index SCAN from the
-	// newest entry every page, which makes the whole walk quadratic on large
-	// histories. Two seekable ranges unioned and re-sorted resume exactly at the
-	// cursor: the tail of the cursor's own timestamp, then everything older.
-	const selectNextPage = db.prepare(`SELECT * FROM (
-				SELECT ${selectColumnsSql}
-				 FROM sessions s
-				 WHERE s.started_at = ? AND s.id < ? AND ${candidateFilterSql}
-				 ORDER BY s.id DESC
-				 LIMIT ?
-			) UNION ALL SELECT * FROM (
-				SELECT ${selectColumnsSql}
-				 FROM sessions s
-				 WHERE s.started_at < ? AND ${candidateFilterSql}
-				 ORDER BY s.started_at DESC, s.id DESC
-				 LIMIT ?
-			)
-			 ORDER BY started_at DESC, id DESC
-			 LIMIT ?`);
-	const seen = new Set<string>();
-	const repositoryIdentityByCwd = repositoryIdentitiesByWorkspace(db);
-	const candidates: ProjectScopeCandidate[] = [];
-	let cursor: { startedAt: string; id: number } | null = null;
-	const ceilingReached = () => candidateCeiling != null && candidates.length >= candidateCeiling;
-	const filterParameters: string[] = excludePeerReceived
-		? [SYNC_BOOTSTRAP_CWD_PREFIX, SYNC_BOOTSTRAP_CWD_PREFIX]
-		: [];
-	pages: while (!ceilingReached()) {
-		const rows = (
-			cursor
-				? selectNextPage.all(
-						cursor.startedAt,
-						cursor.id,
-						...filterParameters,
-						pageSize,
-						cursor.startedAt,
-						...filterParameters,
-						pageSize,
-						pageSize,
-					)
-				: selectFirstPage.all(...filterParameters, pageSize)
-		) as ProjectScopeCandidateRow[];
-		if (rows.length === 0) break;
-		for (const row of rows) {
-			const identifiedRow = identifyRepositoryRow(row, repositoryIdentityByCwd);
-			const candidate = buildProjectScopeCandidate(identifiedRow, mappings, scopes);
-			if (seen.has(candidate.workspace_identity)) continue;
-			seen.add(candidate.workspace_identity);
-			candidates.push(candidate);
-			if (ceilingReached()) break pages;
-		}
-		if (rows.length < pageSize) break;
-		const last = rows.at(-1);
-		// started_at is NOT NULL in the schema; a null here means the row shape
-		// diverged from the query and paging can no longer be trusted.
-		if (!last || last.started_at == null) break;
-		cursor = { startedAt: last.started_at, id: last.id };
-	}
+	const candidates = collectProjectScopeCandidates(db, {
+		candidateCeiling,
+		excludePeerReceived: options.excludePeerReceived === true,
+		mappings,
+		scopes,
+	});
 	if (maxScannedRows != null && candidates.length > maxScannedRows) {
 		throw new Error("project_scope_candidate_scan_too_large");
 	}
@@ -1407,12 +1957,11 @@ function mappingOnlyProject(mapping: ProjectScopeSettingsMapping): ProjectScopeI
 }
 
 function appendMappingOnlyProjects(
-	db: Database,
 	mappings: ProjectScopeSettingsMapping[],
 	byIdentity: Map<string, ProjectScopeInventoryProject>,
 	inventory: ProjectScopeInventoryProject[],
+	repositoryIdentityByWorkspace: Map<string, string>,
 ): void {
-	const repositoryIdentityByWorkspace = repositoryIdentitiesByWorkspace(db);
 	for (const mapping of mappings) {
 		if (!mapping.workspace_identity) continue;
 		const normalized = normalizeWorkspaceIdentity(mapping.workspace_identity) ?? "";
@@ -1437,12 +1986,19 @@ function buildProjectScopeInventory(
 ): BuiltProjectScopeInventory {
 	const byIdentity = new Map<string, ProjectScopeInventoryProject>();
 	const inventory: ProjectScopeInventoryProject[] = [];
-	const repositoryIdentityByCwd = repositoryIdentitiesByCwd(db, rows);
+	const repositoryIdentityByCwd = repositoryIdentitiesByCwd(db, rows, mappings);
+	const conflictsByRepository = new Map<string, boolean>();
 	for (const row of rows) {
 		const identifiedRow = identifyRepositoryRow(row, repositoryIdentityByCwd);
 		const readOnly = row.inventory_source === "peer_received";
 		const candidate = {
-			...buildProjectScopeCandidate(identifiedRow, mappings, scopes),
+			...buildConflictAwareCandidate(
+				identifiedRow,
+				mappings,
+				scopes,
+				repositoryIdentityByCwd,
+				conflictsByRepository,
+			),
 			read_only: readOnly,
 			read_only_reason: readOnly ? "peer_received" : null,
 			...(readOnly
@@ -1494,7 +2050,12 @@ export function listProjectScopeInventory(
 		scopes,
 	);
 
-	appendMappingOnlyProjects(db, mappings, byIdentity, inventory);
+	const repositoryIdentityByWorkspace = repositoryIdentitiesByCwd(
+		db,
+		[...rows, ...bootstrapRows],
+		mappings,
+	);
+	appendMappingOnlyProjects(mappings, byIdentity, inventory, repositoryIdentityByWorkspace);
 
 	const withGuardrails = withCandidateGuardrails(inventory).map((project, index) => {
 		const original = inventory[index];
@@ -1654,7 +2215,7 @@ export function reassignProjectScopeInventoryProject(
 	};
 }
 
-export function upsertProjectScopeSettingsMapping(
+function upsertProjectScopeSettingsMappingInTransaction(
 	db: Database,
 	input: UpsertProjectScopeMappingInput,
 ): ProjectScopeSettingsMapping {
@@ -1685,8 +2246,9 @@ export function upsertProjectScopeSettingsMapping(
 
 	const source = draft.source;
 	const now = new Date().toISOString();
+	const previousMappings = listProjectScopeSettingsMappings(db);
 	if (existing) {
-		const previousMappings = listProjectScopeSettingsMappings(db);
+		persistMappedRepositoryIdentityEvidence(db, previousMappings);
 		db.prepare(
 			`UPDATE project_scope_mappings
 			 SET workspace_identity = ?, project_pattern = ?, scope_id = ?, priority = ?, source = ?, updated_at = ?
@@ -1707,12 +2269,67 @@ export function upsertProjectScopeSettingsMapping(
 		.run(workspaceIdentity, projectPattern, scopeId, priority, source, now, now);
 	const saved = getProjectScopeSettingsMappingById(db, Number(result.lastInsertRowid));
 	if (!saved) throw new Error("project_scope_mapping insert returned no row");
-	propagateProjectScopeMappingToSourceOwnedMemories(db, saved, draft.deviceId);
+	propagateProjectScopeMappingToSourceOwnedMemories(db, saved, draft.deviceId, previousMappings);
 	return saved;
 }
 
-export function deleteProjectScopeSettingsMapping(db: Database, id: number): boolean {
+export function upsertProjectScopeSettingsMapping(
+	db: Database,
+	input: UpsertProjectScopeMappingInput,
+): ProjectScopeSettingsMapping {
+	return db.transaction(() => upsertProjectScopeSettingsMappingInTransaction(db, input))();
+}
+
+export function upsertProjectScopeSettingsMappings(
+	db: Database,
+	inputs: UpsertProjectScopeMappingInput[],
+	options: { deviceId: string },
+): ProjectScopeSettingsMapping[] {
+	return db.transaction(() => {
+		const previousMappings = listProjectScopeSettingsMappings(db);
+		const saved = inputs.map((input) =>
+			upsertProjectScopeSettingsMappingInTransaction(db, { ...input, deviceId: null }),
+		);
+		propagateProjectScopeMappingsToSourceOwnedMemories(
+			db,
+			saved,
+			options.deviceId,
+			previousMappings,
+		);
+		return saved;
+	})();
+}
+
+export function deleteProjectScopeSettingsMapping(
+	db: Database,
+	id: number,
+	options: { deviceId?: string | null; confirmedGuardrailTokens?: string[] } = {},
+): boolean {
 	if (!Number.isInteger(id) || id <= 0) throw new Error("id must be a positive integer");
-	const result = db.prepare("DELETE FROM project_scope_mappings WHERE id = ?").run(id);
-	return Number(result.changes ?? 0) > 0;
+	return db.transaction(() => {
+		const mapping = getProjectScopeSettingsMappingById(db, id);
+		if (!mapping) return false;
+		const warnings = analyzeProjectScopeMappingDeletionGuardrails(db, id, clean(options.deviceId));
+		const confirmed = new Set(options.confirmedGuardrailTokens ?? []);
+		if (
+			warnings.some(
+				(warning) => !warning.confirmation_token || !confirmed.has(warning.confirmation_token),
+			)
+		) {
+			throw new Error("guardrail_confirmation_required");
+		}
+		const previousMappings = listProjectScopeSettingsMappings(db);
+		persistMappedRepositoryIdentityEvidence(db, previousMappings);
+		const result = db.prepare("DELETE FROM project_scope_mappings WHERE id = ?").run(id);
+		const deleted = Number(result.changes ?? 0) > 0;
+		if (deleted) {
+			propagateProjectScopeMappingToSourceOwnedMemories(
+				db,
+				mapping,
+				clean(options.deviceId),
+				previousMappings,
+			);
+		}
+		return deleted;
+	})();
 }

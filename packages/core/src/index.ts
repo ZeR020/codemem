@@ -781,6 +781,8 @@ export type {
 } from "./project-scope-settings.js";
 export {
 	analyzeProjectScopeMappingChangeGuardrails,
+	analyzeProjectScopeMappingChangesGuardrails,
+	analyzeProjectScopeMappingDeletionGuardrails,
 	deleteProjectScopeSettingsMapping,
 	listProjectScopeCandidates,
 	listProjectScopeInventory,
@@ -788,6 +790,7 @@ export {
 	listSharingDomainSettingsScopes,
 	reassignProjectScopeInventoryProject,
 	upsertProjectScopeSettingsMapping,
+	upsertProjectScopeSettingsMappings,
 } from "./project-scope-settings.js";
 export * from "./prompt-pack-ledger.js";
 export * from "./prompt-transport.js";
@@ -1006,6 +1009,7 @@ export type { RefQueryOptions, RefQueryResult } from "./ref-queries.js";
 export { findByConcept, findByFile } from "./ref-queries.js";
 export * from "./release-discovery.js";
 export {
+	canonicalRepositoryProjectIdentity,
 	repositoryIdentitiesByWorkspace,
 	repositoryIdentityForWorkspace,
 } from "./repository-mapping-aliases.js";

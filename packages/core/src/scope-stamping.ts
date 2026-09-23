@@ -1,6 +1,10 @@
 import type { Database } from "./db.js";
 import {
-	recordedRepositoryIdentitiesByWorkspace,
+	discoverKnownRepositoryIdentity,
+	hasConflictingRepositoryMappings,
+	normalizeRepositoryWorkspaceIdentity,
+	recordedRepositoryIdentityEvidenceByWorkspace,
+	repositoryIdentitiesByWorkspace,
 	repositoryIdentityForWorkspace,
 	withRepositoryMappingAliasesFromIdentities,
 } from "./repository-mapping-aliases.js";
@@ -32,6 +36,12 @@ export interface ResolveSessionScopeOptions {
 	localDefaultScopeId?: string;
 }
 
+interface RepositoryScopeContext {
+	allowRepositoryCwdFallback: boolean;
+	mappings: ScopeMapping[];
+	repositoryIdentity: string | null;
+}
+
 function clean(value: string | null | undefined): string | null {
 	const trimmed = value?.trim();
 	return trimmed ? trimmed : null;
@@ -48,37 +58,108 @@ function loadProjectScopeMappings(db: Database): ScopeMapping[] {
 		.all() as ScopeMapping[];
 }
 
-function repositoryScopeContext(
-	db: Database,
+function hasRepositoryConflict(
+	mappings: ScopeMapping[],
+	repositoryIdentities: ReadonlyMap<string, string>,
+	repositoryIdentity: string | null,
+): boolean {
+	return Boolean(
+		repositoryIdentity &&
+			hasConflictingRepositoryMappings(mappings, repositoryIdentities, repositoryIdentity),
+	);
+}
+
+function emptyRepositoryScopeContext(
 	row: SessionScopeRow | null,
 	mappings: ScopeMapping[],
-): { mappings: ScopeMapping[]; repositoryIdentity: string | null } {
-	if (mappings.length === 0) {
-		return {
-			mappings,
-			repositoryIdentity: repositoryIdentityForWorkspace(new Map(), {
-				cwd: row?.cwd,
-				gitRemote: row?.git_remote ?? null,
-				metadataJson: row?.metadata_json,
-			}),
-		};
-	}
-	const repositoryIdentities = recordedRepositoryIdentitiesByWorkspace(
-		db,
-		[row?.cwd, ...mappings.map((mapping) => mapping.workspace_identity)],
-		{
-			freshWorkspaces: [row?.cwd],
-		},
-	);
+): RepositoryScopeContext {
 	return {
-		mappings: withRepositoryMappingAliasesFromIdentities(mappings, repositoryIdentities, {
-			discoverFilesystem: true,
-		}),
-		repositoryIdentity: repositoryIdentityForWorkspace(repositoryIdentities, {
+		allowRepositoryCwdFallback: true,
+		mappings,
+		repositoryIdentity: repositoryIdentityForWorkspace(new Map(), {
 			cwd: row?.cwd,
 			gitRemote: row?.git_remote ?? null,
 			metadataJson: row?.metadata_json,
 		}),
+	};
+}
+
+function addDiscoveredRepositoryWorkspaces(
+	db: Database,
+	repositoryIdentities: Map<string, string>,
+	repositoryIdentity: string,
+	mappedWorkspaces: Array<string | null | undefined>,
+): void {
+	const discoveredWorkspaces = repositoryIdentitiesByWorkspace(db, {
+		knownRepositoryIdentities: [repositoryIdentity, ...mappedWorkspaces],
+	});
+	for (const [workspace, identity] of discoveredWorkspaces) {
+		if (identity === repositoryIdentity) repositoryIdentities.set(workspace, identity);
+	}
+}
+
+function repositoryScopeContext(
+	db: Database,
+	row: SessionScopeRow | null,
+	mappings: ScopeMapping[],
+): RepositoryScopeContext {
+	if (mappings.length === 0) return emptyRepositoryScopeContext(row, mappings);
+	const mappedWorkspaces = mappings.map((mapping) => mapping.workspace_identity);
+	const mappingIdentitySeeds = mappings.flatMap((mapping) => [
+		mapping.workspace_identity,
+		mapping.project_pattern,
+	]);
+	const evidence = recordedRepositoryIdentityEvidenceByWorkspace(
+		db,
+		[row?.cwd, ...mappedWorkspaces],
+		{ freshWorkspaces: [row?.cwd] },
+	);
+	const repositoryIdentities = evidence.byWorkspace;
+	const cwd = normalizeRepositoryWorkspaceIdentity(row?.cwd);
+	const ambiguousCwd = Boolean(
+		cwd && evidence.recordedWorkspaces.has(cwd) && !repositoryIdentities.has(cwd),
+	);
+	if (cwd && !evidence.recordedWorkspaces.has(cwd)) {
+		const knownRepositoryIdentities = new Set(
+			[
+				...repositoryIdentities.values(),
+				...mappingIdentitySeeds.map((identity) => normalizeRepositoryWorkspaceIdentity(identity)),
+			].filter((identity): identity is string => identity != null),
+		);
+		const repositoryIdentity = discoverKnownRepositoryIdentity(cwd, knownRepositoryIdentities);
+		if (repositoryIdentity) repositoryIdentities.set(cwd, repositoryIdentity);
+	}
+	const repositoryIdentity = repositoryIdentityForWorkspace(repositoryIdentities, {
+		cwd: row?.cwd,
+		gitRemote: row?.git_remote ?? null,
+		metadataJson: row?.metadata_json,
+	});
+	if (repositoryIdentity) {
+		addDiscoveredRepositoryWorkspaces(
+			db,
+			repositoryIdentities,
+			repositoryIdentity,
+			mappingIdentitySeeds,
+		);
+	}
+	const repositoryConflict = hasRepositoryConflict(
+		mappings,
+		repositoryIdentities,
+		repositoryIdentity,
+	);
+	const unresolvedAmbiguousCwd = ambiguousCwd && !repositoryIdentity;
+	let effectiveMappings = mappings;
+	if (repositoryConflict || unresolvedAmbiguousCwd) {
+		effectiveMappings = [];
+	} else if (!ambiguousCwd) {
+		effectiveMappings = withRepositoryMappingAliasesFromIdentities(mappings, repositoryIdentities, {
+			discoverFilesystem: true,
+		});
+	}
+	return {
+		allowRepositoryCwdFallback: !ambiguousCwd && !repositoryConflict,
+		mappings: effectiveMappings,
+		repositoryIdentity,
 	};
 }
 
@@ -97,6 +178,7 @@ export function resolveSessionScopeId(db: Database, options: ResolveSessionScope
 	const session = loadSessionScopeRow(db, options.sessionId);
 	const context = repositoryScopeContext(db, session, loadProjectScopeMappings(db));
 	const result = resolveProjectScope({
+		allowRepositoryCwdFallback: context.allowRepositoryCwdFallback,
 		gitRemote: session?.git_remote ?? null,
 		gitBranch: session?.git_branch ?? null,
 		repositoryIdentity: context.repositoryIdentity,
@@ -138,6 +220,7 @@ export function ensureMemoryScopeId(db: Database, memoryId: number): string | nu
 	if (existingScopeId) return existingScopeId;
 	const context = repositoryScopeContext(db, row, loadProjectScopeMappings(db));
 	const result = resolveProjectScope({
+		allowRepositoryCwdFallback: context.allowRepositoryCwdFallback,
 		gitRemote: row.git_remote,
 		gitBranch: row.git_branch,
 		repositoryIdentity: context.repositoryIdentity,
