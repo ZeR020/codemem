@@ -59,7 +59,11 @@ function jsonErr(status: number, body: unknown) {
 	};
 }
 
-function stubMatchingPackFetch(pack_text: string, cwd = process.cwd()) {
+function stubMatchingPackFetch(
+	pack_text: string,
+	cwd = process.cwd(),
+	packBody: Record<string, unknown> = {},
+) {
 	const dbPath = resolveViewerDbPath(cwd);
 	const identity = buildViewerIdentityTarget(process.env, cwd);
 	vi.stubGlobal(
@@ -79,11 +83,12 @@ function stubMatchingPackFetch(pack_text: string, cwd = process.cwd()) {
 				});
 			}
 			if (url.pathname === "/api/pack") {
+				const body = { pack_text, items: [], metrics: {}, ...packBody };
 				return {
 					ok: true,
 					status: 200,
-					json: async () => ({ pack_text, items: [], metrics: {} }),
-					text: async () => JSON.stringify({ pack_text, items: [], metrics: {} }),
+					json: async () => body,
+					text: async () => JSON.stringify(body),
 				};
 			}
 			return jsonErr(404, {});
@@ -236,6 +241,144 @@ describe("fetchPackText preformatted flag", () => {
 
 		expect(result.text).toBe(hostile);
 		expect(result.preformatted).toBe(false);
+	});
+});
+
+describe("fetchPackText span-bearing responses", () => {
+	afterEach(() => {
+		vi.unstubAllGlobals();
+	});
+
+	it("HTTP /api/pack populates renderedItems and itemCount", async () => {
+		const renderedItems = [{ id: 7, fingerprint: "a".repeat(64), spans: [{ start: 0, end: 4 }] }];
+		stubMatchingPackFetch("spanned pack text", process.cwd(), {
+			rendered_items: renderedItems,
+			metrics: { total_items: 1 },
+		});
+		const client = new PiCodememClient(onlineConfig, createViewerRuntime(), {
+			execImpl: async () => {
+				throw new Error("CLI should not run");
+			},
+		});
+
+		const result = await client.fetchPackText("what changed?");
+
+		expect(result.text).toBe("spanned pack text");
+		expect(result.preformatted).toBe(false);
+		expect(result.renderedItems).toEqual(renderedItems);
+		expect(result.itemCount).toBe(1);
+	});
+
+	it("CLI pack --json populates renderedItems and itemCount", async () => {
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async () => {
+				throw new Error("offline");
+			}),
+		);
+		const renderedItems = [{ id: 3, fingerprint: "b".repeat(64), spans: [{ start: 2, end: 9 }] }];
+		const client = new PiCodememClient(offlineConfig, createViewerRuntime(), {
+			execImpl: async (args) => {
+				if (args[0] === "pi-hook-inject") throw new Error("inject missing");
+				if (args[0] === "pack") {
+					return {
+						stdout: JSON.stringify({
+							pack_text: "json spanned pack",
+							rendered_items: renderedItems,
+							metrics: { total_items: 1 },
+						}),
+						stderr: "",
+					};
+				}
+				return { stdout: "", stderr: "" };
+			},
+		});
+
+		const result = await client.fetchPackText("what changed?");
+
+		expect(result.text).toBe("json spanned pack");
+		expect(result.preformatted).toBe(false);
+		expect(result.renderedItems).toEqual(renderedItems);
+		expect(result.itemCount).toBe(1);
+	});
+
+	it("plain-text pi-hook-inject leaves renderedItems and itemCount absent", async () => {
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async () => {
+				throw new Error("offline");
+			}),
+		);
+		const client = new PiCodememClient(offlineConfig, createViewerRuntime(), {
+			execImpl: async (args) => {
+				if (args[0] === "pack") throw new Error("pack missing");
+				if (args[0] === "pi-hook-inject") {
+					return { stdout: "## codemem memories\n\nplain block", stderr: "" };
+				}
+				return { stdout: "", stderr: "" };
+			},
+		});
+
+		const result = await client.fetchPackText("what changed?");
+
+		expect(result.preformatted).toBe(true);
+		expect(result.text).toContain("plain block");
+		expect(result.renderedItems).toBeUndefined();
+		expect(result.itemCount).toBeUndefined();
+	});
+
+	it("prefers span-bearing pack --json over plain-text pi-hook-inject when both are available", async () => {
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async () => {
+				throw new Error("offline");
+			}),
+		);
+		const client = new PiCodememClient(offlineConfig, createViewerRuntime(), {
+			execImpl: async (args) => {
+				if (args[0] === "pack") {
+					return {
+						stdout: JSON.stringify({
+							pack_text: "spanned text",
+							rendered_items: [
+								{ id: 1, fingerprint: "c".repeat(64), spans: [{ start: 0, end: 5 }] },
+							],
+							metrics: { total_items: 1 },
+						}),
+						stderr: "",
+					};
+				}
+				if (args[0] === "pi-hook-inject") {
+					return { stdout: "## codemem memories\n\nplain fallback", stderr: "" };
+				}
+				return { stdout: "", stderr: "" };
+			},
+		});
+
+		const result = await client.fetchPackText("what changed?");
+
+		expect(result.preformatted).toBe(false);
+		expect(result.text).toBe("spanned text");
+		expect(result.renderedItems).toHaveLength(1);
+		expect(result.itemCount).toBe(1);
+	});
+
+	it("a successful empty HTTP pack ends the chain without spawning a command", async () => {
+		stubMatchingPackFetch("", process.cwd(), { rendered_items: [], metrics: { total_items: 0 } });
+		const cliCalls: string[][] = [];
+		const client = new PiCodememClient(onlineConfig, createViewerRuntime(), {
+			execImpl: async (args) => {
+				cliCalls.push([...args]);
+				return { stdout: "", stderr: "" };
+			},
+		});
+
+		const result = await client.fetchPackText("what changed?");
+
+		expect(result.text).toBe("");
+		expect(result.renderedItems).toEqual([]);
+		expect(result.itemCount).toBe(0);
+		expect(cliCalls).toHaveLength(0);
 	});
 });
 
