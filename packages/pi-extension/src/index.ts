@@ -10,16 +10,18 @@
  *
  * Surfaces:
  *   - Ingest → POST /api/pi-hooks → CLI pi-hook-ingest
- *   - Injection → before_agent_start systemPrompt append only (never message)
+ *   - Injection → context event: cached framed block replayed onto older user
+ *     messages, one new pack appended to the latest user message of the request
+ *     copy (never the system prompt, never the saved session)
  *   - Tools → pi.registerTool × 14 when pi.tools_mode === "native"
- *   - session_before_compact → flush signal only (never return compaction)
+ *   - session_before_compact → flush signal + one-shot inject replay skip
  */
 
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import type {
-	BeforeAgentStartEvent,
+	ContextEvent,
 	ExtensionAPI,
 	ExtensionContext,
 	MessageEndEvent,
@@ -37,6 +39,7 @@ import {
 	PiCodememClient,
 } from "./client.js";
 import { loadPiExtensionConfig, type PiExtensionConfig } from "./config.js";
+import { createPiInjector, type PiContextMessage, type PiInjector } from "./inject.js";
 import {
 	buildBeforeCompactPayload,
 	buildMessageEndPayload,
@@ -280,33 +283,25 @@ async function fileContextAppend(
 	}
 }
 
-async function systemPromptInjection(
-	client: PiCodememClient,
+/**
+ * Cache-stable injection on pi's context event: mutate the request-copy
+ * messages in place and return undefined — never { messages }.
+ */
+async function onContext(
+	injector: PiInjector,
 	config: PiExtensionConfig,
-	event: BeforeAgentStartEvent,
-	signal?: AbortSignal,
-): Promise<{ systemPrompt: string } | undefined> {
+	event: ContextEvent,
+	ctx: ExtensionContext,
+): Promise<void> {
 	if (!config.injectPrompts) return;
-	try {
-		const prompt = typeof event.prompt === "string" ? event.prompt : "";
-		if (!prompt.trim()) return;
-		const packFetch = await client.fetchPackText(prompt, signal);
-		if (!packFetch.text.trim()) return;
-		const block = packFetch.preformatted
-			? packFetch.text
-			: formatPiInjectionBlock(packFetch.text, config.injectMaxChars);
-		if (!block.trim()) return;
-		const base = typeof event.systemPrompt === "string" ? event.systemPrompt : "";
-		return { systemPrompt: base ? `${base}\n\n${block}` : block };
-	} catch {
-		return;
-	}
+	await injector.inject(event.messages as PiContextMessage[], ctx.signal);
 }
 
 async function onSessionStart(
 	state: SessionState,
 	client: PiCodememClient,
 	config: PiExtensionConfig,
+	injector: PiInjector,
 	pi: ExtensionAPI,
 	event: SessionStartEvent,
 	ctx: ExtensionContext,
@@ -321,6 +316,7 @@ async function onSessionStart(
 	state.toolCalls.clear();
 	state.seenEventKeys = loadCursorsFromSession(ctx, sessionId);
 	client.rekey(sessionId, cwd, project);
+	injector.rekey(sessionId);
 	if (config.toolsMode === "native") {
 		warnDuplicateToolSurface(ctx, cwd);
 	}
@@ -454,11 +450,13 @@ async function onToolResult(
 async function onBeforeCompact(
 	state: SessionState,
 	client: PiCodememClient,
+	injector: PiInjector,
 	pi: ExtensionAPI,
 	event: SessionBeforeCompactEvent,
 	ctx: ExtensionContext,
 ): Promise<void> {
 	if (!state.sessionId) return;
+	injector.noteCompaction();
 	state.compactSeq += 1;
 	const payload = buildBeforeCompactPayload({
 		sessionId: state.sessionId,
@@ -484,22 +482,38 @@ export default function codememPiExtension(pi: ExtensionAPI): void {
 		execImpl: testExecImpl,
 	});
 
+	let missingTimestampSeq = 0;
+	const injector = createPiInjector({
+		client,
+		config,
+		discriminator: (message) => {
+			if (typeof message.timestamp === "number" && Number.isFinite(message.timestamp)) {
+				return message.timestamp;
+			}
+			// Not messageDiscriminator: that counter belongs to ingest entry ids.
+			missingTimestampSeq += 1;
+			return `inject-n:${missingTimestampSeq}`;
+		},
+	});
+
 	// Native tools only when not in mcp-adapter mode (D6).
 	if (config.toolsMode === "native") {
 		registerMemoryTools(pi, client);
 	}
 
-	pi.on("session_start", (event, ctx) => onSessionStart(state, client, config, pi, event, ctx));
+	pi.on("session_start", (event, ctx) =>
+		onSessionStart(state, client, config, injector, pi, event, ctx),
+	);
 	pi.on("session_shutdown", (event, ctx) =>
 		onSessionShutdown(state, client, runtime, pi, event, ctx),
 	);
 	pi.on("message_end", (event, ctx) => onMessageEnd(state, client, pi, event, ctx));
 	pi.on("tool_call", (event, ctx) => onToolCall(state, client, pi, event, ctx));
 	pi.on("tool_result", (event, ctx) => onToolResult(state, client, config, pi, event, ctx));
-	pi.on("session_before_compact", (event, ctx) => onBeforeCompact(state, client, pi, event, ctx));
-	pi.on("before_agent_start", (event, ctx) =>
-		systemPromptInjection(client, config, event, ctx.signal),
+	pi.on("session_before_compact", (event, ctx) =>
+		onBeforeCompact(state, client, injector, pi, event, ctx),
 	);
+	pi.on("context", (event, ctx) => onContext(injector, config, event, ctx));
 }
 
 /**
