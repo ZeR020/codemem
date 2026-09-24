@@ -1,5 +1,7 @@
 import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { REPOSITORY_IDENTITY_METADATA_KEY } from "./project.js";
+import { claimRecipientPolicyPublicationMutation } from "./recipient-policy-team-metadata.js";
 import { getCachedScopeAuthorization } from "./scope-membership-cache.js";
 import {
 	inviteTokenDigest,
@@ -19,10 +21,161 @@ import { initTestSchema } from "./test-utils.js";
 const createdAt = "2026-07-20T12:00:00.000Z";
 const remote = "https://example.invalid/acme/api.git";
 
+function includeHistoricalRepositoryMemory(
+	db: InstanceType<typeof Database>,
+	operationId: string,
+): void {
+	const cwd = "/workspace/api";
+	const historicalSessionId = Number(
+		db
+			.prepare(
+				"INSERT INTO sessions(started_at, cwd, project, metadata_json) VALUES (?, ?, 'api', '{}')",
+			)
+			.run(createdAt, cwd).lastInsertRowid,
+	);
+	db.prepare(
+		"INSERT INTO sessions(started_at, cwd, project, metadata_json) VALUES (?, ?, 'api', ?)",
+	).run(createdAt, cwd, JSON.stringify({ [REPOSITORY_IDENTITY_METADATA_KEY]: remote }));
+	const historicalMemoryId = Number(
+		db
+			.prepare(`INSERT INTO memory_items(
+				session_id, kind, title, body_text, confidence, tags_text, active, created_at,
+				updated_at, metadata_json, import_key, rev, visibility, scope_id
+			 ) VALUES (?, 'discovery', 'historical', 'body', 0.8, '', 1, ?, ?, '{}',
+				'historical:api', 1, 'shared', 'source-space')`)
+			.run(historicalSessionId, createdAt, createdAt).lastInsertRowid,
+	);
+	expect(
+		countShareableProjectMemories(db, {
+			canonicalIdentity: remote,
+			initiatingDeviceId: "owner",
+		}),
+	).toBe(1);
+	const project = planShareProvisioning(db, {
+		operationId,
+		initiatingDeviceId: "owner",
+	}).projects[0];
+	expect(project?.memoryIds).toContain(historicalMemoryId);
+}
+
+function insertAcceptedLegacyCwdOperation(
+	db: InstanceType<typeof Database>,
+	operationId: string,
+): void {
+	db.prepare(`INSERT INTO actors(
+		actor_id, display_name, is_local, status, created_at, updated_at
+	 ) VALUES ('actor-owner', 'Owner', 1, 'active', ?, ?)`).run(createdAt, createdAt);
+	db.prepare(`INSERT INTO share_operations(
+		operation_id, state, inviter_actor_id, inviter_device_ids_json, person_id,
+		person_kind, teammate_name, history_policy, reviewed_project_set_digest,
+		coordinator_group_id, invite_token_digest, invite_expires_at,
+		recipient_actor_id, recipient_device_id, acceptance_consumed_at, created_at, updated_at
+	 ) VALUES (?, 'accepted', 'actor-owner', '["owner"]', 'actor-recipient', 'existing',
+		'Recipient', 'existing_and_future', 'digest', 'team', 'invite-digest',
+		'2099-01-01T00:00:00.000Z', 'actor-recipient', 'recipient', ?, ?, ?)`).run(
+		operationId,
+		createdAt,
+		createdAt,
+		createdAt,
+	);
+	db.prepare(`INSERT INTO share_operation_projects(
+		operation_id, canonical_project_identity, display_name, identity_source,
+		existing_memory_count, ordinal
+	 ) VALUES (?, '/workspace/api', 'api', 'cwd', 1, 0)`).run(operationId);
+	db.prepare(`INSERT INTO share_operation_steps(
+		operation_id, step_key, effect_id, status, updated_at
+	 ) VALUES (?, 'managed_boundary:/workspace/api', 'managed-project:legacy-cwd', 'pending', ?)`).run(
+		operationId,
+		createdAt,
+	);
+}
+
+function successfulProvisioningDependencies(boundaryId: string): ShareProvisioningDependencies {
+	return {
+		createOrGetBoundary: vi.fn(async () => ({
+			scope_id: boundaryId,
+			label: "api",
+			kind: "managed_project",
+			authority_type: "coordinator",
+			coordinator_id: "coord",
+			group_id: "team",
+			manifest_issuer_device_id: null,
+			membership_epoch: 1,
+			manifest_hash: null,
+			status: "active",
+			created_at: createdAt,
+			updated_at: createdAt,
+		})),
+		grantMembership: vi.fn(async ({ scopeId, deviceId, role }) => ({
+			scope_id: scopeId,
+			device_id: deviceId,
+			role,
+			status: "active",
+			membership_epoch: 1,
+			coordinator_id: "coord",
+			group_id: "team",
+			manifest_issuer_device_id: null,
+			manifest_hash: null,
+			signed_manifest_json: null,
+			updated_at: createdAt,
+		})),
+		supportsReassignScope: vi.fn(async () => "supported"),
+		refreshAuthorization: vi.fn(async () => undefined),
+		runInitialSync: vi.fn(async () => ({
+			ok: true,
+			perScopeResults: [{ scope_id: boundaryId, ok: true }],
+		})),
+	};
+}
+
+async function expectPublicationGate(
+	db: InstanceType<typeof Database>,
+	operationId: string,
+	deps: ShareProvisioningDependencies,
+): Promise<void> {
+	const releasePublication = await claimRecipientPolicyPublicationMutation(db);
+	let released = false;
+	try {
+		const execution = executeShareProvisioning(
+			db,
+			{ operationId, initiatingDeviceId: "owner" },
+			deps,
+		);
+		for (const [cwd, scopeId] of [
+			["/workspace/api-main", "source-space"],
+			["/workspace/api-sibling", "local-default"],
+		] as const) {
+			db.prepare(
+				"INSERT INTO sessions(started_at, cwd, project, metadata_json) VALUES (?, ?, 'api', ?)",
+			).run(createdAt, cwd, JSON.stringify({ [REPOSITORY_IDENTITY_METADATA_KEY]: remote }));
+			db.prepare(
+				"INSERT INTO project_scope_mappings(workspace_identity, project_pattern, scope_id, priority, source, created_at, updated_at) VALUES (?, ?, ?, 10, 'user', ?, ?)",
+			).run(cwd, cwd, scopeId, createdAt, createdAt);
+		}
+		releasePublication();
+		released = true;
+		await expect(execution).rejects.toThrow("conflicting_repository_mappings");
+		expect(deps.grantMembership).not.toHaveBeenCalled();
+	} finally {
+		if (!released) releasePublication();
+	}
+}
+
+function expectInviterProjectFilterRejected(
+	db: InstanceType<typeof Database>,
+	operationId: string,
+): void {
+	db.prepare(
+		"UPDATE sync_peers SET projects_include_json = '[\"other\"]' WHERE peer_device_id = 'owner-proven'",
+	).run();
+	expect(() => planShareProvisioning(db, { operationId, initiatingDeviceId: "owner" })).toThrow(
+		"inviter_project_access_ambiguous",
+	);
+}
+
 describe("exact project share provisioning", () => {
 	let db: InstanceType<typeof Database>;
 	let operationId: string;
-
 	beforeEach(() => {
 		db = new Database(":memory:");
 		initTestSchema(db);
@@ -147,7 +300,6 @@ describe("exact project share provisioning", () => {
 			projects: [{ canonical_identity: remote, display_name: "api", existing_memory_count: 2 }],
 		});
 	});
-
 	afterEach(() => db.close());
 
 	it("includes locally authored legacy origins without adopting replicated local sentinels", () => {
@@ -281,16 +433,9 @@ describe("exact project share provisioning", () => {
 			"unreviewed-source-member",
 		]);
 	});
-
-	it("fails closed when a reviewed inviter device no longer passes current project filters", () => {
-		db.prepare(
-			"UPDATE sync_peers SET projects_include_json = '[\"other\"]' WHERE peer_device_id = 'owner-proven'",
-		).run();
-		expect(() => planShareProvisioning(db, { operationId, initiatingDeviceId: "owner" })).toThrow(
-			"inviter_project_access_ambiguous",
-		);
-	});
-
+	it("fails closed when a reviewed inviter device no longer passes current project filters", () =>
+		expectInviterProjectFilterRejected(db, operationId));
+	it("waits for mapping edits", () => expectPublicationGate(db, operationId, dependencies().deps));
 	it("fails capability preflight before any boundary, migration, or mapping mutation", async () => {
 		const supportsReassignScope = vi.fn(async (deviceId: string) =>
 			deviceId === "unreviewed-source-member" ? "unsupported" : "supported",
@@ -1077,5 +1222,273 @@ describe("exact project share provisioning", () => {
 			step_key: `space_grant:${remote}:owner`,
 			safe_error_code: "recipient_policy_legacy_grant_blocked",
 		});
+	});
+});
+
+describe("historical repository share safeguards", () => {
+	it("rejects a stale cwd operation when recorded repository history is ambiguous", () => {
+		const db = new Database(":memory:");
+		try {
+			initTestSchema(db);
+			insertAcceptedLegacyCwdOperation(db, "share-ambiguous-cwd");
+			includeHistoricalRepositoryMemory(db, "share-ambiguous-cwd");
+			db.prepare(
+				"INSERT INTO sessions(started_at, cwd, project, metadata_json) VALUES (?, '/workspace/api', 'api', ?)",
+			).run(
+				createdAt,
+				JSON.stringify({
+					[REPOSITORY_IDENTITY_METADATA_KEY]: "https://example.invalid/acme/reused.git",
+				}),
+			);
+			expect(() =>
+				planShareProvisioning(db, {
+					operationId: "share-ambiguous-cwd",
+					initiatingDeviceId: "owner",
+				}),
+			).toThrow("operation_intent_invalid");
+		} finally {
+			db.close();
+		}
+	});
+
+	it("checks active policy under a pre-upgrade cwd before granting", async () => {
+		const db = new Database(":memory:");
+		try {
+			initTestSchema(db);
+			insertAcceptedLegacyCwdOperation(db, "share-legacy-policy");
+			includeHistoricalRepositoryMemory(db, "share-legacy-policy");
+			db.prepare(`INSERT INTO recipient_policy_authority_states(
+				canonical_project_identity, authority_state, generation, desired_devices_digest,
+				state_changed_at, created_at, updated_at
+			 ) VALUES ('/workspace/api', 'active', 1, 'revoked', ?, ?, ?)`).run(
+				createdAt,
+				createdAt,
+				createdAt,
+			);
+			const plan = planShareProvisioning(db, {
+				operationId: "share-legacy-policy",
+				initiatingDeviceId: "owner",
+			});
+			const dependencies = successfulProvisioningDependencies(
+				plan.projects[0]?.boundaryId ?? "missing",
+			);
+			await expect(
+				executeShareProvisioning(
+					db,
+					{ operationId: "share-legacy-policy", initiatingDeviceId: "owner" },
+					dependencies,
+				),
+			).rejects.toThrow("recipient_policy_legacy_grant_blocked");
+			expect(dependencies.grantMembership).not.toHaveBeenCalled();
+		} finally {
+			db.close();
+		}
+	});
+
+	it("rejects an existing canonical mapping before provisioning effects", async () => {
+		for (const [workspaceIdentity, pattern] of [
+			[remote, remote],
+			[null, remote],
+			[`${remote}/`, `${remote}/`],
+			["/workspace/api", "/workspace/api"],
+			[null, "/workspace/api"],
+			[null, "/workspace/api*"],
+		] as const) {
+			const db = new Database(":memory:");
+			try {
+				initTestSchema(db);
+				const operationId = "share-canonical-mapping-conflict";
+				insertAcceptedLegacyCwdOperation(db, operationId);
+				includeHistoricalRepositoryMemory(db, operationId);
+				const boundaryId =
+					planShareProvisioning(db, { operationId, initiatingDeviceId: "owner" }).projects[0]
+						?.boundaryId ?? "missing";
+				const deps = successfulProvisioningDependencies(boundaryId);
+				db.prepare(`INSERT INTO project_scope_mappings(
+					workspace_identity, project_pattern, scope_id, priority, source, created_at, updated_at
+				 ) VALUES (?, ?, 'other-scope', 1000, 'user', ?, ?)`).run(
+					workspaceIdentity,
+					pattern,
+					createdAt,
+					createdAt,
+				);
+				await expect(
+					executeShareProvisioning(db, { operationId, initiatingDeviceId: "owner" }, deps),
+				).rejects.toThrow("project_mapping_conflict");
+				expect(deps.createOrGetBoundary).not.toHaveBeenCalled();
+				expect(deps.grantMembership).not.toHaveBeenCalled();
+				expect(
+					db
+						.prepare("SELECT scope_id FROM memory_items WHERE import_key = 'historical:api'")
+						.pluck()
+						.get(),
+				).toBe("source-space");
+			} finally {
+				db.close();
+			}
+		}
+	});
+});
+
+describe("historical repository share provisioning", () => {
+	it("includes inferred cwd-only memories", () => {
+		const db = new Database(":memory:");
+		try {
+			initTestSchema(db);
+			db.prepare(`INSERT INTO actors(
+				actor_id, display_name, is_local, status, created_at, updated_at
+			 ) VALUES ('actor-owner', 'Owner', 1, 'active', ?, ?)`).run(createdAt, createdAt);
+			db.prepare(`INSERT INTO share_operations(
+				operation_id, state, inviter_actor_id, inviter_device_ids_json, person_id,
+				person_kind, teammate_name, history_policy, reviewed_project_set_digest,
+				coordinator_group_id, invite_token_digest, invite_expires_at,
+				recipient_actor_id, recipient_device_id, acceptance_consumed_at, created_at, updated_at
+			 ) VALUES ('share-historical', 'accepted', 'actor-owner', '["owner"]',
+				'actor-recipient', 'existing', 'Recipient', 'existing_and_future', 'digest',
+				'team', 'invite-digest', '2099-01-01T00:00:00.000Z', 'actor-recipient',
+				'recipient', ?, ?, ?)`).run(createdAt, createdAt, createdAt);
+			db.prepare(`INSERT INTO share_operation_projects(
+				operation_id, canonical_project_identity, display_name, identity_source,
+				existing_memory_count, ordinal
+			 ) VALUES ('share-historical', ?, 'api', 'git_remote', 1, 0)`).run(remote);
+			db.prepare(`INSERT INTO share_operation_steps(
+				operation_id, step_key, effect_id, status, updated_at
+			 ) VALUES ('share-historical', ?, 'managed-project:historical', 'pending', ?)`).run(
+				`managed_boundary:${remote}`,
+				createdAt,
+			);
+			includeHistoricalRepositoryMemory(db, "share-historical");
+		} finally {
+			db.close();
+		}
+	});
+
+	it("matches a pre-upgrade cwd share to its repository memories", () => {
+		const db = new Database(":memory:");
+		try {
+			initTestSchema(db);
+			db.prepare(`INSERT INTO actors(
+				actor_id, display_name, is_local, status, created_at, updated_at
+			 ) VALUES ('actor-owner', 'Owner', 1, 'active', ?, ?)`).run(createdAt, createdAt);
+			db.prepare(`INSERT INTO share_operations(
+				operation_id, state, inviter_actor_id, inviter_device_ids_json, person_id,
+				person_kind, teammate_name, history_policy, reviewed_project_set_digest,
+				coordinator_group_id, invite_token_digest, invite_expires_at,
+				recipient_actor_id, recipient_device_id, acceptance_consumed_at, created_at, updated_at
+			 ) VALUES ('share-pre-upgrade', 'accepted', 'actor-owner', '["owner"]',
+				'actor-recipient', 'existing', 'Recipient', 'existing_and_future', 'digest',
+				'team', 'invite-digest', '2099-01-01T00:00:00.000Z', 'actor-recipient',
+				'recipient', ?, ?, ?)`).run(createdAt, createdAt, createdAt);
+			db.prepare(`INSERT INTO share_operation_projects(
+				operation_id, canonical_project_identity, display_name, identity_source,
+				existing_memory_count, ordinal
+			 ) VALUES ('share-pre-upgrade', '/workspace/api', 'api', 'cwd', 1, 0)`).run();
+			db.prepare(`INSERT INTO share_operation_steps(
+				operation_id, step_key, effect_id, status, updated_at
+			 ) VALUES ('share-pre-upgrade', 'managed_boundary:/workspace/api',
+				'managed-project:pre-upgrade', 'pending', ?)`).run(createdAt);
+
+			includeHistoricalRepositoryMemory(db, "share-pre-upgrade");
+			db.prepare(
+				"INSERT INTO sessions(started_at, cwd, project, metadata_json) VALUES (?, '/workspace/api-worktree', 'api', ?)",
+			).run(createdAt, JSON.stringify({ [REPOSITORY_IDENTITY_METADATA_KEY]: remote }));
+			db.prepare(`INSERT INTO share_operation_projects(
+				operation_id, canonical_project_identity, display_name, identity_source,
+				existing_memory_count, ordinal
+			 ) VALUES ('share-pre-upgrade', '/workspace/api-worktree', 'api worktree', 'cwd', 1, 1)`).run();
+			db.prepare(`INSERT INTO share_operation_steps(
+				operation_id, step_key, effect_id, status, updated_at
+			 ) VALUES ('share-pre-upgrade', 'managed_boundary:/workspace/api-worktree',
+				'managed-project:pre-upgrade-worktree', 'pending', ?)`).run(createdAt);
+			expect(() =>
+				planShareProvisioning(db, {
+					operationId: "share-pre-upgrade",
+					initiatingDeviceId: "owner",
+				}),
+			).toThrow("operation_intent_invalid");
+		} finally {
+			db.close();
+		}
+	});
+
+	it("assigns a pre-upgrade cwd share through its canonical repository mapping", async () => {
+		const db = new Database(":memory:");
+		try {
+			initTestSchema(db);
+			db.prepare(`INSERT INTO actors(
+				actor_id, display_name, is_local, status, created_at, updated_at
+			 ) VALUES ('actor-owner', 'Owner', 1, 'active', ?, ?)`).run(createdAt, createdAt);
+			db.prepare(`INSERT INTO share_operations(
+				operation_id, state, inviter_actor_id, inviter_device_ids_json, person_id,
+				person_kind, teammate_name, history_policy, reviewed_project_set_digest,
+				coordinator_group_id, invite_token_digest, invite_expires_at,
+				recipient_actor_id, recipient_device_id, acceptance_consumed_at, created_at, updated_at
+			 ) VALUES ('share-canonical-upgrade', 'accepted', 'actor-owner', '["owner"]',
+				'actor-recipient', 'existing', 'Recipient', 'existing_and_future', 'digest',
+				'team', 'invite-digest', '2099-01-01T00:00:00.000Z', 'actor-recipient',
+				'recipient', ?, ?, ?)`).run(createdAt, createdAt, createdAt);
+			db.prepare(`INSERT INTO share_operation_projects(
+				operation_id, canonical_project_identity, display_name, identity_source,
+				existing_memory_count, ordinal
+			 ) VALUES ('share-canonical-upgrade', '/workspace/api', 'api', 'cwd', 1, 0)`).run();
+			db.prepare(`INSERT INTO share_operation_steps(
+				operation_id, step_key, effect_id, status, updated_at
+			 ) VALUES ('share-canonical-upgrade', 'managed_boundary:/workspace/api',
+				'managed-project:canonical-upgrade', 'pending', ?)`).run(createdAt);
+			includeHistoricalRepositoryMemory(db, "share-canonical-upgrade");
+			const plan = planShareProvisioning(db, {
+				operationId: "share-canonical-upgrade",
+				initiatingDeviceId: "owner",
+			});
+			expect(plan.projects[0]).toMatchObject({
+				canonicalIdentity: remote,
+				operationIdentity: "/workspace/api",
+			});
+			const boundaryId = plan.projects[0]?.boundaryId ?? "missing";
+			await executeShareProvisioning(
+				db,
+				{ operationId: "share-canonical-upgrade", initiatingDeviceId: "owner" },
+				{
+					createOrGetBoundary: vi.fn(async () => ({
+						scope_id: boundaryId,
+						label: "api",
+						kind: "managed_project",
+						authority_type: "coordinator",
+						coordinator_id: "coord",
+						group_id: "team",
+						manifest_issuer_device_id: null,
+						membership_epoch: 1,
+						manifest_hash: null,
+						status: "active",
+						created_at: createdAt,
+						updated_at: createdAt,
+					})),
+					grantMembership: vi.fn(async ({ scopeId, deviceId, role }) => ({
+						scope_id: scopeId,
+						device_id: deviceId,
+						role,
+						status: "active",
+						membership_epoch: 1,
+						coordinator_id: "coord",
+						group_id: "team",
+						manifest_issuer_device_id: null,
+						manifest_hash: null,
+						signed_manifest_json: null,
+						updated_at: createdAt,
+					})),
+					supportsReassignScope: vi.fn(async () => "supported"),
+					refreshAuthorization: vi.fn(async () => undefined),
+					runInitialSync: vi.fn(async () => ({
+						ok: true,
+						perScopeResults: [{ scope_id: boundaryId, ok: true }],
+					})),
+				},
+			);
+			expect(
+				db.prepare("SELECT workspace_identity, project_pattern FROM project_scope_mappings").get(),
+			).toEqual({ workspace_identity: remote, project_pattern: remote });
+		} finally {
+			db.close();
+		}
 	});
 });

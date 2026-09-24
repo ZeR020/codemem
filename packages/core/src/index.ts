@@ -5,7 +5,7 @@
  * and type definitions shared across the codemem TS backend.
  */
 
-export const VERSION = "0.46.0-alpha.2";
+export const VERSION = "0.46.0-beta.2";
 
 export * as Api from "./api-types.js";
 export { extractApplyPatchPaths, MUTATING_TOOL_NAMES } from "./apply-patch.js";
@@ -229,6 +229,8 @@ export {
 	commitDeviceIdentityBindings,
 	DEVICE_IDENTITY_BINDING_VERSION,
 	previewDeviceIdentityBindings,
+	wakeRecipientPoliciesForIdentities,
+	wakeRecipientPoliciesForProjectIdentities,
 } from "./device-identity-binding.js";
 export type {
 	DeviceIdentityBindingEvidence,
@@ -759,6 +761,7 @@ export {
 	projectClause,
 	projectColumnClause,
 	projectMatchesFilter,
+	repositoryIdentityFromMetadata,
 	resolveProject,
 	resolveProjectRoot,
 } from "./project.js";
@@ -795,6 +798,8 @@ export type {
 } from "./project-scope-settings.js";
 export {
 	analyzeProjectScopeMappingChangeGuardrails,
+	analyzeProjectScopeMappingChangesGuardrails,
+	analyzeProjectScopeMappingDeletionGuardrails,
 	deleteProjectScopeSettingsMapping,
 	listProjectScopeCandidates,
 	listProjectScopeInventory,
@@ -802,6 +807,7 @@ export {
 	listSharingDomainSettingsScopes,
 	reassignProjectScopeInventoryProject,
 	upsertProjectScopeSettingsMapping,
+	upsertProjectScopeSettingsMappings,
 } from "./project-scope-settings.js";
 export * from "./prompt-pack-ledger.js";
 export * from "./prompt-transport.js";
@@ -1019,6 +1025,11 @@ export { clearMemoryRefs, normalizeConcept, populateMemoryRefs } from "./ref-pop
 export type { RefQueryOptions, RefQueryResult } from "./ref-queries.js";
 export { findByConcept, findByFile } from "./ref-queries.js";
 export * from "./release-discovery.js";
+export {
+	canonicalRepositoryProjectIdentity,
+	repositoryIdentitiesByWorkspace,
+	repositoryIdentityForWorkspace,
+} from "./repository-mapping-aliases.js";
 export * from "./retrieval-ledger.js";
 export * from "./retrieval-surface-ledger.js";
 export type {

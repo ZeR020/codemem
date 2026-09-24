@@ -37,8 +37,20 @@ function assertReusedCwdIdentity(store: MemoryStore, tmpDir: string): void {
 	const inventory = listProjectScopeInventory(store.db, { limit: 10 });
 	expect(inventory.projects).toHaveLength(2);
 	expect(
-		inventory.projects.find((project) => project.workspace_identity === repoRoot),
+		inventory.projects.find(
+			(project) => project.workspace_identity === "https://example.test/acme/repository.git",
+		),
 	).toMatchObject({ session_count: 2 });
+	store.db
+		.prepare(
+			`INSERT INTO project_scope_mappings(
+				workspace_identity, project_pattern, scope_id, priority, source, created_at, updated_at
+			 ) VALUES (?, 'repository', 'repository-scope', 10, 'user', '2026-09-22', '2026-09-22')`,
+		)
+		.run("https://example.test/acme/repository.git");
+	expect(resolveSessionScopeId(store.db, { sessionId: historicalSessionId })).toBe(
+		"repository-scope",
+	);
 }
 
 describe("raw-event session repository identity", () => {
@@ -64,22 +76,28 @@ describe("raw-event session repository identity", () => {
 		rmSync(tmpDir, { recursive: true, force: true });
 	});
 
-	it("keeps repository grouping separate from canonical session identity", () => {
+	it("uses one canonical repository Project for its main checkout and linked worktrees", () => {
 		const mainRepo = join(tmpDir, "main", "repository");
 		const worktree = join(tmpDir, "external", "worktree");
 		const worktreeGitDir = join(mainRepo, ".git", "worktrees", "external");
 		mkdirSync(worktreeGitDir, { recursive: true });
 		mkdirSync(worktree, { recursive: true });
+		writeFileSync(join(worktreeGitDir, "commondir"), "../..\n");
+		writeFileSync(join(worktree, ".git"), `gitdir: ${worktreeGitDir}\n`);
+		const sessionId = Number(
+			store.db
+				.prepare(
+					"INSERT INTO sessions(started_at, cwd, project, metadata_json) VALUES (?, ?, 'repository', '{}')",
+				)
+				.run("2026-09-21T00:00:00.000Z", worktree).lastInsertRowid,
+		);
 		writeFileSync(
 			join(mainRepo, ".git", "config"),
 			'[remote "origin"]\n\turl = https://example.test/acme/repository.git\n',
 		);
-		writeFileSync(join(worktreeGitDir, "commondir"), "../..\n");
-		writeFileSync(join(worktree, ".git"), `gitdir: ${worktreeGitDir}\n`);
-
-		const sessionId = store.getOrCreateSessionForOpencodeSession({
-			opencodeSessionId: "session-worktree",
-			cwd: worktree,
+		const mainSessionId = store.getOrCreateSessionForOpencodeSession({
+			opencodeSessionId: "session-main",
+			cwd: mainRepo,
 			project: "repository",
 			metadata: { [REPOSITORY_IDENTITY_METADATA_KEY]: "untrusted-override" },
 		});
@@ -87,13 +105,39 @@ describe("raw-event session repository identity", () => {
 		expect(
 			store.db
 				.prepare("SELECT cwd, git_remote, metadata_json FROM sessions WHERE id = ?")
-				.get(sessionId),
+				.get(mainSessionId),
 		).toEqual({
-			cwd: worktree,
+			cwd: mainRepo,
 			git_remote: null,
 			metadata_json: JSON.stringify({
 				[REPOSITORY_IDENTITY_METADATA_KEY]: "https://example.test/acme/repository.git",
 			}),
+		});
+		const inventory = listProjectScopeInventory(store.db, { limit: 10 });
+		expect(inventory.projects).toHaveLength(1);
+		expect(inventory.projects[0]).toMatchObject({
+			repository_identity: "https://example.test/acme/repository.git",
+			session_count: 2,
+			workspace_identity: "https://example.test/acme/repository.git",
+			worktrees: expect.arrayContaining([
+				expect.objectContaining({ cwd: mainRepo }),
+				expect.objectContaining({ cwd: worktree }),
+			]),
+		});
+		store.db
+			.prepare(
+				`INSERT INTO project_scope_mappings(
+					workspace_identity, project_pattern, scope_id, priority, source, created_at, updated_at
+				 ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			)
+			.run(mainRepo, "repository", "legacy-cwd-scope", 10, "user", "2026-09-21", "2026-09-21");
+		expect(resolveSessionScopeId(store.db, { sessionId: mainSessionId })).toBe("legacy-cwd-scope");
+		expect(resolveSessionScopeId(store.db, { sessionId })).toBe("legacy-cwd-scope");
+		const mappedInventory = listProjectScopeInventory(store.db, { limit: 10 });
+		expect(mappedInventory.projects).toHaveLength(1);
+		expect(mappedInventory.projects[0]).toMatchObject({
+			resolved_scope_id: "legacy-cwd-scope",
+			workspace_identity: "https://example.test/acme/repository.git",
 		});
 	});
 

@@ -1,4 +1,17 @@
+import { isAbsolute } from "node:path";
 import type { Database } from "./db.js";
+import { resolveGitRepositoryIdentity } from "./project.js";
+import { repositoryIdentitiesFromIndexedEvidence } from "./repository-discovery-cache.js";
+import {
+	discoverKnownRepositoryIdentity,
+	hasConflictingRepositoryMappings,
+	hasRecordedRepositoryWorkspace,
+	normalizeRepositoryWorkspaceIdentity,
+	recordedRepositoryIdentityEvidenceByWorkspace,
+	repositoryIdentitiesByWorkspace,
+	repositoryIdentityForWorkspace,
+	withRepositoryMappingAliasesFromIdentities,
+} from "./repository-mapping-aliases.js";
 import {
 	LOCAL_DEFAULT_SCOPE_ID,
 	resolveProjectScope,
@@ -10,6 +23,47 @@ interface SessionScopeRow {
 	project: string | null;
 	git_remote: string | null;
 	git_branch: string | null;
+	metadata_json: string | null;
+}
+
+type IndexedRepositoryEvidence = NonNullable<
+	ReturnType<typeof repositoryIdentitiesFromIndexedEvidence>
+>;
+
+function refreshMappedWorkspace(
+	indexed: IndexedRepositoryEvidence,
+	workspace: string | null | undefined,
+	currentCwd: string | null,
+): void {
+	const mapped = normalizeRepositoryWorkspaceIdentity(workspace);
+	if (!mapped || mapped === currentCwd || indexed.workspaces.has(mapped)) return;
+	indexed.identities.delete(mapped);
+	const identity = discoverKnownRepositoryIdentity(mapped, indexed.known);
+	if (identity) indexed.identities.set(mapped, identity);
+}
+
+function refreshIndexedWorkspaces(
+	indexed: IndexedRepositoryEvidence,
+	row: SessionScopeRow | null,
+	mappedWorkspaces: Array<string | null | undefined>,
+): Set<string> {
+	const cwd = normalizeRepositoryWorkspaceIdentity(row?.cwd);
+	const recordedWorkspaces = new Set<string>();
+	if (cwd && hasRecordedRepositoryWorkspace(indexed.identities, cwd)) {
+		recordedWorkspaces.add(cwd);
+	} else if (cwd) {
+		indexed.identities.delete(cwd);
+		if (isAbsolute(cwd)) {
+			const identity = normalizeRepositoryWorkspaceIdentity(
+				resolveGitRepositoryIdentity(row?.cwd ?? cwd)?.identity,
+			);
+			if (identity && indexed.known.has(identity)) indexed.identities.set(cwd, identity);
+		}
+	}
+	for (const workspace of mappedWorkspaces) {
+		refreshMappedWorkspace(indexed, workspace, cwd);
+	}
+	return recordedWorkspaces;
 }
 
 interface MemoryScopeRow extends SessionScopeRow {
@@ -24,6 +78,12 @@ export interface ResolveSessionScopeOptions {
 	workspaceId?: string | null;
 	explicitScopeId?: string | null;
 	localDefaultScopeId?: string;
+}
+
+interface RepositoryScopeContext {
+	allowRepositoryCwdFallback: boolean;
+	mappings: ScopeMapping[];
+	repositoryIdentity: string | null;
 }
 
 function clean(value: string | null | undefined): string | null {
@@ -42,24 +102,171 @@ function loadProjectScopeMappings(db: Database): ScopeMapping[] {
 		.all() as ScopeMapping[];
 }
 
+function hasRepositoryConflict(
+	mappings: ScopeMapping[],
+	repositoryIdentities: ReadonlyMap<string, string>,
+	repositoryIdentity: string | null,
+): boolean {
+	return Boolean(
+		repositoryIdentity &&
+			hasConflictingRepositoryMappings(mappings, repositoryIdentities, repositoryIdentity),
+	);
+}
+
+function emptyRepositoryScopeContext(
+	row: SessionScopeRow | null,
+	mappings: ScopeMapping[],
+): RepositoryScopeContext {
+	return {
+		allowRepositoryCwdFallback: true,
+		mappings,
+		repositoryIdentity: repositoryIdentityForWorkspace(new Map(), {
+			cwd: row?.cwd,
+			gitRemote: row?.git_remote ?? null,
+			metadataJson: row?.metadata_json,
+		}),
+	};
+}
+
+function addDiscoveredRepositoryWorkspaces(
+	db: Database,
+	repositoryIdentities: Map<string, string>,
+	repositoryIdentity: string,
+	mappedWorkspaces: Array<string | null | undefined>,
+): void {
+	const discoveredWorkspaces = repositoryIdentitiesByWorkspace(db, {
+		knownRepositoryIdentities: [repositoryIdentity, ...mappedWorkspaces],
+	});
+	for (const [workspace, identity] of discoveredWorkspaces) {
+		if (identity === repositoryIdentity) repositoryIdentities.set(workspace, identity);
+	}
+}
+
+function scopeRepositoryEvidence(
+	db: Database,
+	row: SessionScopeRow | null,
+	mappedWorkspaces: Array<string | null | undefined>,
+	mappingIdentitySeeds: Array<string | null | undefined>,
+) {
+	const indexed = repositoryIdentitiesFromIndexedEvidence(db, mappingIdentitySeeds);
+	const legacy = () => ({
+		evidence: recordedRepositoryIdentityEvidenceByWorkspace(db, [row?.cwd, ...mappedWorkspaces], {
+			freshWorkspaces: [row?.cwd],
+		}),
+		indexed: false,
+	});
+	if (!indexed) return legacy();
+	const recordedWorkspaces = refreshIndexedWorkspaces(indexed, row, mappedWorkspaces);
+	return {
+		evidence: { byWorkspace: indexed.identities, recordedWorkspaces },
+		indexed: true,
+	};
+}
+
+function discoverCurrentWorkspace(
+	cwd: string | null,
+	repositoryIdentities: Map<string, string>,
+	recordedWorkspaces: ReadonlySet<string>,
+	mappingIdentitySeeds: Array<string | null | undefined>,
+): void {
+	if (!cwd || recordedWorkspaces.has(cwd)) return;
+	const known = new Set(
+		[
+			...repositoryIdentities.values(),
+			...mappingIdentitySeeds.map((identity) => normalizeRepositoryWorkspaceIdentity(identity)),
+		].filter((identity): identity is string => identity != null),
+	);
+	const identity = discoverKnownRepositoryIdentity(cwd, known);
+	if (identity) repositoryIdentities.set(cwd, identity);
+}
+
+function repositoryScopeContext(
+	db: Database,
+	row: SessionScopeRow | null,
+	mappings: ScopeMapping[],
+): RepositoryScopeContext {
+	if (mappings.length === 0) return emptyRepositoryScopeContext(row, mappings);
+	const mappedWorkspaces = mappings.map((mapping) => mapping.workspace_identity);
+	const mappingIdentitySeeds = mappings.flatMap((mapping) => [
+		mapping.workspace_identity,
+		mapping.project_pattern,
+	]);
+	const { evidence, indexed } = scopeRepositoryEvidence(
+		db,
+		row,
+		mappedWorkspaces,
+		mappingIdentitySeeds,
+	);
+	const repositoryIdentities = evidence.byWorkspace;
+	const cwd = normalizeRepositoryWorkspaceIdentity(row?.cwd);
+	const ambiguousCwd = Boolean(
+		cwd && evidence.recordedWorkspaces.has(cwd) && !repositoryIdentities.has(cwd),
+	);
+	if (!indexed)
+		discoverCurrentWorkspace(
+			cwd,
+			repositoryIdentities,
+			evidence.recordedWorkspaces,
+			mappingIdentitySeeds,
+		);
+	const repositoryIdentity = repositoryIdentityForWorkspace(repositoryIdentities, {
+		cwd: row?.cwd,
+		gitRemote: row?.git_remote ?? null,
+		metadataJson: row?.metadata_json,
+	});
+	if (repositoryIdentity && !indexed) {
+		addDiscoveredRepositoryWorkspaces(
+			db,
+			repositoryIdentities,
+			repositoryIdentity,
+			mappingIdentitySeeds,
+		);
+	}
+	const repositoryConflict = hasRepositoryConflict(
+		mappings,
+		repositoryIdentities,
+		repositoryIdentity,
+	);
+	const unresolvedAmbiguousCwd = ambiguousCwd && !repositoryIdentity;
+	let effectiveMappings = mappings;
+	if (repositoryConflict || unresolvedAmbiguousCwd) {
+		effectiveMappings = [];
+	} else if (!ambiguousCwd) {
+		effectiveMappings = withRepositoryMappingAliasesFromIdentities(mappings, repositoryIdentities, {
+			discoverFilesystem: true,
+		});
+	}
+	return {
+		allowRepositoryCwdFallback: !ambiguousCwd && !repositoryConflict,
+		mappings: effectiveMappings,
+		repositoryIdentity,
+	};
+}
+
 function loadSessionScopeRow(db: Database, sessionId: number): SessionScopeRow | null {
 	const row = db
-		.prepare("SELECT cwd, project, git_remote, git_branch FROM sessions WHERE id = ? LIMIT 1")
+		.prepare(
+			"SELECT cwd, project, git_remote, git_branch, metadata_json FROM sessions WHERE id = ? LIMIT 1",
+		)
 		.get(sessionId) as SessionScopeRow | undefined;
 	return row ?? null;
 }
 
 export function resolveSessionScopeId(db: Database, options: ResolveSessionScopeOptions): string {
+	const explicitScopeId = clean(options.explicitScopeId);
+	if (explicitScopeId) return explicitScopeId;
 	const session = loadSessionScopeRow(db, options.sessionId);
+	const context = repositoryScopeContext(db, session, loadProjectScopeMappings(db));
 	const result = resolveProjectScope({
+		allowRepositoryCwdFallback: context.allowRepositoryCwdFallback,
 		gitRemote: session?.git_remote ?? null,
 		gitBranch: session?.git_branch ?? null,
+		repositoryIdentity: context.repositoryIdentity,
 		cwd: session?.cwd ?? null,
 		project: session?.project ?? null,
 		workspaceId: options.workspaceId ?? null,
-		explicitScopeId: options.explicitScopeId ?? null,
 		localDefaultScopeId: options.localDefaultScopeId ?? LOCAL_DEFAULT_SCOPE_ID,
-		mappings: loadProjectScopeMappings(db),
+		mappings: context.mappings,
 	});
 	return result.scopeId;
 }
@@ -75,7 +282,8 @@ function loadMemoryScopeRow(db: Database, memoryId: number): MemoryScopeRow | nu
 				s.cwd,
 				s.project,
 				s.git_remote,
-				s.git_branch
+				s.git_branch,
+				s.metadata_json
 			 FROM memory_items mi
 			 LEFT JOIN sessions s ON s.id = mi.session_id
 			 WHERE mi.id = ?
@@ -90,15 +298,17 @@ export function ensureMemoryScopeId(db: Database, memoryId: number): string | nu
 	if (!row) return null;
 	const existingScopeId = clean(row.scope_id);
 	if (existingScopeId) return existingScopeId;
-
+	const context = repositoryScopeContext(db, row, loadProjectScopeMappings(db));
 	const result = resolveProjectScope({
+		allowRepositoryCwdFallback: context.allowRepositoryCwdFallback,
 		gitRemote: row.git_remote,
 		gitBranch: row.git_branch,
+		repositoryIdentity: context.repositoryIdentity,
 		cwd: row.cwd,
 		project: row.project,
 		workspaceId: row.workspace_id,
 		localDefaultScopeId: LOCAL_DEFAULT_SCOPE_ID,
-		mappings: loadProjectScopeMappings(db),
+		mappings: context.mappings,
 	});
 	db.prepare(
 		`UPDATE memory_items

@@ -51,13 +51,13 @@ Keep `.opencode/.npmrc` pinned to the public npm registry:
 
 npm sets `latest` on a package's first-ever version regardless of `--tag`. A new package whose debut is a prerelease therefore exposes that prerelease to untagged installs (`npm install <pkg>`).
 
-The release workflow cannot fix this automatically: OIDC trusted publishing grants `publish` only, not dist-tag mutation. Instead, a post-publish step runs `scripts/release-latest-guard.mjs` in verify mode and reports any package whose `latest` points at a prerelease. Fix it once, by hand, from a machine with an npm login:
+The release workflow cannot fix this automatically: OIDC trusted publishing grants `publish` only, not dist-tag mutation. Instead, a post-publish step runs `scripts/release-latest-guard.mjs` in verify mode and reports any package whose `latest` points at a prerelease. Attempt the cleanup from a machine with an npm login:
 
 ```fish
 node scripts/release-latest-guard.mjs --apply <package>
 ```
 
-The guard only removes; it never adds or moves `latest`, so an established package's stable `latest` is untouched. Until a package's first stable release, untagged installs of it correctly fail with "no matching version". The verify step is `continue-on-error` while any package is still dirty; flip it to a hard gate once the guard reports clean.
+The guard only removes; it never adds or moves `latest`, so an established package's stable `latest` is untouched. npm may reject removal when the prerelease is the package's only `latest` version; in that case, keep prerelease installs on explicit channel tags until the first stable release moves `latest`. The verify step is `continue-on-error` while any package is still dirty; flip it to a hard gate once the guard reports clean.
 
 ## Release tag preflight
 
@@ -158,7 +158,10 @@ This is a breaking host-compatibility change from Codemem 0.44; upgrade OpenCode
 before installing the 0.45 plugin.
 
 Dependabot continues to propose SDK updates, but accepting one requires updating
-all checked-in runtime pins together. CI keeps the minimum host gate fixed at
+all checked-in SDK pins together. The published dependency and both nested
+runtime manifests use the same exact SDK version; that version can be newer
+than the supported host floor. CI explicitly installs the minimum SDK with
+`--no-save` and keeps the minimum host gate and `engines.opencode` fixed at
 1.18.29 until the documented compatibility floor changes. The ignored
 `.opencode/package.json` is only a local contributor runtime and is not a release
 pin. Refresh it when testing the minimum host locally:
@@ -168,27 +171,31 @@ npm install --prefix .opencode --save-exact @opencode-ai/plugin@1.18.29
 ```
 
 The same 0.45 package also runs on OpenCode 2 through its `setup()` entrypoint.
-Codemem validates that path against the exact stable `@opencode/cli@2.0.2` and
-`@opencode/plugin@2.0.2` releases and labels its OpenCode 2 integration beta.
+Codemem validates that path against the exact stable `@opencode/cli@2.0.12` and
+`@opencode/plugin@2.0.12` releases and labels its OpenCode 2 integration beta.
 `codemem setup --opencode-only` keeps writing the singular `plugin` key because
 OpenCode 1 requires it and OpenCode 2 translates it. Required CI gates run only
-against the 1.18.29 floor and the exact 2.0.2 pin; any compatibility run against
+against the 1.18.29 floor and the exact 2.0.12 pin; any compatibility run against
 a newer or moving OpenCode release is advisory and never blocks a Codemem change
 until the pin moves in its own reviewed PR. Rollback is a host-edge change:
 disable the V2 path with `CODEMEM_PLUGIN_IGNORE=1` or return to OpenCode 1
 without any database migration.
 
-The OpenCode 2 contract separately pins matching `@opencode/cli@2.0.2` and
-`@opencode/plugin@2.0.2` development dependencies. The workspace
+The OpenCode 2 contract separately pins matching `@opencode/cli@2.0.12` and
+`@opencode/plugin@2.0.12` packages. The workspace
 allows the CLI package's postinstall because it installs the matching platform
-binary used by the packed-host smoke test. For 2.0.2, the independently reviewed
-postinstall selects an exact optional platform package, detects AVX2 support with
+binary used by the packed-host smoke test. The 2.0.12 postinstall is byte-identical
+to the independently reviewed 2.0.2 script. It selects an exact optional platform package, detects AVX2 support with
 `sysctl` on macOS or PowerShell on Windows, and hard-links or copies its binary.
 If the optional package is absent, it installs that exact package in a temporary
 directory before copying and verifying the binary. Re-review the postinstall
 whenever the exact pin changes. Update both revisions together and rerun the
 executable checks documented in [the OpenCode 2 contract](opencode-v2-contract.md);
 do not replace these pins with a moving tag or semver range.
+
+The approved minimum-release-age exception covers only the exact OpenCode 2.0.12
+packages listed in `pnpm-workspace.yaml`. Remove those exceptions once the
+versions clear the configured release-age window.
 
 Override for testing:
 

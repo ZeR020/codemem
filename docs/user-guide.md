@@ -2,18 +2,11 @@
 
 ## Explore the viewer
 
-The Feed shows captured memories with full titles and the complete selected Summary, Facts, or Narrative open by default. Select a title to collapse or reopen its content and supplemental provenance; use search to narrow the list.
+The Feed shows captured memories in the same order used when packing context: the full title, narrative, then every fact. Cards open by default; use **Collapse memory** or **Expand memory** to hide or reveal content and supplemental provenance, and use search to narrow the list.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="images/docs-feed-dark.png">
   <img alt="Feed showing captured memories" src="images/docs-feed-light.png">
-</picture>
-
-Select **Facts** on a memory to review its extracted facts without leaving the Feed.
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="images/docs-memory-facts-dark.png">
-  <img alt="Extracted facts for a memory in the Feed" src="images/docs-memory-facts.png">
 </picture>
 
 Optionally, use **Projects** to review project-level information. This example uses synthetic fixture data: its two Sharing review findings are informational, show no recipients, and do not show a successful sharing or sync flow.
@@ -232,7 +225,7 @@ Command/file token caching notes:
 
 ## Automatic context injection
 - The OpenCode 1 plugin injects a memory pack next to the latest user message by default, keeping older prompt prefixes stable for provider prompt caches.
-- The OpenCode 2 entrypoint (beta integration, validated on the exact stable OpenCode 2.0.2 release) captures activity, manages lifecycle cleanup, and exposes manual `mem-status`, `mem-recent`, and `mem-stats` tools through `tool.transform` with `codemode: false`. On OpenCode 2.0.2, automatic recall runs through `session.context` when the latest user message has a non-empty ID. Each identified turn performs one fresh retrieval, while retries and tool continuations replay retained context; missing or blank identity skips safely. Auxiliary hooks remain isolated; see the [pinned contract](opencode-v2-contract.md). To stop the OpenCode 2 path or return to OpenCode 1.18.29+, follow [troubleshooting and rollback](plugin-reference.md#opencode-host-support-troubleshooting-and-rollback); no database migration is needed.
+- The OpenCode 2 entrypoint (beta integration, validated on the exact stable OpenCode 2.0.12 release) captures activity, manages lifecycle cleanup, and exposes manual `mem-status`, `mem-recent`, and `mem-stats` tools through `tool.transform` with `codemode: false`. On OpenCode 2.0.12, automatic recall runs through `session.context` when the latest user message has a non-empty ID. Each identified turn performs one fresh retrieval, while retries and tool continuations replay retained context; missing or blank identity skips safely. Auxiliary hooks remain isolated; see the [pinned contract](opencode-v2-contract.md). To stop the OpenCode 2 path or return to OpenCode 1.18.29+, follow [troubleshooting and rollback](plugin-reference.md#opencode-host-support-troubleshooting-and-rollback); no database migration is needed.
 - OpenCode 1 controls:
   - `CODEMEM_INJECT_CONTEXT=0` disables injection.
   - `CODEMEM_INJECT_SURFACE=system` uses the legacy OpenCode system-prompt injection surface.
@@ -306,6 +299,8 @@ The normal flow is **Projects → Sharing → Devices → Health**, not manual p
 - **Add device** — invite another device for an existing Identity and review the Projects it will inherit from that Identity's direct and Team access.
 
 Team membership organizes people and devices, but it is not permission to every Project—only Projects explicitly assigned to that Team. Project access remains explicit and uses canonical Project identity.
+
+When **Projects** shows sharing decisions, review each row's choice before applying it. Use the row checkboxes and **Apply selected** for a subset, or **Apply all** to apply every choice that is ready; choices that still require recipient input remain unapplied.
 
 **Advanced → Coordinator Administration** keeps the last successfully loaded coordinator groups, Spaces, join requests, devices, and status visible if a refresh fails. A bounded notice names stale or unavailable sections and provides **Retry**. Mutations that require current coordinator state remain disabled until refresh succeeds; retained rows and counts do not imply deletion, and a section that has never loaded is shown as unavailable rather than empty.
 
@@ -433,7 +428,7 @@ Optional legacy filters can narrow an already-authorized peer's data; they canno
 Normal sharing uses product terms:
 
 - A **Team** organizes collaborating people and their devices. Team membership can supply inherited access only to Projects explicitly shared with that Team.
-- A **Project** is the exact canonical workspace selected for sharing, not every workspace with a similar display name.
+- A **Project** is the canonical repository selected for sharing. Linked worktrees are member paths of that Project, while unrelated repositories with similar names remain separate.
 - A **Space** is the user-facing access boundary that groups related Projects.
 
 Advanced screens and diagnostics may call a Space a **Sharing domain**, a coordinator group an administrative container, and the stored boundary a `scope_id`. Those internal terms explain enforcement; users do not need them to share a Project or add a device. Coordinator-group membership alone never grants Project access.
@@ -460,6 +455,13 @@ Safe defaults:
 - Broad mappings or basename collisions should be reviewed before you rely on
   them. If `codemem` exists under both work and personal paths, map the canonical
   workspace path/remote instead of trusting the basename.
+- Removing a Local-only project mapping can expose existing memories through a
+  fallback Sharing domain. Review the access warning and select Remove again to
+  confirm; if mappings change in between, review the new warning first.
+- Assigning a shared mapping to a Project with existing Local memories also
+  requires reviewing and confirming the access change before those memories move.
+- Sharing a Project stops before granting access if its repository is already
+  assigned to a different Space; resolve that mapping conflict first.
 
 For a mixed personal/work laptop, start conservatively:
 
@@ -475,6 +477,10 @@ For a mixed personal/work laptop, start conservatively:
 Do not treat coordinator-group membership as data access. A coordinator group can help discover and administer devices, but a device still needs Project access through a direct recipient or Team policy before it can receive those memories.
 
 ### Upgrade maintenance / Sharing-domain backfill
+
+Schema version 21 adds a recipient-policy wake counter on startup. Policy edits made
+while reconciliation is running remain due for a follow-up pass; existing databases
+gain the column automatically.
 
 When upgrading an existing database to 0.30, codemem may run a one-time
 Sharing-domain backfill. This stamps historical memories and sync bookkeeping

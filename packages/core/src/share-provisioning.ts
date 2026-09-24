@@ -2,7 +2,22 @@ import { createHash } from "node:crypto";
 import type { CoordinatorScope, CoordinatorScopeMembership } from "./coordinator-store-contract.js";
 import { type Database, fromJson } from "./db.js";
 import { assertLegacyShareGrantAllowed } from "./recipient-policy-reconciler.js";
-import { canonicalWorkspaceIdentity } from "./scope-resolution.js";
+import { serializeRecipientPolicyPublicationMutation } from "./recipient-policy-team-metadata.js";
+import {
+	canonicalRepositoryProjectIdentity,
+	hasConflictingRepositoryMappings,
+	hasRecordedRepositoryWorkspace,
+	mappedScopeIdsForRepository,
+	normalizeRepositoryWorkspaceIdentity,
+	repositoryIdentitiesByWorkspace,
+	repositoryIdentityForWorkspace,
+	withRepositoryMappingAliasesFromIdentities,
+} from "./repository-mapping-aliases.js";
+import {
+	canonicalWorkspaceIdentity,
+	resolveProjectScope,
+	type ScopeMapping,
+} from "./scope-resolution.js";
 import {
 	DEFAULT_SYNC_SCOPE_ID,
 	recordReplicationOp,
@@ -13,6 +28,7 @@ import {
 
 export interface ManagedProjectPlan {
 	canonicalIdentity: string;
+	operationIdentity?: string;
 	displayName: string;
 	boundaryId: string;
 	memoryIds: number[];
@@ -20,6 +36,21 @@ export interface ManagedProjectPlan {
 	reassignedMemoryIds: number[];
 	memberDeviceIds: string[];
 	reassignmentSourceDeviceIds: string[];
+}
+
+function provisioningStepIdentity(project: ManagedProjectPlan): string {
+	return project.operationIdentity ?? project.canonicalIdentity;
+}
+
+function assertLegacyShareGrantForProject(
+	db: Database,
+	project: ManagedProjectPlan,
+	deviceId: string,
+): void {
+	for (const canonicalProjectIdentity of [project.canonicalIdentity, project.operationIdentity]) {
+		if (!canonicalProjectIdentity) continue;
+		assertLegacyShareGrantAllowed(db, { canonicalProjectIdentity, deviceId });
+	}
 }
 
 export interface ShareProvisioningPlan {
@@ -77,6 +108,7 @@ interface MemoryCandidateRow {
 	origin_device_id: string | null;
 	session_user: string | null;
 	session_tool_version: string | null;
+	session_metadata_json: string | null;
 }
 
 function clean(value: unknown): string | null {
@@ -125,7 +157,8 @@ function memoryCandidates(db: Database): MemoryCandidateRow[] {
 	return db
 		.prepare(`SELECT mi.id, mi.import_key, mi.visibility, mi.scope_id, mi.origin_device_id,
 			COALESCE(mi.project, s.project) AS project, s.cwd, s.git_remote, s.git_branch,
-			mi.workspace_id, s.user AS session_user, s.tool_version AS session_tool_version
+			mi.workspace_id, s.user AS session_user, s.tool_version AS session_tool_version,
+			s.metadata_json AS session_metadata_json
 		 FROM memory_items mi
 		 JOIN sessions s ON s.id = mi.session_id
 		 WHERE mi.active = 1`)
@@ -155,22 +188,33 @@ function isInitiatingDeviceMemory(row: MemoryCandidateRow, initiatingDeviceId: s
 	);
 }
 
+function memoryCandidateIdentity(
+	row: MemoryCandidateRow,
+	repositoryIdentities: ReadonlyMap<string, string>,
+): string {
+	return canonicalWorkspaceIdentity({
+		gitRemote: row.git_remote,
+		gitBranch: row.git_branch,
+		repositoryIdentity: repositoryIdentityForWorkspace(repositoryIdentities, {
+			cwd: row.cwd,
+			gitRemote: row.git_remote,
+			metadataJson: row.session_metadata_json,
+		}),
+		cwd: row.cwd,
+		project: row.project,
+		workspaceId: row.workspace_id,
+	}).value;
+}
+
 export function countShareableProjectMemories(
 	db: Database,
 	input: { canonicalIdentity: string; initiatingDeviceId: string },
 ): number {
+	const repositoryIdentities = repositoryIdentitiesByWorkspace(db);
 	return memoryCandidates(db).filter((row) => {
 		if (!shareableForManagedProject(row)) return false;
 		if (!isInitiatingDeviceMemory(row, input.initiatingDeviceId)) return false;
-		return (
-			canonicalWorkspaceIdentity({
-				gitRemote: row.git_remote,
-				gitBranch: row.git_branch,
-				cwd: row.cwd,
-				project: row.project,
-				workspaceId: row.workspace_id,
-			}).value === input.canonicalIdentity
-		);
+		return memoryCandidateIdentity(row, repositoryIdentities) === input.canonicalIdentity;
 	}).length;
 }
 
@@ -256,10 +300,73 @@ function projectAllowedPeerDeviceIds(db: Database, projectValues: Array<string |
 		.toSorted();
 }
 
-export function planShareProvisioning(
+interface ProvisioningMappingEvidence {
+	repositoryIdentities: ReadonlyMap<string, string>;
+	mappings: ScopeMapping[];
+	effectiveMappings: ScopeMapping[];
+}
+
+function loadProvisioningMappingEvidence(db: Database): ProvisioningMappingEvidence {
+	const mappings = db
+		.prepare(`SELECT id, workspace_identity, project_pattern, scope_id, priority, source, updated_at
+			FROM project_scope_mappings ORDER BY priority DESC, id ASC`)
+		.all() as ScopeMapping[];
+	const repositoryIdentities = repositoryIdentitiesByWorkspace(db, {
+		knownRepositoryIdentities: mappings.flatMap((mapping) => [
+			mapping.workspace_identity,
+			mapping.project_pattern,
+		]),
+	});
+	return {
+		repositoryIdentities,
+		mappings,
+		effectiveMappings: withRepositoryMappingAliasesFromIdentities(mappings, repositoryIdentities, {
+			discoverFilesystem: true,
+		}),
+	};
+}
+
+function assertValidProvisioningProjects(
+	projects: ProjectRow[],
+	evidence: ProvisioningMappingEvidence,
+): void {
+	const { repositoryIdentities, mappings } = evidence;
+	if (projects.length === 0) throw new Error("operation_intent_invalid");
+	if (
+		projects.some((project) => {
+			const identity = normalizeRepositoryWorkspaceIdentity(project.canonical_project_identity);
+			return (
+				hasRecordedRepositoryWorkspace(repositoryIdentities, project.canonical_project_identity) &&
+				Boolean(identity && !repositoryIdentities.has(identity))
+			);
+		})
+	) {
+		throw new Error("operation_intent_invalid");
+	}
+	const canonicalIdentities = projects.map((project) =>
+		canonicalRepositoryProjectIdentity(repositoryIdentities, project.canonical_project_identity),
+	);
+	if (new Set(canonicalIdentities).size !== canonicalIdentities.length) {
+		throw new Error("operation_intent_invalid");
+	}
+	if (
+		canonicalIdentities.some((identity) =>
+			hasConflictingRepositoryMappings(mappings, repositoryIdentities, identity),
+		)
+	) {
+		throw new Error("conflicting_repository_mappings");
+	}
+}
+
+function loadProvisioningContext(
 	db: Database,
 	input: { operationId: string; initiatingDeviceId: string },
-): ShareProvisioningPlan {
+): {
+	operation: OperationRow;
+	recipientDeviceId: string;
+	initiatingDeviceId: string;
+	inviterDeviceIds: string[];
+} {
 	const operation = db
 		.prepare(`SELECT operation_id, state, inviter_device_ids_json, coordinator_group_id,
 			recipient_device_id FROM share_operations WHERE operation_id = ?`)
@@ -279,133 +386,169 @@ export function planShareProvisioning(
 	}
 	const recipientDeviceId = clean(operation.recipient_device_id);
 	const initiatingDeviceId = clean(input.initiatingDeviceId);
-	if (!recipientDeviceId || !initiatingDeviceId)
+	if (!recipientDeviceId || !initiatingDeviceId) {
 		throw new Error("operation_device_binding_missing");
+	}
 	const inviterDeviceIds = parseStringList(operation.inviter_device_ids_json);
-	if (!inviterDeviceIds.includes(initiatingDeviceId))
+	if (!inviterDeviceIds.includes(initiatingDeviceId)) {
 		throw new Error("initiating_device_not_reviewed");
+	}
+	return { operation, recipientDeviceId, initiatingDeviceId, inviterDeviceIds };
+}
+
+function plannedMemberDeviceIds(
+	db: Database,
+	input: {
+		operationId: string;
+		projectIdentity: string;
+		initiatingDeviceId: string;
+		inviterDeviceIds: string[];
+		recipientDeviceId: string;
+		sourceScopeIds: string[];
+		projectNames: string[];
+	},
+): string[] {
+	const persisted = persistedProjectMembers(db, input.operationId, input.projectIdentity);
+	const requiresValidation = persisted.some(
+		(deviceId) =>
+			stepStatus(db, input.operationId, `space_grant:${input.projectIdentity}:${deviceId}`) !==
+			"completed",
+	);
+	const current =
+		persisted.length === 0 || requiresValidation
+			? [
+					...effectiveInviterDevices(db, {
+						initiatingDeviceId: input.initiatingDeviceId,
+						inviterDeviceIds: input.inviterDeviceIds,
+						sourceScopeIds: input.sourceScopeIds,
+						projectNames: input.projectNames,
+					}),
+					input.recipientDeviceId,
+				]
+			: persisted;
+	if (persisted.some((deviceId) => !current.includes(deviceId))) {
+		throw new Error("inviter_project_access_ambiguous");
+	}
+	const members = persisted.length > 0 ? persisted : current;
+	if (!members.includes(input.initiatingDeviceId) || !members.includes(input.recipientDeviceId)) {
+		throw new Error("provisioning_membership_plan_invalid");
+	}
+	if (
+		members.some(
+			(deviceId) =>
+				deviceId !== input.recipientDeviceId && !input.inviterDeviceIds.includes(deviceId),
+		)
+	) {
+		throw new Error("provisioning_membership_plan_invalid");
+	}
+	return members;
+}
+
+function reassignmentSourceDevices(
+	db: Database,
+	rows: MemoryCandidateRow[],
+	boundaryId: string,
+): string[] {
+	const scopeIds = [
+		...new Set(
+			rows
+				.map((row) => clean(row.scope_id) ?? DEFAULT_SYNC_SCOPE_ID)
+				.filter((scopeId) => scopeId !== boundaryId),
+		),
+	];
+	const defaultScopeProjects = rows
+		.filter((row) => (clean(row.scope_id) ?? DEFAULT_SYNC_SCOPE_ID) === DEFAULT_SYNC_SCOPE_ID)
+		.map((row) => clean(row.project));
+	return [
+		...new Set([
+			...activeScopeMemberDeviceIds(
+				db,
+				scopeIds.filter((scopeId) => scopeId !== DEFAULT_SYNC_SCOPE_ID),
+			),
+			...projectAllowedPeerDeviceIds(db, defaultScopeProjects),
+		]),
+	].toSorted();
+}
+
+function buildManagedProjectPlan(
+	db: Database,
+	project: ProjectRow,
+	candidates: MemoryCandidateRow[],
+	repositoryIdentities: ReadonlyMap<string, string>,
+	context: ReturnType<typeof loadProvisioningContext>,
+): ManagedProjectPlan {
+	const canonicalProjectIdentity = canonicalRepositoryProjectIdentity(
+		repositoryIdentities,
+		project.canonical_project_identity,
+	);
+	const matched = candidates.filter(
+		(row) =>
+			shareableForManagedProject(row) &&
+			isInitiatingDeviceMemory(row, context.initiatingDeviceId) &&
+			memoryCandidateIdentity(row, repositoryIdentities) === canonicalProjectIdentity,
+	);
+	const sourceScopeIds = [
+		...new Set(matched.map((row) => clean(row.scope_id) ?? "local-default")),
+	].toSorted();
+	const projectNames = [
+		...new Set(
+			matched.map((row) => clean(row.project)).filter((item): item is string => item != null),
+		),
+	].toSorted();
+	const memberDeviceIds = plannedMemberDeviceIds(db, {
+		...context,
+		operationId: context.operation.operation_id,
+		projectIdentity: project.canonical_project_identity,
+		sourceScopeIds,
+		projectNames,
+	});
+	const boundaryId = db
+		.prepare(`SELECT effect_id FROM share_operation_steps WHERE operation_id = ? AND step_key = ?`)
+		.pluck()
+		.get(
+			context.operation.operation_id,
+			`managed_boundary:${project.canonical_project_identity}`,
+		) as string;
+	const localOnlyRows = matched.filter((row) => neverReplicationEligible(db, row));
+	const reassignedRows = matched.filter((row) => !neverReplicationEligible(db, row));
+	return {
+		canonicalIdentity: canonicalProjectIdentity,
+		...(canonicalProjectIdentity === project.canonical_project_identity
+			? {}
+			: { operationIdentity: project.canonical_project_identity }),
+		displayName: project.display_name,
+		boundaryId,
+		memoryIds: matched.map((row) => row.id).toSorted((a, b) => a - b),
+		localOnlyMemoryIds: localOnlyRows.map((row) => row.id).toSorted((a, b) => a - b),
+		reassignedMemoryIds: reassignedRows.map((row) => row.id).toSorted((a, b) => a - b),
+		memberDeviceIds: [...new Set(memberDeviceIds)].toSorted(),
+		reassignmentSourceDeviceIds: reassignmentSourceDevices(db, reassignedRows, boundaryId),
+	};
+}
+
+export function planShareProvisioning(
+	db: Database,
+	input: { operationId: string; initiatingDeviceId: string },
+): ShareProvisioningPlan {
+	const context = loadProvisioningContext(db, input);
 	const projects = db
 		.prepare(`SELECT canonical_project_identity, display_name FROM share_operation_projects
 		 WHERE operation_id = ? ORDER BY ordinal`)
-		.all(operation.operation_id) as ProjectRow[];
-	if (projects.length === 0) throw new Error("operation_intent_invalid");
+		.all(context.operation.operation_id) as ProjectRow[];
+	const evidence = loadProvisioningMappingEvidence(db);
+	const repositoryIdentities = evidence.repositoryIdentities;
+	assertValidProvisioningProjects(projects, evidence);
 	const candidates = memoryCandidates(db);
-	const plans = projects.map((project): ManagedProjectPlan => {
-		const matched = candidates.filter((row) => {
-			if (!shareableForManagedProject(row)) return false;
-			if (!isInitiatingDeviceMemory(row, initiatingDeviceId)) return false;
-			const identity = canonicalWorkspaceIdentity({
-				gitRemote: row.git_remote,
-				gitBranch: row.git_branch,
-				cwd: row.cwd,
-				project: row.project,
-				workspaceId: row.workspace_id,
-			});
-			return identity.value === project.canonical_project_identity;
-		});
-		const sourceScopeIds = [
-			...new Set(matched.map((row) => clean(row.scope_id) ?? "local-default")),
-		].toSorted();
-		const projectNames = [
-			...new Set(
-				matched.map((row) => clean(row.project)).filter((item): item is string => item != null),
-			),
-		].toSorted();
-		const persistedMembers = persistedProjectMembers(
-			db,
-			operation.operation_id,
-			project.canonical_project_identity,
-		);
-		const persistedMembersNeedValidation = persistedMembers.some(
-			(deviceId) =>
-				stepStatus(
-					db,
-					operation.operation_id,
-					`space_grant:${project.canonical_project_identity}:${deviceId}`,
-				) !== "completed",
-		);
-		const currentMemberDeviceIds =
-			persistedMembers.length === 0 || persistedMembersNeedValidation
-				? [
-						...effectiveInviterDevices(db, {
-							initiatingDeviceId,
-							inviterDeviceIds,
-							sourceScopeIds,
-							projectNames,
-						}),
-						recipientDeviceId,
-					]
-				: persistedMembers;
-		if (
-			persistedMembers.length > 0 &&
-			persistedMembers.some((deviceId) => !currentMemberDeviceIds.includes(deviceId))
-		) {
-			throw new Error("inviter_project_access_ambiguous");
-		}
-		const memberDeviceIds = persistedMembers.length > 0 ? persistedMembers : currentMemberDeviceIds;
-		if (
-			!memberDeviceIds.includes(initiatingDeviceId) ||
-			!memberDeviceIds.includes(recipientDeviceId)
-		) {
-			throw new Error("provisioning_membership_plan_invalid");
-		}
-		if (
-			memberDeviceIds.some(
-				(deviceId) => deviceId !== recipientDeviceId && !inviterDeviceIds.includes(deviceId),
-			)
-		) {
-			throw new Error("provisioning_membership_plan_invalid");
-		}
-		const boundaryId = db
-			.prepare(`SELECT effect_id FROM share_operation_steps
-				WHERE operation_id = ? AND step_key = ?`)
-			.pluck()
-			.get(
-				operation.operation_id,
-				`managed_boundary:${project.canonical_project_identity}`,
-			) as string;
-		const localOnlyRows = matched.filter((row) => neverReplicationEligible(db, row));
-		const reassignedRows = matched.filter((row) => !neverReplicationEligible(db, row));
-		const reassignmentScopeIds = [
-			...new Set(
-				reassignedRows
-					.map((row) => clean(row.scope_id) ?? DEFAULT_SYNC_SCOPE_ID)
-					.filter((scopeId) => scopeId !== boundaryId),
-			),
-		];
-		const legacyDefaultProjects = reassignedRows
-			.filter(
-				(row) =>
-					(clean(row.scope_id) ?? DEFAULT_SYNC_SCOPE_ID) === DEFAULT_SYNC_SCOPE_ID &&
-					DEFAULT_SYNC_SCOPE_ID !== boundaryId,
-			)
-			.map((row) => clean(row.project));
-		const reassignmentSourceDeviceIds = [
-			...new Set([
-				...activeScopeMemberDeviceIds(
-					db,
-					reassignmentScopeIds.filter((scopeId) => scopeId !== DEFAULT_SYNC_SCOPE_ID),
-				),
-				...projectAllowedPeerDeviceIds(db, legacyDefaultProjects),
-			]),
-		].toSorted();
-		return {
-			canonicalIdentity: project.canonical_project_identity,
-			displayName: project.display_name,
-			boundaryId,
-			memoryIds: matched.map((row) => row.id).toSorted((a, b) => a - b),
-			localOnlyMemoryIds: localOnlyRows.map((row) => row.id).toSorted((a, b) => a - b),
-			reassignedMemoryIds: reassignedRows.map((row) => row.id).toSorted((a, b) => a - b),
-			memberDeviceIds: [...new Set(memberDeviceIds)].toSorted(),
-			reassignmentSourceDeviceIds,
-		};
-	});
+	const plans = projects.map((project) =>
+		buildManagedProjectPlan(db, project, candidates, repositoryIdentities, context),
+	);
 	if (plans.some((project) => !clean(project.boundaryId)))
 		throw new Error("managed_boundary_plan_missing");
+	for (const project of plans) assertCompatibleEffectiveMapping(project, evidence);
 	return {
-		operationId: operation.operation_id,
-		groupId: operation.coordinator_group_id,
-		recipientDeviceId,
+		operationId: context.operation.operation_id,
+		groupId: context.operation.coordinator_group_id,
+		recipientDeviceId: context.recipientDeviceId,
 		projects: plans,
 		requiredCapabilityDeviceIds: [
 			...new Set(
@@ -424,9 +567,10 @@ function persistMembershipPlan(db: Database, plan: ShareProvisioningPlan): void 
 	const now = new Date().toISOString();
 	db.transaction(() => {
 		for (const project of plan.projects) {
+			const stepIdentity = provisioningStepIdentity(project);
 			for (const deviceId of project.memberDeviceIds) {
-				const stepKey = `provisioning_member:${project.canonicalIdentity}:${deviceId}`;
-				const effectId = `provisioning-member:${plan.operationId}:${project.canonicalIdentity}:${deviceId}`;
+				const stepKey = `provisioning_member:${stepIdentity}:${deviceId}`;
+				const effectId = `provisioning-member:${plan.operationId}:${stepIdentity}:${deviceId}`;
 				db.prepare(`INSERT OR IGNORE INTO share_operation_steps(
 					operation_id, step_key, effect_id, status, attempt_count, started_at,
 					completed_at, last_attempt_at, updated_at
@@ -600,14 +744,31 @@ function localReassign(db: Database, memoryIds: number[], scopeId: string, devic
 	})();
 }
 
-function exactMapping(db: Database, project: ManagedProjectPlan): void {
-	const existing = db
-		.prepare(`SELECT id, scope_id FROM project_scope_mappings
-		 WHERE workspace_identity = ? ORDER BY priority DESC, updated_at DESC, id DESC LIMIT 1`)
-		.get(project.canonicalIdentity) as { id: number; scope_id: string } | undefined;
-	if (existing && existing.scope_id !== project.boundaryId)
+function assertCompatibleEffectiveMapping(
+	project: ManagedProjectPlan,
+	evidence: ProvisioningMappingEvidence,
+): boolean {
+	const repositoryScopes = mappedScopeIdsForRepository(
+		evidence.mappings,
+		evidence.repositoryIdentities,
+		project.canonicalIdentity,
+	);
+	if ([...repositoryScopes].some((scopeId) => scopeId !== project.boundaryId)) {
 		throw new Error("project_mapping_conflict");
-	if (existing) return;
+	}
+	const resolution = resolveProjectScope({
+		repositoryIdentity: project.canonicalIdentity,
+		allowRepositoryCwdFallback: false,
+		mappings: evidence.effectiveMappings,
+	});
+	if (resolution.mapping && resolution.scopeId !== project.boundaryId) {
+		throw new Error("project_mapping_conflict");
+	}
+	return resolution.reason === "exact_mapping";
+}
+
+function exactMapping(db: Database, project: ManagedProjectPlan): void {
+	if (assertCompatibleEffectiveMapping(project, loadProvisioningMappingEvidence(db))) return;
 	const now = new Date().toISOString();
 	db.prepare(`INSERT INTO project_scope_mappings(
 		workspace_identity, project_pattern, scope_id, priority, source, created_at, updated_at
@@ -620,7 +781,7 @@ function exactMapping(db: Database, project: ManagedProjectPlan): void {
 	);
 }
 
-export async function executeShareProvisioning(
+async function executeShareProvisioningWithStableMappings(
 	db: Database,
 	input: { operationId: string; initiatingDeviceId: string },
 	dependencies: ShareProvisioningDependencies,
@@ -659,24 +820,21 @@ export async function executeShareProvisioning(
 		"UPDATE share_operations SET state = 'provisioning', updated_at = ? WHERE operation_id = ? AND state != 'cancelled'",
 	).run(new Date().toISOString(), plan.operationId);
 	for (const project of plan.projects) {
-		await executeStep(
-			`managed_boundary:${project.canonicalIdentity}`,
-			project.boundaryId,
-			async () => {
-				const scope = await dependencies.createOrGetBoundary(project, plan.groupId);
-				if (
-					scope.scope_id !== project.boundaryId ||
-					scope.group_id !== plan.groupId ||
-					scope.kind !== "managed_project" ||
-					scope.authority_type !== "coordinator" ||
-					scope.status !== "active"
-				) {
-					throw new Error("managed_boundary_conflict");
-				}
-			},
-		);
+		const stepIdentity = provisioningStepIdentity(project);
+		await executeStep(`managed_boundary:${stepIdentity}`, project.boundaryId, async () => {
+			const scope = await dependencies.createOrGetBoundary(project, plan.groupId);
+			if (
+				scope.scope_id !== project.boundaryId ||
+				scope.group_id !== plan.groupId ||
+				scope.kind !== "managed_project" ||
+				scope.authority_type !== "coordinator" ||
+				scope.status !== "active"
+			) {
+				throw new Error("managed_boundary_conflict");
+			}
+		});
 		for (const deviceId of project.memberDeviceIds) {
-			const stepKey = `space_grant:${project.canonicalIdentity}:${deviceId}`;
+			const stepKey = `space_grant:${stepIdentity}:${deviceId}`;
 			const expectedRole = deviceId === input.initiatingDeviceId ? "admin" : "member";
 			const effectId = persistedEffectId(
 				db,
@@ -685,10 +843,7 @@ export async function executeShareProvisioning(
 				`space-grant:${project.boundaryId}:${deviceId}:1`,
 			);
 			await executeStep(stepKey, effectId, async () => {
-				assertLegacyShareGrantAllowed(db, {
-					canonicalProjectIdentity: project.canonicalIdentity,
-					deviceId,
-				});
+				assertLegacyShareGrantForProject(db, project, deviceId);
 				const membership = await dependencies.grantMembership({
 					effectId,
 					groupId: plan.groupId,
@@ -707,8 +862,8 @@ export async function executeShareProvisioning(
 			});
 		}
 		await executeStep(
-			`memory_reassignment:${project.canonicalIdentity}`,
-			`memory-reassignment:${plan.operationId}:${project.canonicalIdentity}`,
+			`memory_reassignment:${stepIdentity}`,
+			`memory-reassignment:${plan.operationId}:${stepIdentity}`,
 			() => {
 				localReassign(db, project.localOnlyMemoryIds, project.boundaryId, input.initiatingDeviceId);
 				for (const memoryId of project.reassignedMemoryIds) {
@@ -729,7 +884,7 @@ export async function executeShareProvisioning(
 				}
 			},
 		);
-		await executeStep(`project_assignment:${project.canonicalIdentity}`, project.boundaryId, () =>
+		await executeStep(`project_assignment:${stepIdentity}`, project.boundaryId, () =>
 			exactMapping(db, project),
 		);
 	}
@@ -765,6 +920,16 @@ export async function executeShareProvisioning(
 	// superseded: a duplicate won the race and cancelled this operation while it
 	// was in flight. Callers must not report it as active.
 	return { ...plan, superseded: activation.changes === 0 };
+}
+
+export function executeShareProvisioning(
+	db: Database,
+	input: { operationId: string; initiatingDeviceId: string },
+	dependencies: ShareProvisioningDependencies,
+): Promise<ShareProvisioningPlan & { superseded: boolean }> {
+	return serializeRecipientPolicyPublicationMutation(db, () =>
+		executeShareProvisioningWithStableMappings(db, input, dependencies),
+	);
 }
 
 /**

@@ -457,6 +457,7 @@ export interface ProjectScopeCandidate {
 	cwd: string | null;
 	git_remote: string | null;
 	git_branch: string | null;
+	repository_identity?: string | null;
 	latest_session_at: string | null;
 	read_only?: boolean;
 	read_only_reason?: "peer_received" | null;
@@ -485,6 +486,12 @@ export interface ProjectScopeInventoryProject extends ProjectScopeCandidate {
 	origin_devices?: Array<{ device_id: string; display_name: string | null }>;
 	session_count: number;
 	statuses: ProjectScopeInventoryStatus[];
+	worktrees?: Array<{
+		cwd: string;
+		latest_session_at: string | null;
+		memory_count: number;
+		session_count: number;
+	}>;
 	sharing?: ProjectSharingSummary[];
 }
 
@@ -2049,12 +2056,28 @@ export async function saveSharingDomainProjectMappings(input: {
 	return payload.mappings;
 }
 
-export async function deleteSharingDomainProjectMapping(id: number): Promise<boolean> {
+export async function deleteSharingDomainProjectMapping(
+	id: number,
+	confirmedGuardrailTokens: string[] = [],
+): Promise<boolean> {
 	const resp = await fetch(`/api/sync/sharing-domains/project-mappings/${encodeURIComponent(id)}`, {
 		method: "DELETE",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({ confirmed_guardrail_tokens: confirmedGuardrailTokens }),
 	});
-	const { text, payload } = await readJsonPayload<{ deleted?: boolean }>(resp);
-	if (!resp.ok) throw new Error(payloadError(payload) || text || "request failed");
+	const { text, payload } = await readJsonPayload<{
+		deleted?: boolean;
+		error?: string;
+		required_guardrails?: string[];
+		required_guardrail_tokens?: string[];
+		guardrail_warnings?: ProjectScopeGuardrailWarning[];
+	}>(resp);
+	if (!resp.ok) {
+		if (payload?.error === "guardrail_confirmation_required") {
+			throw new SharingDomainGuardrailConfirmationError(payload);
+		}
+		throw new Error(payloadError(payload) || text || "request failed");
+	}
 	return Boolean(payload?.deleted);
 }
 

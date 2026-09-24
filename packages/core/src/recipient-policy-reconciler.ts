@@ -17,6 +17,10 @@ import {
 	recordRecipientPolicyStableParityPass,
 	upsertRecipientPolicyAuthorityObservation,
 } from "./recipient-policy-reconciliation.js";
+import {
+	canonicalRepositoryProjectIdentity,
+	repositoryIdentitiesByWorkspace,
+} from "./repository-mapping-aliases.js";
 import { SCOPE_MEMBERSHIP_REVOCATION_LIMITATION } from "./scope-membership-semantics.js";
 
 export type RecipientPolicyPeerCapability = "supported" | "unsupported" | "undetermined";
@@ -113,6 +117,7 @@ interface ManagedProjectBoundary {
 interface Lease {
 	acquiredAt: string;
 	expiresAt: string;
+	wakeEpoch: number;
 }
 
 const DEFAULT_LEASE_DURATION_MS = 60_000;
@@ -220,7 +225,13 @@ function acquireLease(
 			`UPDATE recipient_policy_authority_states SET lease_owner = ?, lease_acquired_at = ?,
 			 lease_expires_at = ?, updated_at = ? WHERE canonical_project_identity = ?`,
 		).run(input.leaseOwner, now, expiresAt, now, input.canonicalProjectIdentity);
-		return { acquiredAt: now, expiresAt };
+		const wakeEpoch = db
+			.prepare(
+				"SELECT wake_epoch FROM recipient_policy_authority_states WHERE canonical_project_identity = ?",
+			)
+			.pluck()
+			.get(input.canonicalProjectIdentity) as number;
+		return { acquiredAt: now, expiresAt, wakeEpoch };
 	})();
 }
 
@@ -244,25 +255,65 @@ function assertLease(db: Database, projectId: string, leaseOwner: string, now: s
 	}
 }
 
+function scopeMappingsBelongToProject(
+	mappings: Array<{ workspace_identity: string | null; project_pattern: string }>,
+	repositoryIdentities: ReadonlyMap<string, string>,
+	projectId: string,
+): boolean {
+	return mappings.every((mapping) => {
+		if (mapping.workspace_identity == null) return false;
+		return (
+			canonicalRepositoryProjectIdentity(repositoryIdentities, mapping.workspace_identity) ===
+				projectId &&
+			canonicalRepositoryProjectIdentity(repositoryIdentities, mapping.project_pattern) ===
+				projectId
+		);
+	});
+}
+
+function mappedProjectsForScope(
+	mappings: Array<{ workspace_identity: string | null; project_pattern: string }>,
+	repositoryIdentities: ReadonlyMap<string, string>,
+): Set<string> {
+	return new Set(
+		mappings.flatMap((mapping) => {
+			if (mapping.workspace_identity == null) return [];
+			const workspaceProject = canonicalRepositoryProjectIdentity(
+				repositoryIdentities,
+				mapping.workspace_identity,
+			);
+			const patternProject = canonicalRepositoryProjectIdentity(
+				repositoryIdentities,
+				mapping.project_pattern,
+			);
+			return workspaceProject === patternProject ? [workspaceProject] : [];
+		}),
+	);
+}
+
 function boundary(db: Database, projectId: string): ManagedProjectBoundary {
+	const repositoryIdentities = repositoryIdentitiesByWorkspace(db);
 	const mappings = db
 		.prepare(
-			`SELECT workspace_identity, project_pattern, scope_id FROM project_scope_mappings
-			 WHERE workspace_identity = ? ORDER BY id`,
+			`SELECT workspace_identity, project_pattern, scope_id
+			 FROM project_scope_mappings ORDER BY id`,
 		)
-		.all(projectId) as Array<{
+		.all() as Array<{
 		workspace_identity: string | null;
 		project_pattern: string;
 		scope_id: string;
 	}>;
-	const mapping = mappings[0];
-	if (
-		!mapping ||
-		mappings.length !== 1 ||
-		mapping.workspace_identity !== projectId ||
-		mapping.project_pattern !== projectId ||
-		!validId(mapping.scope_id)
-	) {
+	const matchingMappings = mappings.filter(
+		(mapping) =>
+			mapping.workspace_identity != null &&
+			canonicalRepositoryProjectIdentity(repositoryIdentities, mapping.workspace_identity) ===
+				projectId &&
+			canonicalRepositoryProjectIdentity(repositoryIdentities, mapping.project_pattern) ===
+				projectId,
+	);
+	const matchingScopeIds = [...new Set(matchingMappings.map((mapping) => mapping.scope_id))];
+	const mapping = matchingMappings[0];
+	if (!mapping || matchingScopeIds.length !== 1 || !validId(mapping.scope_id)) {
 		throw new Error("recipient_policy_exact_mapping_required");
 	}
 	const scopes = db
@@ -276,15 +327,13 @@ function boundary(db: Database, projectId: string): ManagedProjectBoundary {
 		coordinator_id: string | null;
 		group_id: string | null;
 	}>;
-	const mappingCount = Number(
-		db
-			.prepare("SELECT COUNT(*) FROM project_scope_mappings WHERE scope_id = ?")
-			.pluck()
-			.get(mapping.scope_id) ?? 0,
-	);
+	const scopeMappings = mappings.filter((candidate) => candidate.scope_id === mapping.scope_id);
+	const mappedProjects = mappedProjectsForScope(scopeMappings, repositoryIdentities);
 	if (
 		scopes.length !== 1 ||
-		mappingCount !== 1 ||
+		mappedProjects.size !== 1 ||
+		!mappedProjects.has(projectId) ||
+		!scopeMappingsBelongToProject(scopeMappings, repositoryIdentities, projectId) ||
 		!validId(scopes[0]?.coordinator_id ?? "") ||
 		!validId(scopes[0]?.group_id ?? "")
 	) {
@@ -454,43 +503,46 @@ function generation(db: Database, projectId: string, desiredDigest: string): num
 }
 
 function authority(
-	db: Database,
+	run: RecipientPolicyReconciliationRun,
 	input: {
-		projectId: string;
 		state?: "active" | "eligible" | "legacy" | "rolled_back";
 		safeErrorCode: string | null;
 		now: string;
 		completed?: boolean;
 	},
 ): void {
-	const current = getRecipientPolicyAuthorityState(db, input.projectId);
+	const current = getRecipientPolicyAuthorityState(run.db, run.projectId);
 	const preserveActiveAuthority =
 		input.safeErrorCode !== null && RETRYABLE_ACTIVE_AUTHORITY_ERRORS.has(input.safeErrorCode);
 	const nextState =
 		input.state ??
 		(current?.authorityState === "active" && !preserveActiveAuthority ? "rolled_back" : undefined);
-	db.prepare(
-		`UPDATE recipient_policy_authority_states SET
+	run.db
+		.prepare(
+			`UPDATE recipient_policy_authority_states SET
 		 authority_state = COALESCE(?, authority_state),
 		 state_changed_at = CASE WHEN ? IS NULL OR ? = authority_state THEN state_changed_at ELSE ? END,
 		 safe_error_code = ?, last_error_at = CASE WHEN ? IS NULL THEN NULL ELSE ? END,
 		 last_completed_at = CASE WHEN ? THEN ? ELSE last_completed_at END,
-		 attempt_count = attempt_count + 1, last_attempt_at = ?, updated_at = ?
+		 attempt_count = attempt_count + 1,
+		 last_attempt_at = CASE WHEN wake_epoch = ? THEN ? ELSE NULL END, updated_at = ?
 		 WHERE canonical_project_identity = ?`,
-	).run(
-		nextState ?? null,
-		nextState ?? null,
-		nextState ?? null,
-		input.now,
-		input.safeErrorCode,
-		input.safeErrorCode,
-		input.now,
-		input.completed ? 1 : 0,
-		input.now,
-		input.now,
-		input.now,
-		input.projectId,
-	);
+		)
+		.run(
+			nextState ?? null,
+			nextState ?? null,
+			nextState ?? null,
+			input.now,
+			input.safeErrorCode,
+			input.safeErrorCode,
+			input.now,
+			input.completed ? 1 : 0,
+			input.now,
+			run.lease.wakeEpoch,
+			input.now,
+			input.now,
+			run.projectId,
+		);
 }
 
 function resetParity(db: Database, projectId: string, now: string): void {
@@ -767,6 +819,36 @@ async function retryPendingRevocationRefreshes(
 	return pending.length > 0;
 }
 
+function normalizeIncompleteRefreshStep(
+	db: Database,
+	input: {
+		projectId: string;
+		generation: number;
+		stepKey: string;
+		leaseOwner: string;
+		now: string;
+	},
+): void {
+	const payloadDigest = digest("recipient-policy-step-payload-v1", {
+		canonicalProjectIdentity: input.projectId,
+	});
+	const effectId = deterministicRecipientPolicyReconciliationEffectId({
+		canonicalProjectIdentity: input.projectId,
+		generation: input.generation,
+		stepKey: input.stepKey,
+		payloadDigest,
+	});
+	db.transaction(() => {
+		assertLease(db, input.projectId, input.leaseOwner, input.now);
+		db.prepare(
+			`UPDATE recipient_policy_reconciliation_steps
+			 SET effect_id = ?, payload_digest = ?
+			 WHERE canonical_project_identity = ? AND generation = ? AND step_key = ?
+			 AND status IN ('pending', 'running', 'failed')`,
+		).run(effectId, payloadDigest, input.projectId, input.generation, input.stepKey);
+	}).immediate();
+}
+
 async function retryPendingRefreshes(
 	db: Database,
 	input: {
@@ -780,24 +862,13 @@ async function retryPendingRefreshes(
 	const pending = listPendingRecipientPolicyRefreshSteps(db, input.projectId);
 	for (const refresh of pending) {
 		const payload = { canonicalProjectIdentity: input.projectId };
-		const payloadDigest = digest("recipient-policy-step-payload-v1", payload);
-		const effectId = deterministicRecipientPolicyReconciliationEffectId({
-			canonicalProjectIdentity: input.projectId,
+		normalizeIncompleteRefreshStep(db, {
+			projectId: input.projectId,
 			generation: refresh.generation,
 			stepKey: refresh.stepKey,
-			payloadDigest,
+			leaseOwner: input.leaseOwner,
+			now: input.effects.now(),
 		});
-		// Pre-upgrade incomplete refresh rows used snapshot-specific payload identities. Refresh is
-		// idempotent and targets the current boundary, so normalize those rows before replay.
-		db.transaction(() => {
-			assertLease(db, input.projectId, input.leaseOwner, input.effects.now());
-			db.prepare(
-				`UPDATE recipient_policy_reconciliation_steps
-				 SET effect_id = ?, payload_digest = ?
-				 WHERE canonical_project_identity = ? AND generation = ? AND step_key = ?
-				 AND status IN ('pending', 'running', 'failed')`,
-			).run(effectId, payloadDigest, input.projectId, refresh.generation, refresh.stepKey);
-		}).immediate();
 		await step(
 			db,
 			{
@@ -886,12 +957,15 @@ export function assertLegacyShareGrantAllowed(
 	db: Database,
 	input: { canonicalProjectIdentity: string; deviceId: string },
 ): void {
-	const state = getRecipientPolicyAuthorityState(db, input.canonicalProjectIdentity);
-	if (!state || state.authorityState === "legacy") return;
-	const desired = deriveRecipientPolicyEffectiveDevicesFromDatabase(
-		db,
+	const canonicalProjectIdentity = canonicalRepositoryProjectIdentity(
+		repositoryIdentitiesByWorkspace(db),
 		input.canonicalProjectIdentity,
 	);
+	const canonicalState = getRecipientPolicyAuthorityState(db, canonicalProjectIdentity);
+	const policyIdentity = canonicalState ? canonicalProjectIdentity : input.canonicalProjectIdentity;
+	const state = canonicalState ?? getRecipientPolicyAuthorityState(db, policyIdentity);
+	if (!state || state.authorityState === "legacy") return;
+	const desired = deriveRecipientPolicyEffectiveDevicesFromDatabase(db, policyIdentity);
 	const desiredDeviceDigest =
 		desired.status === "eligible"
 			? deviceDigest(desired.devices.map((item) => item.deviceId).toSorted())
@@ -1036,7 +1110,7 @@ async function capabilityFailure(
 		capability === "unsupported"
 			? "recipient_policy_capability_unsupported"
 			: "recipient_policy_capability_undetermined";
-	authority(run.db, { projectId: run.projectId, safeErrorCode, now: run.effects.now() });
+	authority(run, { safeErrorCode, now: run.effects.now() });
 	return result(
 		run.projectId,
 		capability === "unsupported" ? "needs_attention" : "waiting",
@@ -1066,8 +1140,7 @@ async function staleGrantEnrollment(
 	);
 	if (!changed) return null;
 	resetParity(run.db, run.projectId, run.effects.now());
-	authority(run.db, {
-		projectId: run.projectId,
+	authority(run, {
 		safeErrorCode: "recipient_policy_generation_stale",
 		now: run.effects.now(),
 	});
@@ -1117,6 +1190,27 @@ async function applyGrantSteps(
 	}
 }
 
+function stageGrantRefresh(run: RecipientPolicyReconciliationRun, input: GrantEffectInput): void {
+	if (input.grantDeviceIds.length === 0) return;
+	const stepKey = `refresh:${input.passKey}`;
+	normalizeIncompleteRefreshStep(run.db, {
+		projectId: run.projectId,
+		generation: run.activeGeneration,
+		stepKey,
+		leaseOwner: run.leaseOwner,
+		now: run.effects.now(),
+	});
+	ensureRecipientPolicyReconciliationStep(run.db, {
+		canonicalProjectIdentity: run.projectId,
+		generation: run.activeGeneration,
+		stepKey,
+		payloadDigest: digest("recipient-policy-step-payload-v1", {
+			canonicalProjectIdentity: run.projectId,
+		}),
+		now: run.effects.now(),
+	});
+}
+
 async function checkCapabilitiesAndApplyGrants(
 	run: RecipientPolicyReconciliationRun,
 	input: GrantEffectInput,
@@ -1125,6 +1219,7 @@ async function checkCapabilitiesAndApplyGrants(
 	if (capabilityOutcome) return capabilityOutcome;
 	const staleOutcome = await staleGrantEnrollment(run, input);
 	if (staleOutcome) return staleOutcome;
+	stageGrantRefresh(run, input);
 	await applyGrantSteps(run, input);
 	return null;
 }
@@ -1169,8 +1264,7 @@ async function revokeChangedGrantBindings(
 		lease: run.lease,
 		effects: run.effects,
 	});
-	authority(run.db, {
-		projectId: run.projectId,
+	authority(run, {
 		safeErrorCode: "recipient_policy_generation_stale",
 		now: run.effects.now(),
 	});
@@ -1198,13 +1292,7 @@ async function refreshAfterGrantEffects(
 		lease: run.lease,
 		effects: run.effects,
 	});
-	if (
-		replayedRefresh ||
-		(input.grantDeviceIds.length === 0 &&
-			(input.revocations.length > 0 || input.replayedRevocationRefresh))
-	) {
-		return;
-	}
+	if (replayedRefresh || input.grantDeviceIds.length === 0) return;
 	await step(
 		run.db,
 		{
@@ -1246,8 +1334,7 @@ function incompleteParityResult(
 	run: RecipientPolicyReconciliationRun,
 ): RecipientPolicyReconcileResult {
 	resetParity(run.db, run.projectId, run.effects.now());
-	authority(run.db, {
-		projectId: run.projectId,
+	authority(run, {
 		safeErrorCode: "recipient_policy_parity_incomplete",
 		now: run.effects.now(),
 	});
@@ -1262,8 +1349,7 @@ function incompleteParityResult(
 }
 
 function activeParityResult(run: RecipientPolicyReconciliationRun): RecipientPolicyReconcileResult {
-	authority(run.db, {
-		projectId: run.projectId,
+	authority(run, {
 		state: "active",
 		safeErrorCode: null,
 		now: run.effects.now(),
@@ -1373,8 +1459,7 @@ function finishParityPass(
 			passedAt: input.verified.snapshot.observedAt,
 		});
 	}
-	authority(run.db, {
-		projectId: run.projectId,
+	authority(run, {
 		state: "eligible",
 		safeErrorCode: null,
 		now: run.effects.now(),
@@ -1437,8 +1522,7 @@ async function prepareInitialReconciliation(
 	const managedBoundary = boundary(run.db, run.projectId);
 	const desired = deriveRecipientPolicyEffectiveDevicesFromDatabase(run.db, run.projectId);
 	if (desired.status !== "eligible") {
-		authority(run.db, {
-			projectId: run.projectId,
+		authority(run, {
 			safeErrorCode: "recipient_policy_desired_state_invalid",
 			now: run.effects.now(),
 		});
@@ -1514,8 +1598,7 @@ function staleDesiredResult(
 	) {
 		return null;
 	}
-	authority(run.db, {
-		projectId: run.projectId,
+	authority(run, {
 		safeErrorCode: "recipient_policy_generation_stale",
 		now: run.effects.now(),
 	});
@@ -1759,7 +1842,7 @@ async function executeRecipientPolicyReconciliation(
 		});
 	} catch (error) {
 		const safeErrorCode = safeError(error, "recipient_policy_reconciliation_failed");
-		authority(run.db, { projectId: run.projectId, safeErrorCode, now: run.effects.now() });
+		authority(run, { safeErrorCode, now: run.effects.now() });
 		return result(
 			run.projectId,
 			safeErrorCode === "recipient_policy_snapshot_not_fresh" ? "waiting" : "needs_attention",
@@ -1771,14 +1854,295 @@ async function executeRecipientPolicyReconciliation(
 	}
 }
 
+function migrateRecipientPolicyAliasAuthority(
+	db: Database,
+	canonicalProjectIdentity: string,
+	aliases: string[],
+): void {
+	const authorityIdentities = [canonicalProjectIdentity, ...aliases];
+	const placeholders = authorityIdentities.map(() => "?").join(", ");
+	const authoritySource = db
+		.prepare(
+			`SELECT canonical_project_identity FROM recipient_policy_authority_states
+			 WHERE canonical_project_identity IN (${placeholders})
+			 ORDER BY generation DESC, updated_at DESC, canonical_project_identity ASC LIMIT 1`,
+		)
+		.pluck()
+		.get(...authorityIdentities) as string | undefined;
+	if (!authoritySource || authoritySource === canonicalProjectIdentity) return;
+	db.prepare(
+		"DELETE FROM recipient_policy_authority_states WHERE canonical_project_identity = ?",
+	).run(canonicalProjectIdentity);
+	db.prepare(
+		`UPDATE recipient_policy_authority_states SET canonical_project_identity = ?
+		 WHERE canonical_project_identity = ?`,
+	).run(canonicalProjectIdentity, authoritySource);
+}
+
+interface AliasStepRow {
+	canonical_project_identity: string;
+	generation: number;
+	step_key: string;
+	effect_id: string;
+	payload_digest: string;
+	status: string;
+	attempt_count: number;
+	started_at: string | null;
+	completed_at: string | null;
+	last_attempt_at: string | null;
+	safe_error_code: string | null;
+	error_at: string | null;
+	lease_owner: string | null;
+	lease_acquired_at: string | null;
+	lease_expires_at: string | null;
+	created_at: string;
+	updated_at: string;
+}
+
+function canonicalAliasStepPayloadDigest(
+	step: AliasStepRow,
+	canonicalProjectIdentity: string,
+): string {
+	if (
+		!step.step_key.startsWith("refresh:") &&
+		!step.step_key.startsWith("refresh-after-revocations-v2:")
+	) {
+		return step.payload_digest;
+	}
+	return digest("recipient-policy-step-payload-v1", { canonicalProjectIdentity });
+}
+
+function aliasStepEffectId(
+	step: AliasStepRow,
+	canonicalProjectIdentity: string,
+	payloadDigest: string,
+): string {
+	if (["running", "failed"].includes(step.status)) return step.effect_id;
+	return deterministicRecipientPolicyReconciliationEffectId({
+		canonicalProjectIdentity,
+		generation: step.generation,
+		stepKey: step.step_key,
+		payloadDigest,
+	});
+}
+
+function shouldPromoteAliasStep(aliasStep: AliasStepRow, canonicalStep: AliasStepRow): boolean {
+	if (aliasStep.status === "completed") return canonicalStep.status !== "completed";
+	return ["running", "failed"].includes(aliasStep.status) && canonicalStep.status === "pending";
+}
+
+function assertCompatibleUncertainAliasEffects(
+	aliasStep: AliasStepRow,
+	canonicalStep: AliasStepRow | undefined,
+	effectId: string,
+): void {
+	if (!canonicalStep) return;
+	if (
+		["running", "failed"].includes(aliasStep.status) &&
+		["running", "failed"].includes(canonicalStep.status) &&
+		canonicalStep.effect_id !== effectId
+	) {
+		throw new Error("recipient_policy_reconciliation_step_conflict");
+	}
+}
+
+function rekeyRecipientPolicyAliasStep(
+	db: Database,
+	input: {
+		alias: string;
+		canonicalProjectIdentity: string;
+		effectId: string;
+		payloadDigest: string;
+		step: AliasStepRow;
+	},
+): void {
+	db.prepare(
+		`UPDATE recipient_policy_reconciliation_steps
+		 SET canonical_project_identity = ?, effect_id = ?, payload_digest = ?
+		 WHERE canonical_project_identity = ? AND generation = ? AND step_key = ?`,
+	).run(
+		input.canonicalProjectIdentity,
+		input.effectId,
+		input.payloadDigest,
+		input.alias,
+		input.step.generation,
+		input.step.step_key,
+	);
+}
+
+function promoteCompletedRecipientPolicyAliasStep(
+	db: Database,
+	canonicalProjectIdentity: string,
+	step: AliasStepRow,
+	effectId: string,
+	payloadDigest: string,
+): void {
+	db.prepare(
+		`UPDATE recipient_policy_reconciliation_steps SET effect_id = ?, payload_digest = ?,
+		 status = ?, attempt_count = ?, started_at = ?, completed_at = ?, last_attempt_at = ?,
+		 safe_error_code = ?, error_at = ?, lease_owner = ?, lease_acquired_at = ?,
+		 lease_expires_at = ?, created_at = MIN(created_at, ?), updated_at = MAX(updated_at, ?)
+		 WHERE canonical_project_identity = ? AND generation = ? AND step_key = ?`,
+	).run(
+		effectId,
+		payloadDigest,
+		step.status,
+		step.attempt_count,
+		step.started_at,
+		step.completed_at,
+		step.last_attempt_at,
+		step.safe_error_code,
+		step.error_at,
+		step.lease_owner,
+		step.lease_acquired_at,
+		step.lease_expires_at,
+		step.created_at,
+		step.updated_at,
+		canonicalProjectIdentity,
+		step.generation,
+		step.step_key,
+	);
+}
+
+function migrateRecipientPolicyAliasSteps(
+	db: Database,
+	canonicalProjectIdentity: string,
+	alias: string,
+): void {
+	const aliasSteps = db
+		.prepare(
+			"SELECT * FROM recipient_policy_reconciliation_steps WHERE canonical_project_identity = ?",
+		)
+		.all(alias) as AliasStepRow[];
+	for (const aliasStep of aliasSteps) {
+		const payloadDigest = canonicalAliasStepPayloadDigest(aliasStep, canonicalProjectIdentity);
+		const canonicalStep = db
+			.prepare(
+				`SELECT * FROM recipient_policy_reconciliation_steps
+				 WHERE canonical_project_identity = ? AND generation = ? AND step_key = ?`,
+			)
+			.get(canonicalProjectIdentity, aliasStep.generation, aliasStep.step_key) as
+			| AliasStepRow
+			| undefined;
+		if (canonicalStep && canonicalStep.payload_digest !== payloadDigest) {
+			throw new Error("recipient_policy_reconciliation_step_conflict");
+		}
+		const effectId = aliasStepEffectId(aliasStep, canonicalProjectIdentity, payloadDigest);
+		assertCompatibleUncertainAliasEffects(aliasStep, canonicalStep, effectId);
+		if (!canonicalStep) {
+			rekeyRecipientPolicyAliasStep(db, {
+				alias,
+				canonicalProjectIdentity,
+				effectId,
+				payloadDigest,
+				step: aliasStep,
+			});
+			continue;
+		}
+		if (shouldPromoteAliasStep(aliasStep, canonicalStep)) {
+			promoteCompletedRecipientPolicyAliasStep(
+				db,
+				canonicalProjectIdentity,
+				aliasStep,
+				effectId,
+				payloadDigest,
+			);
+		}
+		db.prepare(
+			`DELETE FROM recipient_policy_reconciliation_steps
+			 WHERE canonical_project_identity = ? AND generation = ? AND step_key = ?`,
+		).run(alias, aliasStep.generation, aliasStep.step_key);
+	}
+}
+
+function hasLiveAuthorityLease(db: Database, projectIdentities: string[], now: string): boolean {
+	if (projectIdentities.length === 0) return false;
+	const placeholders = projectIdentities.map(() => "?").join(", ");
+	const rows = db
+		.prepare(
+			`SELECT lease_expires_at FROM recipient_policy_authority_states
+			 WHERE canonical_project_identity IN (${placeholders})
+			 AND lease_owner IS NOT NULL AND lease_expires_at IS NOT NULL`,
+		)
+		.all(...projectIdentities) as Array<{ lease_expires_at: string }>;
+	const nowTimestamp = timestamp(now, "recipient_policy_reconciliation_time_invalid");
+	return rows.some(
+		(row) =>
+			timestamp(row.lease_expires_at, "recipient_policy_reconciliation_lease_invalid") >
+			nowTimestamp,
+	);
+}
+
+function migrateRecipientPolicyAliasState(
+	db: Database,
+	canonicalProjectIdentity: string,
+	aliases: Iterable<string>,
+	now: string,
+): boolean {
+	const aliasList = [...new Set(aliases)].filter((alias) => alias !== canonicalProjectIdentity);
+	if (aliasList.length === 0) return true;
+	const migrate = db.transaction(() => {
+		if (hasLiveAuthorityLease(db, [canonicalProjectIdentity, ...aliasList], now)) return false;
+		migrateRecipientPolicyAliasAuthority(db, canonicalProjectIdentity, aliasList);
+		for (const alias of aliasList) {
+			db.prepare(
+				"DELETE FROM recipient_policy_authority_states WHERE canonical_project_identity = ?",
+			).run(alias);
+			migrateRecipientPolicyAliasSteps(db, canonicalProjectIdentity, alias);
+			db.prepare(
+				`INSERT INTO recipient_policy_deny_overlays(
+					canonical_project_identity, scope_id, device_id, generation, reason_code,
+					created_at, updated_at
+				 ) SELECT ?, scope_id, device_id, generation, reason_code, created_at, updated_at
+				 FROM recipient_policy_deny_overlays WHERE canonical_project_identity = ?
+				 ON CONFLICT(canonical_project_identity, scope_id, device_id) DO UPDATE SET
+					generation = MAX(recipient_policy_deny_overlays.generation, excluded.generation),
+					reason_code = CASE
+						WHEN excluded.generation >= recipient_policy_deny_overlays.generation
+						THEN excluded.reason_code ELSE recipient_policy_deny_overlays.reason_code END,
+					updated_at = MAX(recipient_policy_deny_overlays.updated_at, excluded.updated_at)`,
+			).run(canonicalProjectIdentity, alias);
+			db.prepare(
+				"DELETE FROM recipient_policy_deny_overlays WHERE canonical_project_identity = ?",
+			).run(alias);
+		}
+		return true;
+	});
+	return migrate.immediate();
+}
+
 export async function reconcileRecipientPolicyProject(
 	db: Database,
 	input: ReconcileRecipientPolicyProjectInput,
 	effects: RecipientPolicyReconcilerEffects,
 ): Promise<RecipientPolicyReconcileResult> {
-	const projectId = input.canonicalProjectIdentity;
+	const repositoryIdentities = repositoryIdentitiesByWorkspace(db);
+	const projectId = canonicalRepositoryProjectIdentity(
+		repositoryIdentities,
+		input.canonicalProjectIdentity,
+	);
+	const aliases = [...repositoryIdentities]
+		.filter(([, repository]) => repository === projectId)
+		.map(([cwd]) => cwd);
+	const canonicalInput = { ...input, canonicalProjectIdentity: projectId };
 	const startedAt = effects.now();
-	const lease = acquireLease(db, input, startedAt);
+	if (!validId(canonicalInput.canonicalProjectIdentity) || !validId(canonicalInput.leaseOwner)) {
+		throw new Error("recipient_policy_reconciliation_input_invalid");
+	}
+	const duration = canonicalInput.leaseDurationMs ?? DEFAULT_LEASE_DURATION_MS;
+	if (!Number.isSafeInteger(duration) || duration <= 0) {
+		throw new Error("recipient_policy_reconciliation_lease_invalid");
+	}
+	timestamp(startedAt, "recipient_policy_reconciliation_time_invalid");
+	if (aliases.length > 0 && !migrateRecipientPolicyAliasState(db, projectId, aliases, startedAt)) {
+		const generation = Math.max(
+			0,
+			getRecipientPolicyAuthorityState(db, projectId)?.generation ?? 0,
+			...aliases.map((alias) => getRecipientPolicyAuthorityState(db, alias)?.generation ?? 0),
+		);
+		return result(projectId, "busy", generation, "recipient_policy_lease_held");
+	}
+	const lease = acquireLease(db, canonicalInput, startedAt);
 	if (!lease) {
 		return result(
 			projectId,

@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
+import { REPOSITORY_IDENTITY_METADATA_KEY } from "./project.js";
 import {
 	commitRecipientPolicyEdges,
 	parseRecipientPolicyEdgeCommitRequest,
@@ -201,6 +202,46 @@ afterEach(() => {
 	for (const directory of temporaryDirectories.splice(0)) {
 		rmSync(directory, { recursive: true, force: true });
 	}
+});
+
+it("wakes an active policy when its desired recipients change", () => {
+	const db = seedGraph();
+	const cwd = "/workspace/project-a";
+	db.prepare("INSERT INTO sessions(started_at, cwd, metadata_json) VALUES (?, ?, ?)").run(
+		NOW,
+		cwd,
+		JSON.stringify({ codemem_repository_identity: PROJECT_A }),
+	);
+	db.prepare(
+		`INSERT INTO recipient_policy_authority_states(
+		 canonical_project_identity, authority_state, generation, state_changed_at,
+		 last_attempt_at, created_at, updated_at
+		 ) VALUES (?, 'active', 1, ?, ?, ?, ?)`,
+	).run(PROJECT_A, NOW, NOW, NOW, NOW);
+	db.prepare(
+		`INSERT INTO recipient_policy_authority_states(
+		 canonical_project_identity, authority_state, generation, state_changed_at,
+		 last_attempt_at, created_at, updated_at
+		 ) VALUES (?, 'active', 1, ?, ?, ?, ?)`,
+	).run(cwd, NOW, NOW, NOW, NOW);
+	const changes = [identityChange(PROJECT_A, "identity-b")];
+	const preview = previewRecipientPolicyEdges(db, { version: 1, changes });
+
+	expect(
+		commitRecipientPolicyEdges(db, {
+			version: 1,
+			changes,
+			reviewedPolicyDigest: preview.reviewedPolicyDigest,
+		}),
+	).toMatchObject({ status: "applied", writeCount: 1 });
+	expect(
+		db
+			.prepare(
+				"SELECT last_attempt_at FROM recipient_policy_authority_states ORDER BY canonical_project_identity",
+			)
+			.pluck()
+			.all(),
+	).toEqual([null, null]);
 });
 
 describe("recipient-policy edge changes", () => {
@@ -1243,5 +1284,155 @@ describe("recipient-policy edge changes", () => {
 		).toMatchObject({ status: "conflict", writeCount: 0 });
 		expect(rowSnapshot(db)).toEqual([]);
 		expect(snapshot()).toBe(before);
+	});
+});
+
+describe("recipient-policy edge repository inference", () => {
+	it("counts historical cwd-only memories in repository Project facts", () => {
+		const db = seedGraph();
+		db.prepare("UPDATE sessions SET metadata_json = ? WHERE cwd = '/workspace/alpha'").run(
+			JSON.stringify({ [REPOSITORY_IDENTITY_METADATA_KEY]: PROJECT_A }),
+		);
+		const historicalSessionId = Number(
+			db
+				.prepare(
+					`INSERT INTO sessions(started_at, cwd, project)
+					 VALUES (?, '/workspace/alpha', 'alpha')`,
+				)
+				.run(NOW).lastInsertRowid,
+		);
+		db.prepare(
+			`INSERT INTO memory_items(
+				session_id, kind, title, body_text, active, created_at, updated_at,
+				visibility, project, scope_id
+			 ) VALUES (?, 'discovery', 'historical', 'body', 1, ?, ?, 'shared', 'alpha', 'local-default')`,
+		).run(historicalSessionId, NOW, NOW);
+		const reusedCwdSessionId = Number(
+			db
+				.prepare(
+					`INSERT INTO sessions(started_at, cwd, project, git_remote)
+					 VALUES (?, '/workspace/alpha', 'older-alpha', 'https://example.test/older/alpha.git')`,
+				)
+				.run(NOW).lastInsertRowid,
+		);
+		db.prepare(
+			`INSERT INTO memory_items(
+				session_id, kind, title, body_text, active, created_at, updated_at,
+				visibility, project, scope_id
+			 ) VALUES (?, 'discovery', 'older checkout', 'body', 1, ?, ?, 'shared', 'older-alpha', 'local-default')`,
+		).run(reusedCwdSessionId, NOW, NOW);
+
+		expect(
+			previewRecipientPolicyEdges(db, {
+				version: 1,
+				changes: [identityChange(PROJECT_A, "identity-a")],
+			}).projects,
+		).toEqual([
+			expect.objectContaining({
+				canonicalProjectIdentity: PROJECT_A,
+				existingMemoryCount: 2,
+			}),
+		]);
+	});
+
+	it("updates a pre-upgrade cwd edge through its repository identity", () => {
+		const db = seedGraph();
+		db.prepare("UPDATE sessions SET metadata_json = ? WHERE cwd = '/workspace/alpha'").run(
+			JSON.stringify({ [REPOSITORY_IDENTITY_METADATA_KEY]: PROJECT_A }),
+		);
+		insertProjectRecipient(db, "/workspace/alpha", "identity-a");
+		insertProjectRecipient(db, PROJECT_A, "identity-a");
+		const change = identityChange(PROJECT_A, "identity-a", "remove");
+		const preview = previewRecipientPolicyEdges(db, { version: 1, changes: [change] });
+
+		expect(
+			commitRecipientPolicyEdges(db, {
+				version: 1,
+				changes: [change],
+				reviewedPolicyDigest: preview.reviewedPolicyDigest,
+			}),
+		).toMatchObject({ status: "applied", writeCount: 1 });
+		expect(
+			db
+				.prepare(
+					`SELECT status FROM project_recipients
+					 WHERE recipient_id = 'identity-a' ORDER BY canonical_project_identity`,
+				)
+				.pluck()
+				.all(),
+		).toEqual(["revoked", "revoked"]);
+	});
+});
+
+describe("recipient-policy edge canonical alias precedence", () => {
+	it("canonicalizes a stale cwd removal request", () => {
+		const db = seedGraph();
+		db.prepare("UPDATE sessions SET metadata_json = ? WHERE cwd = '/workspace/alpha'").run(
+			JSON.stringify({ [REPOSITORY_IDENTITY_METADATA_KEY]: PROJECT_A }),
+		);
+		insertProjectRecipient(db, "/workspace/alpha", "identity-a");
+		const change = identityChange("/workspace/alpha", "identity-a", "remove");
+		const preview = previewRecipientPolicyEdges(db, { version: 1, changes: [change] });
+		expect(preview.normalizedChanges[0]?.canonicalProjectIdentity).toBe(PROJECT_A);
+
+		expect(
+			commitRecipientPolicyEdges(db, {
+				version: 1,
+				changes: [change],
+				reviewedPolicyDigest: preview.reviewedPolicyDigest,
+			}),
+		).toMatchObject({ status: "applied", writeCount: 1 });
+		expect(
+			db
+				.prepare("SELECT status FROM project_recipients WHERE recipient_id = 'identity-a'")
+				.pluck()
+				.get(),
+		).toBe("revoked");
+	});
+
+	it("prefers canonical revocation over an active cwd alias", () => {
+		const db = seedGraph();
+		db.prepare("UPDATE sessions SET metadata_json = ? WHERE cwd = '/workspace/alpha'").run(
+			JSON.stringify({ [REPOSITORY_IDENTITY_METADATA_KEY]: PROJECT_A }),
+		);
+		insertProjectRecipient(db, "/workspace/alpha", "identity-a");
+		insertProjectRecipient(db, PROJECT_A, "identity-a");
+		db.prepare(
+			`UPDATE project_recipients SET status = 'revoked', updated_at = ?
+			 WHERE canonical_project_identity = ? AND recipient_id = 'identity-a'`,
+		).run("2026-01-01T00:00:00.000Z", PROJECT_A);
+
+		expect(deriveRecipientPolicyEffectiveDevicesFromDatabase(db, PROJECT_A).devices).toEqual([]);
+		const preview = previewRecipientPolicyEdges(db, {
+			version: 1,
+			changes: [identityChange("/workspace/alpha", "identity-a", "remove")],
+		});
+		expect(preview.outcomes).toEqual([expect.objectContaining({ outcome: "already_absent" })]);
+	});
+});
+
+describe("recipient-policy edge repository merging", () => {
+	it("combines cwd and repository recipient edges for intent and reconciliation", () => {
+		const db = seedGraph();
+		db.prepare("UPDATE sessions SET metadata_json = ? WHERE cwd = '/workspace/alpha'").run(
+			JSON.stringify({ [REPOSITORY_IDENTITY_METADATA_KEY]: PROJECT_A }),
+		);
+		insertProjectRecipient(db, "/workspace/alpha", "identity-a");
+		insertProjectRecipient(db, PROJECT_A, "identity-b");
+
+		expect(
+			listRecipientPolicyIntent(db).projectRecipients.map((recipient) => ({
+				project: recipient.canonicalProjectIdentity,
+				recipient: recipient.recipientKind === "identity" ? recipient.identityId : recipient.teamId,
+			})),
+		).toEqual([
+			{ project: PROJECT_A, recipient: "identity-a" },
+			{ project: PROJECT_A, recipient: "identity-b" },
+		]);
+		expect(
+			deriveRecipientPolicyEffectiveDevicesFromDatabase(db, PROJECT_A).devices.map(
+				(device) => device.deviceId,
+			),
+		).toEqual(["device-a", "device-b"]);
 	});
 });

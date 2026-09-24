@@ -158,14 +158,14 @@ describe("required OpenCode host workflow contract", () => {
 			/npm install --prefix packages\/opencode-plugin\/\.opencode --no-save @opencode-ai\/plugin@1\.18\.29/u,
 		);
 		assert.match(pluginJob, /pnpm --filter @codemem\/opencode-plugin test &&/u);
-		assert.equal(pluginPackage.dependencies["@opencode-ai/plugin"], "1.18.29");
+		assert.equal(pluginPackage.engines.opencode, ">=1.18.29");
 		assert.doesNotMatch(pluginJob, /^ {4}(?:if|continue-on-error):/m);
 	});
 
-	it("requires packed OpenCode 1 and exactly matched OpenCode 2.0.2 hosts on every normal run", () => {
+	it("requires packed OpenCode 1 and exactly matched OpenCode 2.0.12 hosts on every normal run", () => {
 		const packedJob = getJob(ciWorkflow, "packaged-plugin-smoke");
-		assert.equal(pluginPackage.devDependencies["@opencode/cli"], "2.0.2");
-		assert.equal(pluginPackage.dependencies["@opencode/plugin"], "2.0.2");
+		assert.equal(pluginPackage.devDependencies["@opencode/cli"], "2.0.12");
+		assert.equal(pluginPackage.dependencies["@opencode/plugin"], "2.0.12");
 		assert.equal(
 			pluginPackage.scripts["test:opencode-v2-contract"],
 			"node ./scripts/packed-v2-host-smoke.mjs",

@@ -53,6 +53,55 @@ const ALLOWED_ATTR = ["href", "title"];
  * SVG — mutating sanitized content and bypassing this allowlist. */
 const SANITIZE_OPTIONS = { ALLOWED_TAGS, ALLOWED_ATTR, ALLOW_DATA_ATTR: false };
 
+const SEMANTIC_SECTION_HEADINGS = new Map([
+	["request", "request"],
+	["completed", "completed"],
+	["learned", "learned"],
+	["investigated", "investigated"],
+	["next steps", "next-steps"],
+	["notes", "notes"],
+]);
+
+function semanticSectionTone(heading: Element): string | null {
+	const label = String(heading.textContent || "")
+		.trim()
+		.replace(/:\s*$/, "")
+		.replace(/\s+/g, " ")
+		.toLowerCase();
+	return SEMANTIC_SECTION_HEADINGS.get(label) ?? null;
+}
+
+function wrapSemanticSection(heading: Element, tone: string, semanticHeadings: Set<Element>): void {
+	const section = document.createElement("div");
+	section.classList.add("feed-semantic-section", `feed-section-${tone}`);
+	heading.before(section);
+	section.append(heading);
+	let sibling = section.nextSibling;
+	while (sibling) {
+		if (sibling instanceof Element && semanticHeadings.has(sibling)) break;
+		const nextSibling = sibling.nextSibling;
+		section.append(sibling);
+		sibling = nextSibling;
+	}
+}
+
+function decorateSemanticSections(html: string): string {
+	const template = document.createElement("template");
+	template.innerHTML = html;
+	const headings = Array.from(template.content.querySelectorAll("h1, h2, h3, h4, h5, h6"));
+	const semanticHeadings = new Set(headings.filter((heading) => semanticSectionTone(heading)));
+	for (const heading of semanticHeadings) {
+		const tone = semanticSectionTone(heading);
+		if (!tone) continue;
+		heading.classList.add("feed-section-heading", `feed-section-${tone}`);
+	}
+	for (const heading of semanticHeadings) {
+		const tone = semanticSectionTone(heading);
+		if (tone) wrapSemanticSection(heading, tone, semanticHeadings);
+	}
+	return template.innerHTML;
+}
+
 export function isSafeHref(value: string): boolean {
 	const href = String(value || "").trim();
 	if (!href) return false;
@@ -82,5 +131,6 @@ export function sanitizeHtml(html: string): string {
 
 export function renderMarkdownSafe(value: string): string {
 	const rawHtml = marked.parse(String(value || ""), { async: false });
-	return DOMPurify.sanitize(rawHtml, SANITIZE_OPTIONS);
+	const sanitized = DOMPurify.sanitize(rawHtml, SANITIZE_OPTIONS);
+	return decorateSemanticSections(sanitized);
 }

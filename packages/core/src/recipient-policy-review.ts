@@ -29,6 +29,10 @@ import {
 	deterministicPolicyTeamId,
 	legacyRecipientPolicyDigest,
 } from "./recipient-policy-identifiers.js";
+import {
+	repositoryIdentitiesByWorkspace,
+	repositoryIdentityForWorkspace,
+} from "./repository-mapping-aliases.js";
 import { canonicalWorkspaceIdentity } from "./scope-resolution.js";
 
 export interface RecipientPolicyReviewContext {
@@ -227,9 +231,10 @@ export function recipientPolicyReviewSourceFingerprint(
 }
 
 function memoryCountsByProject(db: Database): Map<string, number> {
+	const repositoryIdentities = repositoryIdentitiesByWorkspace(db);
 	const rows = db
 		.prepare(
-			`SELECT s.cwd, s.project, s.git_remote, s.git_branch, mi.workspace_id
+			`SELECT s.cwd, s.project, s.git_remote, s.git_branch, s.metadata_json, mi.workspace_id
 			 FROM memory_items mi
 			 JOIN sessions s ON s.id = mi.session_id
 			 WHERE mi.active = 1 AND mi.deleted_at IS NULL`,
@@ -239,6 +244,7 @@ function memoryCountsByProject(db: Database): Map<string, number> {
 		project: string | null;
 		git_remote: string | null;
 		git_branch: string | null;
+		metadata_json: string | null;
 		workspace_id: string | null;
 	}>;
 	const counts = new Map<string, number>();
@@ -248,6 +254,11 @@ function memoryCountsByProject(db: Database): Map<string, number> {
 			project: row.project,
 			gitRemote: row.git_remote,
 			gitBranch: row.git_branch,
+			repositoryIdentity: repositoryIdentityForWorkspace(repositoryIdentities, {
+				cwd: row.cwd,
+				gitRemote: row.git_remote,
+				metadataJson: row.metadata_json,
+			}),
 			workspaceId: row.workspace_id,
 		}).value;
 		counts.set(projectId, (counts.get(projectId) ?? 0) + 1);

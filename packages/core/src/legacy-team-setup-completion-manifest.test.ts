@@ -109,6 +109,125 @@ function expectDeviceLabel(db: InstanceType<typeof Database>, attemptId: string,
 	).toBe(expected);
 }
 
+function seedRevokedProjectForConvergence(
+	db: InstanceType<typeof Database>,
+	teamId: string,
+	policyRevision: string,
+): void {
+	db.prepare(`INSERT INTO project_recipients(
+		canonical_project_identity, recipient_kind, recipient_id, status, provenance,
+		policy_revision, migration_state, source_fingerprint, idempotency_key,
+		created_at, updated_at
+	 ) VALUES (?, 'team', ?, 'revoked', 'reviewed_team_setup', ?, 'completed', ?, ?, ?, ?)`).run(
+		PROJECT_B,
+		teamId,
+		policyRevision,
+		"source-b",
+		"revoked-before-convergence",
+		NOW,
+		NOW,
+	);
+	db.prepare(`INSERT INTO recipient_policy_authority_states(
+		canonical_project_identity, authority_state, generation, state_changed_at,
+		last_attempt_at, created_at, updated_at
+	 ) VALUES (?, 'active', 1, ?, ?, ?, ?)`).run(PROJECT_B, NOW, NOW, NOW, NOW);
+}
+
+function containmentPolicySnapshot(db: InstanceType<typeof Database>) {
+	return ["policy_teams", "project_recipients", "legacy_team_setup_drafts"].map((table) =>
+		db.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all(),
+	);
+}
+
+function containmentMappingsSnapshot(db: InstanceType<typeof Database>) {
+	return db.prepare("SELECT * FROM project_scope_mappings ORDER BY id").all();
+}
+
+function seedContainmentWakeAuthority(
+	db: InstanceType<typeof Database>,
+	input: { teamId: string; revision: string; state: string },
+): string[] {
+	const project = "https://example.test/acme/containment-wake.git";
+	const insertRecipient = db.prepare(`INSERT INTO project_recipients(
+		canonical_project_identity, recipient_kind, recipient_id, status, provenance,
+		policy_revision, migration_state, idempotency_key, created_at, updated_at
+	 ) VALUES (?, 'team', ?, 'active', ?, ?, 'completed', ?, ?, ?)`);
+	insertRecipient.run(
+		project,
+		input.teamId,
+		"reviewed_team_setup",
+		input.revision,
+		`containment-wake:${input.state}`,
+		NOW,
+		NOW,
+	);
+	const insertAuthority = db.prepare(`INSERT INTO recipient_policy_authority_states(
+		canonical_project_identity, authority_state, generation, state_changed_at,
+		last_attempt_at, created_at, updated_at
+	 ) VALUES (?, 'active', 1, ?, ?, ?, ?)`);
+	insertAuthority.run(project, NOW, NOW, NOW, NOW);
+	const projects = [project];
+	if (input.state === "active") {
+		const userProject = "https://example.test/acme/user-owned-containment.git";
+		insertRecipient.run(userProject, input.teamId, "user", input.revision, "user-wake", NOW, NOW);
+		insertAuthority.run(userProject, NOW, NOW, NOW, NOW);
+		projects.push(userProject);
+	}
+	if (input.state === "legacy-contained") {
+		insertAuthority.run(PROJECT_B, NOW, NOW, NOW, NOW);
+		projects.push(PROJECT_B);
+	}
+	return projects;
+}
+
+function expectContainmentWake(
+	db: InstanceType<typeof Database>,
+	projects: string[],
+	state: string,
+): void {
+	for (const project of projects) {
+		expect(
+			db
+				.prepare(
+					"SELECT last_attempt_at FROM recipient_policy_authority_states WHERE canonical_project_identity = ?",
+				)
+				.pluck()
+				.get(project),
+		).toBe(
+			state === "active" || (state === "legacy-contained" && project === PROJECT_B) ? null : NOW,
+		);
+	}
+}
+
+function seedPriorContainmentState(
+	db: InstanceType<typeof Database>,
+	state: string,
+	teamId: string,
+	attemptId: string,
+): void {
+	if (state === "legacy-contained" || state === "unbound-contained") {
+		db.prepare(
+			"UPDATE policy_teams SET status = 'inactive', migration_state = 'needs_setup' WHERE team_id = ?",
+		).run(teamId);
+		db.prepare("UPDATE legacy_team_setup_drafts SET finish_digest = NULL WHERE attempt_id = ?").run(
+			attemptId,
+		);
+	}
+	if (state === "unbound-contained") {
+		db.prepare(
+			"UPDATE legacy_team_setup_drafts SET completed_team_id = NULL WHERE attempt_id = ?",
+		).run(attemptId);
+	}
+	if (state === "independently-inactive") {
+		db.prepare("UPDATE policy_teams SET status = 'inactive' WHERE team_id = ?").run(teamId);
+	}
+	if (state === "non-setup-owned") {
+		db.prepare("UPDATE policy_teams SET provenance = 'user' WHERE team_id = ?").run(teamId);
+	}
+	if (state === "missing-team")
+		db.prepare("DELETE FROM policy_teams WHERE team_id = ?").run(teamId);
+}
+
 describe("legacy Team setup completion manifests", () => {
 	let db: InstanceType<typeof Database>;
 
@@ -1083,21 +1202,7 @@ describe("legacy Team setup completion manifests", () => {
 		db.prepare(
 			"DELETE FROM project_scope_mappings WHERE workspace_identity = ? AND source = 'user'",
 		).run(PROJECT_B);
-		db.prepare(
-			`INSERT INTO project_recipients(
-			 canonical_project_identity, recipient_kind, recipient_id, status, provenance,
-			 policy_revision, migration_state, source_fingerprint, idempotency_key,
-			 created_at, updated_at
-			 ) VALUES (?, 'team', ?, 'revoked', 'reviewed_team_setup', ?, 'completed', ?, ?, ?, ?)`,
-		).run(
-			PROJECT_B,
-			manifest.team_id,
-			manifest.team.policy_revision,
-			"source-b",
-			"revoked-before-convergence",
-			NOW,
-			NOW,
-		);
+		seedRevokedProjectForConvergence(db, manifest.team_id, manifest.team.policy_revision);
 		const insertNewerSession = db.prepare(
 			"INSERT INTO sessions(started_at, project, git_remote) VALUES (?, ?, ?)",
 		);
@@ -1140,6 +1245,14 @@ describe("legacy Team setup completion manifests", () => {
 				manifest,
 			}),
 		).resolves.toEqual(manifest);
+		expect(
+			db
+				.prepare(
+					"SELECT last_attempt_at FROM recipient_policy_authority_states WHERE canonical_project_identity = ?",
+				)
+				.pluck()
+				.get(PROJECT_B),
+		).toBeNull();
 		expect(
 			db
 				.prepare(
@@ -1974,30 +2087,6 @@ describe("legacy Team setup completion manifests", () => {
 		).rejects.toThrow("team_setup_confirmation_stale");
 	});
 
-	function seedPriorContainmentState(state: string, teamId: string, attemptId: string): void {
-		if (state === "legacy-contained" || state === "unbound-contained") {
-			db.prepare(
-				"UPDATE policy_teams SET status = 'inactive', migration_state = 'needs_setup' WHERE team_id = ?",
-			).run(teamId);
-			db.prepare(
-				"UPDATE legacy_team_setup_drafts SET finish_digest = NULL WHERE attempt_id = ?",
-			).run(attemptId);
-		}
-		if (state === "unbound-contained") {
-			db.prepare(
-				"UPDATE legacy_team_setup_drafts SET completed_team_id = NULL WHERE attempt_id = ?",
-			).run(attemptId);
-		}
-		if (state === "independently-inactive") {
-			db.prepare("UPDATE policy_teams SET status = 'inactive' WHERE team_id = ?").run(teamId);
-		}
-		if (state === "non-setup-owned") {
-			db.prepare("UPDATE policy_teams SET provenance = 'user' WHERE team_id = ?").run(teamId);
-		}
-		if (state === "missing-team")
-			db.prepare("DELETE FROM policy_teams WHERE team_id = ?").run(teamId);
-	}
-
 	it.each([
 		{ state: "active", cleanup: true },
 		{ state: "legacy-contained", cleanup: true },
@@ -2026,6 +2115,10 @@ describe("legacy Team setup completion manifests", () => {
 			insertScope.run("retired-scope", COORDINATOR_ID, GROUP_ID, "inactive", NOW, NOW);
 			insertScope.run("other-group", COORDINATOR_ID, "other-group", "active", NOW, NOW);
 			insertScope.run("other-coordinator", "other-coordinator", GROUP_ID, "active", NOW, NOW);
+			insertScope.run("locally-managed", COORDINATOR_ID, GROUP_ID, "active", NOW, NOW);
+			db.prepare("UPDATE replication_scopes SET authority_type = 'local' WHERE scope_id = ?").run(
+				"locally-managed",
+			);
 			const insertMapping = db.prepare(`INSERT INTO project_scope_mappings(
 			workspace_identity, project_pattern, scope_id, priority, source, created_at, updated_at
 		) VALUES (?, ?, ?, 1000, ?, ?, ?)`);
@@ -2035,6 +2128,7 @@ describe("legacy Team setup completion manifests", () => {
 				["manual", "scope-engineering", "user"],
 				["foreign-group", "other-group", "reviewed_team_setup"],
 				["foreign-coordinator", "other-coordinator", "reviewed_team_setup"],
+				["locally-managed", "locally-managed", "reviewed_team_setup"],
 			])
 				insertMapping.run(project, project, scope, source, NOW, NOW);
 			const session = db.prepare(
@@ -2042,29 +2136,30 @@ describe("legacy Team setup completion manifests", () => {
 			);
 			const before = Number(session.run(NOW, "api", PROJECT_A).lastInsertRowid);
 			expect(resolveSessionScopeId(db, { sessionId: before })).toBe("scope-engineering");
-			seedPriorContainmentState(state, manifest.team_id, draft.attemptId);
-			const policySnapshot = () =>
-				["policy_teams", "project_recipients", "legacy_team_setup_drafts"].map((table) =>
-					db.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all(),
-				);
-			const previousPolicy = policySnapshot();
-			const mappings = () => db.prepare("SELECT * FROM project_scope_mappings ORDER BY id").all();
-			const previousMappings = mappings();
+			seedPriorContainmentState(db, state, manifest.team_id, draft.attemptId);
+			const previousMappings = containmentMappingsSnapshot(db);
+			const affectedProjects = seedContainmentWakeAuthority(db, {
+				teamId: manifest.team_id,
+				revision: manifest.team.policy_revision,
+				state,
+			});
+			const previousPolicy = containmentPolicySnapshot(db);
 
 			await containLegacyTeamSetupCompletionConflict(db, {
 				coordinatorId: COORDINATOR_ID,
 				groupId: GROUP_ID,
 			});
-			if (state !== "active") expect(policySnapshot()).toEqual(previousPolicy);
-			if (!cleanup) expect(mappings()).toEqual(previousMappings);
-			const containedPolicy = policySnapshot();
-			const containedMappings = mappings();
+			if (state !== "active") expect(containmentPolicySnapshot(db)).toEqual(previousPolicy);
+			if (!cleanup) expect(containmentMappingsSnapshot(db)).toEqual(previousMappings);
+			const containedPolicy = containmentPolicySnapshot(db);
+			const containedMappings = containmentMappingsSnapshot(db);
 			await containLegacyTeamSetupCompletionConflict(db, {
 				coordinatorId: COORDINATOR_ID,
 				groupId: GROUP_ID,
 			});
-			expect(policySnapshot()).toEqual(containedPolicy);
-			expect(mappings()).toEqual(containedMappings);
+			expect(containmentPolicySnapshot(db)).toEqual(containedPolicy);
+			expect(containmentMappingsSnapshot(db)).toEqual(containedMappings);
+			expectContainmentWake(db, affectedProjects, state);
 			const after = Number(session.run(NOW, "api", PROJECT_A).lastInsertRowid);
 			expect(resolveSessionScopeId(db, { sessionId: after })).toBe(
 				cleanup ? "local-default" : "scope-engineering",
@@ -2075,7 +2170,7 @@ describe("legacy Team setup completion manifests", () => {
 					.prepare("SELECT project_pattern FROM project_scope_mappings ORDER BY project_pattern")
 					.pluck()
 					.all(),
-			).toEqual(["foreign-coordinator", "foreign-group", "manual"]);
+			).toEqual(["foreign-coordinator", "foreign-group", "locally-managed", "manual"]);
 		},
 	);
 

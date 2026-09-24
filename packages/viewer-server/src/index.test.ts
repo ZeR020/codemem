@@ -482,15 +482,384 @@ async function resolvesReceivedProjectOriginDeviceNames(): Promise<void> {
 	}
 }
 
+async function aliasesPreUpgradeSharesToRepositoryProjects(
+	options: { mappingOnly?: boolean } = {},
+): Promise<void> {
+	const { app, getStore, cleanup } = createTestApp();
+	const repositoryDirectory = options.mappingOnly
+		? mkdtempSync(join(tmpdir(), "codemem-share-repository-"))
+		: null;
+	try {
+		await app.request("/api/stats");
+		const store = getStore();
+		if (!store) throw new Error("store not initialized");
+		const cwd = repositoryDirectory ?? "/workspace/repository";
+		const repositoryIdentity = "https://example.test/acme/repository.git";
+		if (repositoryDirectory) {
+			mkdirSync(join(repositoryDirectory, ".git"));
+			writeFileSync(
+				join(repositoryDirectory, ".git", "config"),
+				`[remote "origin"]\n\turl = ${repositoryIdentity}\n`,
+			);
+			store.db
+				.prepare(`INSERT INTO project_scope_mappings(
+				workspace_identity, project_pattern, scope_id, priority, source, created_at, updated_at
+			) VALUES (?, ?, 'local-default', 1000, 'test', ?, ?)`)
+				.run(
+					repositoryIdentity,
+					repositoryIdentity,
+					"2026-09-22T00:00:00.000Z",
+					"2026-09-22T00:00:00.000Z",
+				);
+		}
+		const sessionId = insertTestSession(store.db);
+		store.db
+			.prepare(
+				"UPDATE sessions SET cwd = ?, project = 'repository', metadata_json = ? WHERE id = ?",
+			)
+			.run(
+				cwd,
+				JSON.stringify(
+					options.mappingOnly ? {} : { codemem_repository_identity: repositoryIdentity },
+				),
+				sessionId,
+			);
+		insertTestMemory(store, { sessionId, kind: "discovery", title: "repository memory" });
+		store.db
+			.prepare(`INSERT INTO share_operations(
+				operation_id, state, inviter_actor_id, inviter_device_ids_json, person_id,
+				person_kind, teammate_name, history_policy, reviewed_project_set_digest,
+				coordinator_group_id, invite_token_digest, invite_expires_at,
+				recipient_actor_id, recipient_device_id, acceptance_consumed_at, created_at, updated_at
+			 ) VALUES ('share-pre-upgrade', 'active', ?, ?, 'actor-recipient', 'existing',
+				'Recipient', 'existing_and_future', 'digest', 'team', 'invite-digest',
+				'2099-01-01T00:00:00.000Z', 'actor-recipient', 'recipient-device',
+				'2026-09-22T00:00:00.000Z', '2026-09-22T00:00:00.000Z',
+				'2026-09-22T00:00:00.000Z')`)
+			.run(store.actorId, JSON.stringify([store.deviceId]));
+		store.db
+			.prepare(`INSERT INTO share_operation_projects(
+				operation_id, canonical_project_identity, display_name, identity_source,
+				existing_memory_count, ordinal
+			 ) VALUES ('share-pre-upgrade', ?, 'repository', 'cwd', 1, 0)`)
+			.run(cwd);
+		if (!options.mappingOnly) {
+			const siblingCwd = "/workspace/repository-worktree";
+			store.db
+				.prepare(
+					"INSERT INTO sessions(started_at, cwd, project, metadata_json) VALUES (?, ?, ?, ?)",
+				)
+				.run(
+					"2026-09-22T00:00:00.000Z",
+					siblingCwd,
+					"repository",
+					JSON.stringify({ codemem_repository_identity: repositoryIdentity }),
+				);
+			store.db
+				.prepare(`INSERT INTO share_operation_projects(
+				operation_id, canonical_project_identity, display_name, identity_source,
+				existing_memory_count, ordinal
+			 ) VALUES ('share-pre-upgrade', ?, 'repository worktree', 'cwd', 0, 1)`)
+				.run(siblingCwd);
+		}
+
+		const response = await app.request("/api/sync/projects");
+		const inventory = (await response.json()) as {
+			projects: Array<{ workspace_identity: string; sharing: unknown[] }>;
+		};
+		expect(inventory.projects).toEqual([
+			expect.objectContaining({
+				workspace_identity: repositoryIdentity,
+				sharing: [expect.anything()],
+			}),
+		]);
+	} finally {
+		cleanup();
+		if (repositoryDirectory) rmSync(repositoryDirectory, { recursive: true, force: true });
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+async function requestBehindPublicationForDb(
+	db: InstanceType<typeof Database>,
+	request: () => Promise<Response>,
+): Promise<Response> {
+	let releasePublication: () => void = () => undefined;
+	const publicationGate = new Promise<void>((resolve) => {
+		releasePublication = resolve;
+	});
+	let markPublicationStarted: () => void = () => undefined;
+	const publicationStarted = new Promise<void>((resolve) => {
+		markPublicationStarted = resolve;
+	});
+	const heldPublication = core.serializeRecipientPolicyPublicationMutation(db, async () => {
+		markPublicationStarted();
+		await publicationGate;
+	});
+	await publicationStarted;
+	let requestSettled = false;
+	const pendingRequest = request().then((response) => {
+		requestSettled = true;
+		return response;
+	});
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	expect(requestSettled).toBe(false);
+	releasePublication();
+	const response = await pendingRequest;
+	await heldPublication;
+	return response;
+}
+
+async function saveMappingWithConfirmation(
+	request: (input: Record<string, unknown>) => Promise<Response>,
+	input: Record<string, unknown>,
+): Promise<Response> {
+	const preview = await request(input);
+	expect(preview.status).toBe(409);
+	const challenge = (await preview.json()) as {
+		required_guardrails: string[];
+		required_guardrail_tokens: string[];
+	};
+	expect(challenge.required_guardrails).toContain("scope_reassignment_old_copies");
+	const saved = await request({
+		...input,
+		confirmed_guardrail_tokens: challenge.required_guardrail_tokens,
+	});
+	expect(saved.status).toBe(200);
+	return saved;
+}
 
 describe("GET /api/sync/projects origin devices", () => {
 	it(
 		"resolves safe names and rejects raw IDs from identity and peer records",
 		resolvesReceivedProjectOriginDeviceNames,
 	);
+	it(
+		"attaches pre-upgrade cwd shares to repository Projects",
+		aliasesPreUpgradeSharesToRepositoryProjects,
+	);
+	it("attaches cwd shares when only a mapping identifies the repository", () =>
+		aliasesPreUpgradeSharesToRepositoryProjects({ mappingOnly: true }));
+});
+
+it("wakes affected recipient policies after an actor merge", async () => {
+	const { app, getStore, cleanup } = createTestApp();
+	try {
+		await app.request("/api/sync/actors");
+		const store = getStore();
+		if (!store) throw new Error("store not initialized");
+		const createdResponse = await app.request("/api/sync/actors", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ display_name: "Merge wake actor" }),
+		});
+		const secondaryActorId = ((await createdResponse.json()) as { actor_id: string }).actor_id;
+		const now = new Date().toISOString();
+		store.db
+			.prepare(`INSERT INTO project_recipients(
+			canonical_project_identity, recipient_kind, recipient_id, status, provenance,
+			policy_revision, migration_state, idempotency_key, created_at, updated_at
+		) VALUES ('merge-wake-project', 'identity', ?, 'active', 'test', '1', 'native',
+		'merge-wake-recipient', ?, ?)`)
+			.run(secondaryActorId, now, now);
+		store.db
+			.prepare(`INSERT INTO recipient_policy_authority_states(
+			canonical_project_identity, authority_state, generation, state_changed_at,
+			last_attempt_at, created_at, updated_at
+		) VALUES ('merge-wake-project', 'active', 1, ?, ?, ?, ?)`)
+			.run(now, now, now, now);
+		const mergeResponse = await app.request("/api/sync/actors/merge", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				primary_actor_id: store.actorId,
+				secondary_actor_id: secondaryActorId,
+			}),
+		});
+		expect(mergeResponse.status).toBe(200);
+		expect(
+			store.db
+				.prepare(
+					"SELECT last_attempt_at FROM recipient_policy_authority_states WHERE canonical_project_identity = 'merge-wake-project'",
+				)
+				.pluck()
+				.get(),
+		).toBeNull();
+	} finally {
+		cleanup();
+	}
+});
+
+it("wakes recipient policies after single and bulk Project remaps", async () => {
+	const { app, getStore, cleanup } = createTestApp();
+	try {
+		await app.request("/api/stats");
+		const store = getStore();
+		if (!store) throw new Error("store not initialized");
+		const now = new Date().toISOString();
+		for (const scopeId of ["mapping-wake-a", "mapping-wake-b"]) {
+			store.db
+				.prepare(`INSERT INTO replication_scopes(
+				scope_id, label, kind, authority_type, coordinator_id, group_id,
+				membership_epoch, status, created_at, updated_at
+			) VALUES (?, ?, 'managed_project', 'coordinator', 'coordinator', 'group',
+			1, 'active', ?, ?)`)
+				.run(scopeId, scopeId, now, now);
+		}
+		const projects = ["https://example.test/acme/single.git", "https://example.test/acme/bulk.git"];
+		const legacyCwd = "/workspace/single";
+		const insertAuthority = store.db.prepare(`INSERT INTO recipient_policy_authority_states(
+			canonical_project_identity, authority_state, generation, state_changed_at,
+			last_attempt_at, created_at, updated_at
+		) VALUES (?, 'active', 1, ?, ?, ?, ?)`);
+		for (const project of projects) {
+			insertAuthority.run(project, now, now, now, now);
+		}
+		const request = (path: string, mappings: unknown) =>
+			app.request(path, {
+				method: "PUT",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify(mappings),
+			});
+		const singleResponse = await request("/api/sync/sharing-domains/project-mappings", {
+			workspace_identity: projects[0],
+			project_pattern: projects[0],
+			scope_id: "mapping-wake-a",
+		});
+		expect(singleResponse.status).toBe(200);
+		const singleMapping = (await singleResponse.json()) as { mapping: { id: number } };
+		expect(
+			(
+				await request("/api/sync/sharing-domains/project-mappings/bulk", {
+					mappings: [
+						{
+							workspace_identity: projects[1],
+							project_pattern: projects[1],
+							scope_id: "mapping-wake-b",
+						},
+					],
+				})
+			).status,
+		).toBe(200);
+		expect(
+			store.db
+				.prepare(
+					"SELECT last_attempt_at FROM recipient_policy_authority_states ORDER BY canonical_project_identity",
+				)
+				.pluck()
+				.all(),
+		).toEqual([null, null]);
+		store.db
+			.prepare(
+				"UPDATE recipient_policy_authority_states SET last_attempt_at = ? WHERE canonical_project_identity = ?",
+			)
+			.run(now, projects[0]);
+		store.db
+			.prepare("INSERT INTO sessions(started_at, cwd, metadata_json) VALUES (?, ?, ?)")
+			.run(now, legacyCwd, JSON.stringify({ codemem_repository_identity: projects[0] }));
+		insertAuthority.run(legacyCwd, now, now, now, now);
+		const siblingProject = "https://example.test/acme/sibling.git";
+		store.db
+			.prepare(`INSERT INTO project_scope_mappings(
+			workspace_identity, project_pattern, scope_id, priority, source, created_at, updated_at
+		 ) VALUES (?, ?, 'mapping-wake-a', 0, 'test', ?, ?)`)
+			.run(siblingProject, siblingProject, now, now);
+		insertAuthority.run(siblingProject, now, now, now, now);
+		const deleteResponse = await app.request(
+			`/api/sync/sharing-domains/project-mappings/${singleMapping.mapping.id}`,
+			{ method: "DELETE" },
+		);
+		expect(deleteResponse.status).toBe(200);
+		expect(
+			store.db
+				.prepare(
+					"SELECT last_attempt_at FROM recipient_policy_authority_states WHERE canonical_project_identity = ?",
+				)
+				.pluck()
+				.get(legacyCwd),
+		).toBeNull();
+		expect(
+			store.db
+				.prepare(
+					"SELECT last_attempt_at FROM recipient_policy_authority_states WHERE canonical_project_identity = ?",
+				)
+				.pluck()
+				.get(projects[0]),
+		).toBeNull();
+		expect(
+			store.db
+				.prepare(
+					"SELECT last_attempt_at FROM recipient_policy_authority_states WHERE canonical_project_identity = ?",
+				)
+				.pluck()
+				.get(siblingProject),
+		).toBeNull();
+	} finally {
+		cleanup();
+	}
+});
+
+it("wakes old-scope siblings when an ID-less remap uses a normalized identity", async () => {
+	const { app, getStore, cleanup } = createTestApp();
+	try {
+		await app.request("/api/stats");
+		const store = getStore();
+		if (!store) throw new Error("store not initialized");
+		const now = new Date().toISOString();
+		for (const scopeId of ["normalized-old", "normalized-new"]) {
+			store.db
+				.prepare(`INSERT INTO replication_scopes(
+					scope_id, label, kind, authority_type, coordinator_id, group_id,
+					membership_epoch, status, created_at, updated_at
+				 ) VALUES (?, ?, 'managed_project', 'coordinator', 'coordinator', 'group',
+					1, 'active', ?, ?) `)
+				.run(scopeId, scopeId, now, now);
+		}
+		const insertMapping = store.db.prepare(`INSERT INTO project_scope_mappings(
+			workspace_identity, project_pattern, scope_id, priority, source, created_at, updated_at
+		 ) VALUES (?, ?, 'normalized-old', 0, 'test', ?, ?)`);
+		insertMapping.run("/repo", "/repo", now, now);
+		insertMapping.run("project-old-sibling", "project-old-sibling", now, now);
+		store.db
+			.prepare(`INSERT INTO recipient_policy_authority_states(
+			canonical_project_identity, authority_state, generation, state_changed_at,
+			last_attempt_at, created_at, updated_at
+		 ) VALUES ('project-old-sibling', 'active', 1, ?, ?, ?, ?)`)
+			.run(now, now, now, now);
+		const request = (confirmedGuardrailTokens: string[] = []) =>
+			app.request("/api/sync/sharing-domains/project-mappings", {
+				method: "PUT",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					confirmed_guardrail_tokens: confirmedGuardrailTokens,
+					workspace_identity: "/repo/",
+					project_pattern: "/repo/",
+					scope_id: "normalized-new",
+				}),
+			});
+		const unconfirmedResponse = await request();
+		expect(unconfirmedResponse.status).toBe(409);
+		const unconfirmed = (await unconfirmedResponse.json()) as {
+			required_guardrail_tokens: string[];
+		};
+
+		const response = await request(unconfirmed.required_guardrail_tokens);
+
+		expect(response.status).toBe(200);
+		expect(
+			store.db
+				.prepare(
+					"SELECT last_attempt_at FROM recipient_policy_authority_states WHERE canonical_project_identity = 'project-old-sibling'",
+				)
+				.pluck()
+				.get(),
+		).toBeNull();
+	} finally {
+		cleanup();
+	}
 });
 
 describe("viewer-server", () => {
@@ -12464,35 +12833,8 @@ describe("viewer-server", () => {
 				await app.request("/api/stats");
 				const store = getStore();
 				if (!store) throw new Error("store not initialized");
-				const requestBehindPublication = async (request: () => Promise<Response>) => {
-					let releasePublication: () => void = () => undefined;
-					const publicationGate = new Promise<void>((resolve) => {
-						releasePublication = resolve;
-					});
-					let markPublicationStarted: () => void = () => undefined;
-					const publicationStarted = new Promise<void>((resolve) => {
-						markPublicationStarted = resolve;
-					});
-					const heldPublication = core.serializeRecipientPolicyPublicationMutation(
-						store.db,
-						async () => {
-							markPublicationStarted();
-							await publicationGate;
-						},
-					);
-					await publicationStarted;
-					let requestSettled = false;
-					const pendingRequest = request().then((response) => {
-						requestSettled = true;
-						return response;
-					});
-					await new Promise((resolve) => setTimeout(resolve, 0));
-					expect(requestSettled).toBe(false);
-					releasePublication();
-					const response = await pendingRequest;
-					await heldPublication;
-					return response;
-				};
+				const requestBehindPublication = (request: () => Promise<Response>) =>
+					requestBehindPublicationForDb(store.db, request);
 				const sessionId = insertTestSession(store.db);
 				insertTestMemory(store, {
 					sessionId,
@@ -12612,8 +12954,24 @@ describe("viewer-server", () => {
 						body: JSON.stringify(mappingRequest),
 					}),
 				);
-				expect(saveRes.status).toBe(200);
-				const saveBody = (await saveRes.json()) as { mapping: { id: number; scope_id: string } };
+				expect(saveRes.status).toBe(409);
+				const required = (await saveRes.json()) as {
+					required_guardrails: string[];
+					required_guardrail_tokens: string[];
+				};
+				expect(required.required_guardrails).toContain("scope_reassignment_old_copies");
+				const confirmedSaveRes = await app.request("/api/sync/sharing-domains/project-mappings", {
+					method: "PUT",
+					headers: { "Content-Type": "application/json" },
+					body: JSON.stringify({
+						...mappingRequest,
+						confirmed_guardrail_tokens: required.required_guardrail_tokens,
+					}),
+				});
+				expect(confirmedSaveRes.status).toBe(200);
+				const saveBody = (await confirmedSaveRes.json()) as {
+					mapping: { id: number; scope_id: string };
+				};
 				expect(saveBody.mapping.scope_id).toBe("acme-work");
 
 				const updatedRes = await app.request("/api/sync/sharing-domains/settings");
@@ -12650,7 +13008,7 @@ describe("viewer-server", () => {
 						method: "DELETE",
 					}),
 				);
-				expect(deleteRes.status).toBe(200);
+				expect(deleteRes.status).toBe(409);
 			} finally {
 				cleanup();
 			}
@@ -13895,16 +14253,19 @@ describe("viewer-server", () => {
 					.run(now, now);
 
 				const projectIdentity = "https://git.example.invalid/exampleco/api.git";
-				const saveRes = await app.request("/api/sync/sharing-domains/project-mappings", {
-					method: "PUT",
-					headers: { "Content-Type": "application/json" },
-					body: JSON.stringify({
+				await saveMappingWithConfirmation(
+					(input) =>
+						app.request("/api/sync/sharing-domains/project-mappings", {
+							method: "PUT",
+							headers: { "Content-Type": "application/json" },
+							body: JSON.stringify(input),
+						}),
+					{
 						workspace_identity: projectIdentity,
 						project_pattern: "api",
 						scope_id: "exampleco-work",
-					}),
-				});
-				expect(saveRes.status).toBe(200);
+					},
+				);
 
 				const inventoryRes = await app.request(
 					"/api/sync/projects?q=exampleco&status=explicitly_mapped&limit=1",
@@ -14401,16 +14762,19 @@ describe("viewer-server", () => {
 				};
 				const project = settings.projects.find((item) => item.display_project === "test-project");
 				if (!project) throw new Error("project missing");
-				const createRes = await app.request("/api/sync/sharing-domains/project-mappings", {
-					method: "PUT",
-					headers: { "Content-Type": "application/json" },
-					body: JSON.stringify({
+				const createRes = await saveMappingWithConfirmation(
+					(input) =>
+						app.request("/api/sync/sharing-domains/project-mappings", {
+							method: "PUT",
+							headers: { "Content-Type": "application/json" },
+							body: JSON.stringify(input),
+						}),
+					{
 						workspace_identity: project.workspace_identity,
 						project_pattern: project.display_project,
 						scope_id: "acme-work",
-					}),
-				});
-				expect(createRes.status).toBe(200);
+					},
+				);
 				const created = (await createRes.json()) as { mapping: { id: number } };
 
 				const unconfirmedRes = await app.request("/api/sync/sharing-domains/project-mappings", {
@@ -20299,5 +20663,186 @@ describe("viewer-server", () => {
 				cleanup();
 			}
 		});
+	});
+});
+
+describe("repository Project cleanup inference", () => {
+	it("does not infer a reused checkout over an explicit historical remote", async () => {
+		const { app, getStore, cleanup } = createTestApp();
+		try {
+			await app.request("/api/stats");
+			const store = getStore();
+			if (!store) throw new Error("store not initialized");
+			const cwd = "/workspace/reused-api";
+			const oldRepository = "https://git.example.invalid/tmp/old-api.git";
+			const newRepository = "https://git.example.invalid/tmp/new-api.git";
+			const historicalSessionId = insertTestSession(store.db);
+			store.db
+				.prepare("UPDATE sessions SET cwd = ?, git_remote = ?, metadata_json = '{}' WHERE id = ?")
+				.run(cwd, oldRepository, historicalSessionId);
+			insertTestMemory(store, {
+				kind: "discovery",
+				sessionId: historicalSessionId,
+				title: "old repository memory",
+			});
+			const discoveredSessionId = insertTestSession(store.db);
+			store.db
+				.prepare("UPDATE sessions SET cwd = ?, git_remote = NULL, metadata_json = ? WHERE id = ?")
+				.run(
+					cwd,
+					JSON.stringify({ codemem_repository_identity: newRepository }),
+					discoveredSessionId,
+				);
+
+			const previewRes = await app.request("/api/sync/projects/forget", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ workspace_identity: newRepository }),
+			});
+
+			expect(previewRes.status).toBe(404);
+			expect(
+				store.db
+					.prepare("SELECT active FROM memory_items WHERE session_id = ?")
+					.pluck()
+					.get(historicalSessionId),
+			).toBe(1);
+		} finally {
+			cleanup();
+		}
+	});
+
+	it("forgets historical cwd-only memories in an inferred repository Project", async () => {
+		const { app, getStore, cleanup } = createTestApp();
+		try {
+			await app.request("/api/stats");
+			const store = getStore();
+			if (!store) throw new Error("store not initialized");
+			const cwd = "/workspace/historical-api";
+			const repositoryIdentity = "https://git.example.invalid/tmp/historical-api.git";
+			const historicalSessionId = insertTestSession(store.db);
+			store.db
+				.prepare(
+					"UPDATE sessions SET cwd = ?, git_remote = NULL, metadata_json = '{}' WHERE id = ?",
+				)
+				.run(cwd, historicalSessionId);
+			insertTestMemory(store, {
+				kind: "discovery",
+				sessionId: historicalSessionId,
+				title: "historical repository memory",
+			});
+			const discoveredSessionId = insertTestSession(store.db);
+			store.db
+				.prepare("UPDATE sessions SET cwd = ?, git_remote = NULL, metadata_json = ? WHERE id = ?")
+				.run(
+					cwd,
+					JSON.stringify({ codemem_repository_identity: repositoryIdentity }),
+					discoveredSessionId,
+				);
+
+			const previewRes = await app.request("/api/sync/projects/forget", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ workspace_identity: repositoryIdentity }),
+			});
+			expect(previewRes.status).toBe(409);
+			const preview = (await previewRes.json()) as {
+				preview: { confirmation_token: string; local_owned_memory_count: number };
+			};
+			expect(preview.preview.local_owned_memory_count).toBe(1);
+
+			const forgetRes = await app.request("/api/sync/projects/forget", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({
+					confirmation_token: preview.preview.confirmation_token,
+					confirmed: true,
+					workspace_identity: repositoryIdentity,
+				}),
+			});
+			expect(forgetRes.status).toBe(200);
+			expect(await forgetRes.json()).toMatchObject({ forgotten_memory_count: 1 });
+		} finally {
+			cleanup();
+		}
+	});
+});
+
+describe("legacy shared review repository inference", () => {
+	it("groups and reassigns historical cwd-only repository memories", async () => {
+		const { app, getStore, cleanup } = createTestApp();
+		try {
+			await app.request("/api/stats");
+			const store = getStore();
+			if (!store) throw new Error("store not initialized");
+			const now = new Date().toISOString();
+			store.db
+				.prepare(
+					`INSERT INTO replication_scopes(
+						scope_id, label, kind, authority_type, membership_epoch, status, created_at, updated_at
+					 ) VALUES ('oss', 'OSS', 'team', 'coordinator', 1, 'active', ?, ?)`,
+				)
+				.run(now, now);
+			grantSyncScopeToDevices(store, "oss", [store.deviceId]);
+			const cwd = "/workspace/oss/inferred";
+			const repositoryIdentity = "https://git.example.invalid/oss/inferred.git";
+			const historicalSessionId = insertTestSession(store.db);
+			store.db
+				.prepare("UPDATE sessions SET cwd = ?, project = ?, metadata_json = '{}' WHERE id = ?")
+				.run(cwd, "oss-inferred", historicalSessionId);
+			insertTestMemory(store, {
+				kind: "discovery",
+				scopeId: "legacy-shared-review",
+				sessionId: historicalSessionId,
+				title: "historical local shared",
+			});
+			const discoveredSessionId = insertTestSession(store.db);
+			store.db
+				.prepare("UPDATE sessions SET cwd = ?, project = ?, metadata_json = ? WHERE id = ?")
+				.run(
+					cwd,
+					"oss-inferred",
+					JSON.stringify({ codemem_repository_identity: repositoryIdentity }),
+					discoveredSessionId,
+				);
+			insertTestMemory(store, {
+				actorId: "remote-actor",
+				kind: "discovery",
+				originDeviceId: "peer-device",
+				scopeId: "legacy-shared-review",
+				sessionId: discoveredSessionId,
+				title: "repository peer shared",
+			});
+
+			const previewRes = await app.request("/api/sync/legacy-shared-review/reassign", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ scope_id: "oss", workspace_identity: repositoryIdentity }),
+			});
+			expect(previewRes.status).toBe(409);
+			const preview = (await previewRes.json()) as {
+				preview: {
+					confirmation_token: string;
+					memory_count: number;
+					reassignable_memory_count: number;
+				};
+			};
+			expect(preview.preview).toMatchObject({ memory_count: 2, reassignable_memory_count: 1 });
+
+			const applyRes = await app.request("/api/sync/legacy-shared-review/reassign", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({
+					confirmation_token: preview.preview.confirmation_token,
+					confirmed_old_copies: true,
+					scope_id: "oss",
+					workspace_identity: repositoryIdentity,
+				}),
+			});
+			expect(applyRes.status).toBe(200);
+			expect(await applyRes.json()).toMatchObject({ reassigned_memory_count: 1 });
+		} finally {
+			cleanup();
+		}
 	});
 });
