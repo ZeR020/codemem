@@ -6,7 +6,7 @@
  *   - Viewer auto-start begins on session_start (or first need).
  *   - Idempotent cleanup on session_shutdown.
  *   - Re-key session state from ctx.sessionManager.getSessionId() every session_start.
- *   - Durable ingest cursors via pi.appendEntry.
+ *   - Durable ingest cursors and injection decisions via pi.appendEntry.
  *
  * Surfaces:
  *   - Ingest → POST /api/pi-hooks → CLI pi-hook-ingest
@@ -70,6 +70,9 @@ export function __setTestExecImpl(fn: ExecCodememFn | null): void {
 
 const CURSOR_CUSTOM_TYPE = "codemem.cursor";
 const CURSOR_VERSION = 1;
+
+/** Persisted injection decision payload: { v: 1, key, block, fingerprints }. */
+const INJECT_CUSTOM_TYPE = "codemem.inject";
 
 /** Flush-only signals — never durable-deduped; unique per firing. */
 const PI_FLUSH_ONLY_EVENTS = new Set(["session_before_compact"]);
@@ -137,6 +140,22 @@ function loadCursorsFromSession(ctx: ExtensionContext, sessionId: string): Set<s
 		// getEntries may throw on ephemeral sessions
 	}
 	return seen;
+}
+
+/**
+ * Restore persisted injection decisions from the live branch (getEntries would
+ * also see abandoned branches) after injector.rekey cleared the map.
+ */
+function restoreInjectDecisions(injector: PiInjector, ctx: ExtensionContext): void {
+	try {
+		const entries = ctx.sessionManager.getBranch().filter((entry) => {
+			if (entry.type !== "custom") return false;
+			return (entry as { customType?: string }).customType === INJECT_CUSTOM_TYPE;
+		});
+		injector.restore(entries);
+	} catch {
+		// getBranch may throw on ephemeral sessions
+	}
 }
 
 function persistCursor(pi: ExtensionAPI, sessionId: string, seenEventKeys: Set<string>): void {
@@ -320,6 +339,7 @@ async function onSessionStart(
 	state.seenEventKeys = loadCursorsFromSession(ctx, sessionId);
 	client.rekey(sessionId, cwd, project);
 	injector.rekey(sessionId);
+	restoreInjectDecisions(injector, ctx);
 	if (config.toolsMode === "native") {
 		warnDuplicateToolSurface(ctx, cwd);
 	}
@@ -509,6 +529,18 @@ export default function codememPiExtension(pi: ExtensionAPI): void {
 			// Not messageDiscriminator: that counter belongs to ingest entry ids.
 			missingTimestampSeq += 1;
 			return `inject-n:${missingTimestampSeq}`;
+		},
+		persistDecision: (key, decision) => {
+			try {
+				pi.appendEntry(INJECT_CUSTOM_TYPE, {
+					v: 1,
+					key,
+					block: decision.block,
+					fingerprints: decision.fingerprints,
+				});
+			} catch {
+				// best-effort persistence
+			}
 		},
 	});
 
