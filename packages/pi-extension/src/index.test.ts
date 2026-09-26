@@ -43,6 +43,8 @@ function createMockCtx(
 		sessionId?: string;
 		cwd?: string;
 		entries?: unknown[];
+		/** Live-branch entries; defaults to entries (injection restore reads getBranch). */
+		branch?: unknown[];
 		signal?: AbortSignal;
 		/** When set, getLeafEntry returns this value (including null). */
 		leafEntry?: { id?: string; type?: string } | null;
@@ -57,6 +59,7 @@ function createMockCtx(
 		sessionManager: {
 			getSessionId: () => sessionId,
 			getEntries: () => overrides.entries ?? [],
+			getBranch: () => overrides.branch ?? overrides.entries ?? [],
 			getLeafEntry: () => leafEntry,
 			getSessionFile: () => null,
 		},
@@ -752,6 +755,71 @@ describe("injection (context)", () => {
 		const block = formatPiInjectionBlock("x", 1000);
 		expect(block).not.toMatch(/"customType"/);
 		expect(typeof block).toBe("string");
+	});
+});
+
+describe("injection decision restore", () => {
+	afterEach(resetPiExtensionTest);
+
+	it("session_start restores a codemem.inject entry from getBranch; the custom entry never becomes a context message", async () => {
+		vi.stubEnv("CODEMEM_PI_INJECT_PROMPTS", "1");
+		const cwd = "/tmp/codemem-pi-test";
+		let packCalls = 0;
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (input: RequestInfo | URL) => {
+				const url = String(input);
+				if (url.includes("/api/prompt-pack-profile")) return matchingProfile(cwd);
+				if (url.includes("/api/raw-events/status")) return jsonOk({ ingest: { available: true } });
+				if (url.includes("/api/pack")) {
+					packCalls += 1;
+					return jsonOk({ pack_text: "live pack", items: [], metrics: {} });
+				}
+				return { ok: false, status: 404, json: async () => ({}), text: async () => "" };
+			}),
+		);
+
+		const restoredKey = stableMessageEntryId(
+			"sess-test-1",
+			"user",
+			"how does auth work?",
+			1_700_000_000_001,
+		);
+		const { pi, handlers, appended } = createMockPi();
+		codememPiExtension(pi as never);
+		// getEntries stays empty — only getBranch carries the persisted decision.
+		const ctx = createMockCtx({
+			branch: [
+				{
+					type: "custom",
+					customType: "codemem.inject",
+					data: { v: 1, key: restoredKey, block: "RESTORED PASTE BYTES", fingerprints: [] },
+				},
+			],
+		});
+		await handlers.get("session_start")?.[0]?.({ type: "session_start", reason: "startup" }, ctx);
+
+		const messages = [
+			{ role: "user", content: "how does auth work?", timestamp: 1_700_000_000_001 },
+		];
+		const result = await handlers.get("context")?.[0]?.({ type: "context", messages }, ctx);
+
+		expect(result).toBeUndefined();
+		expect(packCalls).toBe(0);
+		expect(messages).toHaveLength(1);
+		expect(messages[0]?.content).toBe("how does auth work?\n\nRESTORED PASTE BYTES");
+
+		// A new timestamped message persists its decision once via appendEntry.
+		const fresh = [{ role: "user", content: "next question", timestamp: 1_700_000_000_002 }];
+		await handlers.get("context")?.[0]?.({ type: "context", messages: fresh }, ctx);
+		const injectEntries = appended.filter((entry) => entry.type === "codemem.inject");
+		expect(injectEntries).toHaveLength(1);
+		expect(injectEntries[0]?.data).toEqual({
+			v: 1,
+			key: stableMessageEntryId("sess-test-1", "user", "next question", 1_700_000_000_002),
+			block: expect.any(String),
+			fingerprints: [],
+		});
 	});
 });
 

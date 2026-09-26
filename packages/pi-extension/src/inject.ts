@@ -7,9 +7,12 @@
  * returns anything — a context handler that returns { messages } drops system
  * messages on Pi 0.84 and collapses them mid-conversation on Pi 0.87.
  *
- * Decisions live in memory for this extension instance only. A restart starts
- * with an empty cache and is not cache-safe; older messages replay again only
- * after new decisions build up.
+ * Decisions live in memory and are mirrored once per new decision to a custom
+ * session entry (`codemem.inject` — session bookkeeping, never model context).
+ * session_start restores them after rekey, so a restart of the same session
+ * replays the saved pastes for timestamped user messages; timestamp-less
+ * messages are not persisted (their `n:<seq>` discriminator does not survive a
+ * restart) and fetch again.
  */
 
 import type { PiCodememClient } from "./client.js";
@@ -41,6 +44,12 @@ export type PiInjector = {
 	clearCompaction(): void;
 	/** Re-key decision identity on session_start. */
 	rekey(sessionId: string): void;
+	/**
+	 * Re-insert persisted decisions (custom session entries from the live
+	 * branch). Malformed payloads are skipped; the map is not cleared first —
+	 * callers rekey() before restoring.
+	 */
+	restore(entries: unknown[]): void;
 };
 
 type InjectDecision = {
@@ -60,6 +69,15 @@ const INJECT_NOTHING: InjectDecision = { block: "", fingerprints: [] };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return value != null && typeof value === "object" && !Array.isArray(value);
+}
+
+function isStringArray(value: unknown): value is string[] {
+	return Array.isArray(value) && value.every((item) => typeof item === "string");
+}
+
+/** Only a finite numeric timestamp yields a decision key that survives restart. */
+function hasFiniteTimestamp(message: PiContextMessage): boolean {
+	return typeof message.timestamp === "number" && Number.isFinite(message.timestamp);
 }
 
 /** ceil(chars / 4) — the OpenCode plugin's estimate, not a provider tokenizer. */
@@ -189,6 +207,21 @@ function collectUsers(
 		});
 }
 
+/**
+ * Insert well-formed { v: 1, key, block, fingerprints } persisted custom
+ * entries; malformed payloads are skipped and the map is not cleared first.
+ */
+function restoreDecisions(decisions: Map<string, InjectDecision>, entries: unknown[]): void {
+	for (const entry of entries) {
+		if (!isRecord(entry)) continue;
+		const data = entry.data;
+		if (!isRecord(data) || data.v !== 1) continue;
+		if (typeof data.key !== "string" || typeof data.block !== "string") continue;
+		if (!isStringArray(data.fingerprints)) continue;
+		decisions.set(data.key, { block: data.block, fingerprints: data.fingerprints });
+	}
+}
+
 /** Compaction: drop cache entries whose user messages are no longer present. */
 function dropDecisionsForAbsentMessages(
 	decisions: Map<string, InjectDecision>,
@@ -197,6 +230,26 @@ function dropDecisionsForAbsentMessages(
 	const present = new Set(users.map((user) => user.key));
 	for (const key of [...decisions.keys()]) {
 		if (!present.has(key)) decisions.delete(key);
+	}
+}
+
+/**
+ * Freeze a fresh decision in memory, then persist it once (best-effort, only
+ * timestamped messages whose keys survive restart). A persistence throw never
+ * fails injection — the in-memory decision is already set.
+ */
+function storeFreshDecision(
+	decisions: Map<string, InjectDecision>,
+	latest: InjectUser,
+	decision: InjectDecision,
+	persistDecision: ((key: string, decision: InjectDecision) => void) | undefined,
+): void {
+	decisions.set(latest.key, decision);
+	if (!persistDecision || !hasFiniteTimestamp(latest.message)) return;
+	try {
+		persistDecision(latest.key, decision);
+	} catch {
+		// best-effort persistence; the in-memory decision stands
 	}
 }
 
@@ -273,8 +326,10 @@ export function createPiInjector(options: {
 	 * not the ingest counter, so a missing timestamp is not cached.
 	 */
 	discriminator: (message: PiContextMessage) => string | number;
+	/** Best-effort persistence per new decision; finite-timestamp messages only. */
+	persistDecision?: (key: string, decision: InjectDecision) => void;
 }): PiInjector {
-	const { client, config, discriminator } = options;
+	const { client, config, discriminator, persistDecision } = options;
 	/** Decision key (stableMessageEntryId) → frozen decision. */
 	const decisions = new Map<string, InjectDecision>();
 	let compactionPending = false;
@@ -320,7 +375,7 @@ export function createPiInjector(options: {
 			retained,
 			signal,
 		);
-		decisions.set(latest.key, decision);
+		storeFreshDecision(decisions, latest, decision, persistDecision);
 		replay(); // replay again after the await — attaches the new decision too
 	}
 
@@ -337,5 +392,6 @@ export function createPiInjector(options: {
 			decisions.clear();
 			compactionPending = false;
 		},
+		restore: (entries) => restoreDecisions(decisions, entries),
 	};
 }
