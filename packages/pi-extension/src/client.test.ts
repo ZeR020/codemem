@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { resolveProject } from "@codemem/core";
@@ -83,7 +83,12 @@ function stubMatchingPackFetch(
 				});
 			}
 			if (url.pathname === "/api/pack") {
-				const body = { pack_text, items: [], metrics: {}, ...packBody };
+				const body = {
+					pack_text,
+					items: [],
+					metrics: { total_items: pack_text ? 1 : 0, pack_tokens: 1 },
+					...packBody,
+				};
 				return {
 					ok: true,
 					status: 200,
@@ -148,8 +153,9 @@ describe("fetchPackText preformatted flag", () => {
 	const packBody = (pack_text: string) => ({
 		ok: true,
 		status: 200,
-		json: async () => ({ pack_text, items: [], metrics: {} }),
-		text: async () => JSON.stringify({ pack_text, items: [], metrics: {} }),
+		json: async () => ({ pack_text, items: [], metrics: { total_items: 1, pack_tokens: 1 } }),
+		text: async () =>
+			JSON.stringify({ pack_text, items: [], metrics: { total_items: 1, pack_tokens: 1 } }),
 	});
 
 	afterEach(() => {
@@ -166,7 +172,7 @@ describe("fetchPackText preformatted flag", () => {
 
 		const result = await client.fetchPackText("what changed?");
 
-		expect(result).toEqual({ text: "raw pack text", preformatted: false });
+		expect(result).toEqual({ text: "raw pack text", preformatted: false, itemCount: 1 });
 	});
 
 	it("does zero fetch and uses CLI when viewerEnabled is false", async () => {
@@ -217,7 +223,13 @@ describe("fetchPackText preformatted flag", () => {
 			execImpl: async (args) => {
 				if (args[0] === "pi-hook-inject") throw new Error("inject missing");
 				if (args[0] === "pack") {
-					return { stdout: JSON.stringify({ pack_text: "json pack text" }), stderr: "" };
+					return {
+						stdout: JSON.stringify({
+							pack_text: "json pack text",
+							metrics: { total_items: 1, pack_tokens: 4 },
+						}),
+						stderr: "",
+					};
 				}
 				return { stdout: "", stderr: "" };
 			},
@@ -225,7 +237,7 @@ describe("fetchPackText preformatted flag", () => {
 
 		const result = await client.fetchPackText("what changed?");
 
-		expect(result).toEqual({ text: "json pack text", preformatted: false });
+		expect(result).toEqual({ text: "json pack text", preformatted: false, itemCount: 1 });
 	});
 
 	it("never sniffs ## codemem memories inside HTTP pack text (flag decides framing)", async () => {
@@ -382,6 +394,217 @@ describe("fetchPackText span-bearing responses", () => {
 	});
 });
 
+const zeroItemText = "## Index\n(no items)\n\n## Detail\n(no items)";
+let packContractLogDir: string | null = null;
+
+function stubPackBody(body: unknown, cwd = process.cwd()) {
+	const dbPath = resolveViewerDbPath(cwd);
+	const identity = buildViewerIdentityTarget(process.env, cwd);
+	vi.stubGlobal(
+		"fetch",
+		vi.fn(async (input: RequestInfo | URL) => {
+			const url = new URL(String(input));
+			if (url.pathname === "/api/raw-events/status") {
+				return jsonOk({ ingest: { available: true } });
+			}
+			if (url.pathname === "/api/prompt-pack-profile") {
+				return jsonOk({
+					service: "codemem-viewer",
+					protocol_version: 1,
+					min_supported_protocol_version: 1,
+					db_path: dbPath,
+					identity_target: identity,
+				});
+			}
+			if (url.pathname === "/api/pack") return jsonOk(body);
+			return jsonErr(404, {});
+		}),
+	);
+}
+
+function usePackContractLog(): string {
+	packContractLogDir = mkdtempSync(join(tmpdir(), "codemem-pi-metric-"));
+	const path = join(packContractLogDir, "plugin.log");
+	vi.stubEnv("CODEMEM_PLUGIN_LOG_PATH", path);
+	return path;
+}
+
+describe("pack contract", () => {
+	afterEach(() => {
+		vi.unstubAllGlobals();
+		vi.unstubAllEnvs();
+		if (packContractLogDir) {
+			rmSync(packContractLogDir, { recursive: true, force: true });
+			packContractLogDir = null;
+		}
+	});
+
+	it("keeps a valid zero-item HTTP pack and does not fall through", async () => {
+		stubPackBody({
+			pack_text: zeroItemText,
+			rendered_items: [],
+			metrics: { total_items: 0, pack_tokens: 11 },
+		});
+		const commands: string[] = [];
+		const client = new PiCodememClient(onlineConfig, createViewerRuntime(), {
+			execImpl: async (args) => {
+				commands.push(args[0] ?? "");
+				return { stdout: "## codemem memories\n\nshould not run", stderr: "" };
+			},
+		});
+
+		const result = await client.fetchPackText("what changed?");
+
+		expect(commands).toEqual([]);
+		expect(result.preformatted).toBe(false);
+		expect(result.text).toBe(zeroItemText);
+		expect(result.itemCount).toBe(0);
+	});
+
+	it("falls through when HTTP returns {} or an error-shaped body", async () => {
+		for (const body of [{}, { error: { code: "pack_failed", message: "no" } }]) {
+			stubPackBody(body);
+			const commands: string[] = [];
+			const client = new PiCodememClient(onlineConfig, createViewerRuntime(), {
+				execImpl: async (args) => {
+					commands.push(args[0] ?? "");
+					if (args[0] === "pi-hook-inject") {
+						return { stdout: "## codemem memories\n\ncli fallback", stderr: "" };
+					}
+					return { stdout: "{}", stderr: "" };
+				},
+			});
+
+			const result = await client.fetchPackText("what changed?");
+
+			expect(result.preformatted).toBe(true);
+			expect(result.text).toContain("cli fallback");
+			expect(commands).toContain("pi-hook-inject");
+		}
+	});
+
+	it("falls through when CLI pack --json is {} or error-shaped, and keeps a zero-item pack", async () => {
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async () => {
+				throw new Error("offline");
+			}),
+		);
+		const cases = [
+			{ stdout: "{}", fallback: true },
+			{ stdout: JSON.stringify({ error: "pack_failed", message: "no" }), fallback: true },
+			{
+				stdout: JSON.stringify({
+					pack_text: zeroItemText,
+					rendered_items: [],
+					metrics: { total_items: 0, pack_tokens: 11 },
+				}),
+				fallback: false,
+			},
+		];
+		for (const item of cases) {
+			const commands: string[] = [];
+			const client = new PiCodememClient(offlineConfig, createViewerRuntime(), {
+				execImpl: async (args) => {
+					commands.push(args[0] ?? "");
+					if (args[0] === "pack") return { stdout: item.stdout, stderr: "" };
+					return { stdout: "## codemem memories\n\ncli fallback", stderr: "" };
+				},
+			});
+
+			const result = await client.fetchPackText("what changed?");
+
+			if (item.fallback) {
+				expect(commands).toContain("pi-hook-inject");
+				expect(result.preformatted).toBe(true);
+			} else {
+				expect(commands).toEqual(["pack"]);
+				expect(result.preformatted).toBe(false);
+				expect(result.text).toBe(zeroItemText);
+				expect(result.itemCount).toBe(0);
+			}
+		}
+	});
+});
+
+describe("pi inject metrics", () => {
+	afterEach(() => {
+		vi.unstubAllGlobals();
+		vi.unstubAllEnvs();
+		if (packContractLogDir) {
+			rmSync(packContractLogDir, { recursive: true, force: true });
+			packContractLogDir = null;
+		}
+	});
+
+	it("logs inject.pack.ok source=pi for span-bearing successes and not for pi-hook-inject", async () => {
+		const logPath = usePackContractLog();
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async () => {
+				throw new Error("offline");
+			}),
+		);
+		const client = new PiCodememClient(offlineConfig, createViewerRuntime(), {
+			project: "codemem",
+			execImpl: async (args) => {
+				if (args[0] !== "pack") throw new Error("inject should not run");
+				return {
+					stdout: JSON.stringify({
+						pack_text: "json pack text",
+						metrics: { total_items: 2, pack_tokens: 9 },
+					}),
+					stderr: "",
+				};
+			},
+		});
+
+		await client.fetchPackText("what changed?");
+
+		const line = readFileSync(logPath, "utf8");
+		expect(line).toContain("inject.pack.ok");
+		expect(line).toContain("source=pi");
+		expect(line).toContain("origin=local");
+		expect(line).toContain("items=2");
+		expect(line).toContain("pack_tokens=9");
+		expect(line).toContain(`query_len=${"what changed?".length}`);
+		expect(line).toContain("empty=false");
+		expect(line).toContain('project="codemem"');
+
+		const hookOnly = join(packContractLogDir ?? tmpdir(), "hook-only.log");
+		vi.stubEnv("CODEMEM_PLUGIN_LOG_PATH", hookOnly);
+		const fallback = new PiCodememClient(offlineConfig, createViewerRuntime(), {
+			execImpl: async (args) => {
+				if (args[0] === "pack") throw new Error("pack missing");
+				return { stdout: "## codemem memories\n\nplain block", stderr: "" };
+			},
+		});
+		await fallback.fetchPackText("what changed?");
+		expect(existsSync(hookOnly)).toBe(false);
+	});
+
+	it("logs origin=viewer for a proven HTTP pack", async () => {
+		const logPath = usePackContractLog();
+		stubPackBody({
+			pack_text: "viewer pack",
+			metrics: { total_items: 1, pack_tokens: 3 },
+		});
+		const client = new PiCodememClient(onlineConfig, createViewerRuntime(), {
+			execImpl: async () => {
+				throw new Error("CLI should not run");
+			},
+		});
+
+		await client.fetchPackText("what changed?");
+
+		const line = readFileSync(logPath, "utf8");
+		expect(line).toContain("source=pi");
+		expect(line).toContain("origin=viewer");
+		expect(line).toContain("items=1");
+		expect(line).toContain("pack_tokens=3");
+	});
+});
+
 describe("boundary CLI timeout budget", () => {
 	afterEach(() => {
 		vi.unstubAllGlobals();
@@ -523,7 +746,11 @@ describe("HTTP pack identity proof", () => {
 					});
 				}
 				if (url.pathname === "/api/pack") {
-					return jsonOk({ pack_text: "viewer pack body", items: [], metrics: {} });
+					return jsonOk({
+						pack_text: "viewer pack body",
+						items: [],
+						metrics: { total_items: 1, pack_tokens: 3 },
+					});
 				}
 				return jsonErr(404, {});
 			}),
@@ -538,7 +765,7 @@ describe("HTTP pack identity proof", () => {
 
 		const result = await client.fetchPackText("fix auth callback");
 
-		expect(result).toEqual({ text: "viewer pack body", preformatted: false });
+		expect(result).toEqual({ text: "viewer pack body", preformatted: false, itemCount: 1 });
 		const packRequests = requests.filter(
 			(r) => r.path === "/api/prompt-pack-profile" || r.path === "/api/pack",
 		);

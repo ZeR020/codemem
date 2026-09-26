@@ -14,7 +14,9 @@
  *     messages, one new pack appended to the latest user message of the request
  *     copy (never the system prompt, never the saved session)
  *   - Tools → pi.registerTool × 14 when pi.tools_mode === "native"
- *   - session_before_compact → flush signal + one-shot inject replay skip
+ *   - session_before_compact → flush only; it does not skip the next pack fetch
+ *   - session_compact with willRetry → one-shot replay skip for the immediate resume
+ *   - session_compact_failed, a non-resume compact, or a later user message clears that skip
  */
 
 import { existsSync, readFileSync } from "node:fs";
@@ -26,6 +28,7 @@ import type {
 	ExtensionContext,
 	MessageEndEvent,
 	SessionBeforeCompactEvent,
+	SessionCompactEvent,
 	SessionShutdownEvent,
 	SessionStartEvent,
 	ToolCallEvent,
@@ -367,12 +370,15 @@ function messageDiscriminator(
 async function onMessageEnd(
 	state: SessionState,
 	client: PiCodememClient,
+	injector: PiInjector,
 	pi: ExtensionAPI,
 	event: MessageEndEvent,
 	ctx: ExtensionContext,
 ): Promise<void> {
 	if (!state.active || !state.sessionId) return;
 	const role = extractMessageRole(event.message);
+	// A new user turn is not the overflow resume. Clear before context runs.
+	if (role === "user") injector.clearCompaction();
 	if (role !== "user" && role !== "assistant") return;
 	const text = extractMessageText(event.message);
 	if (!text) return;
@@ -450,13 +456,11 @@ async function onToolResult(
 async function onBeforeCompact(
 	state: SessionState,
 	client: PiCodememClient,
-	injector: PiInjector,
 	pi: ExtensionAPI,
 	event: SessionBeforeCompactEvent,
 	ctx: ExtensionContext,
 ): Promise<void> {
 	if (!state.sessionId) return;
-	injector.noteCompaction();
 	state.compactSeq += 1;
 	const payload = buildBeforeCompactPayload({
 		sessionId: state.sessionId,
@@ -466,6 +470,18 @@ async function onBeforeCompact(
 		entryId: `session_before_compact:${state.compactSeq}`,
 	});
 	await safeIngest(client, payload, state, pi, event.signal ?? ctx.signal);
+}
+
+function onSessionCompact(injector: PiInjector, event: SessionCompactEvent): void {
+	if (event.willRetry && event.reason !== "manual") {
+		injector.noteCompaction();
+		return;
+	}
+	injector.clearCompaction();
+}
+
+function onSessionCompactFailed(injector: PiInjector): void {
+	injector.clearCompaction();
 }
 
 /**
@@ -507,12 +523,12 @@ export default function codememPiExtension(pi: ExtensionAPI): void {
 	pi.on("session_shutdown", (event, ctx) =>
 		onSessionShutdown(state, client, runtime, pi, event, ctx),
 	);
-	pi.on("message_end", (event, ctx) => onMessageEnd(state, client, pi, event, ctx));
+	pi.on("message_end", (event, ctx) => onMessageEnd(state, client, injector, pi, event, ctx));
 	pi.on("tool_call", (event, ctx) => onToolCall(state, client, pi, event, ctx));
 	pi.on("tool_result", (event, ctx) => onToolResult(state, client, config, pi, event, ctx));
-	pi.on("session_before_compact", (event, ctx) =>
-		onBeforeCompact(state, client, injector, pi, event, ctx),
-	);
+	pi.on("session_before_compact", (event, ctx) => onBeforeCompact(state, client, pi, event, ctx));
+	pi.on("session_compact", (event) => onSessionCompact(injector, event));
+	pi.on("session_compact_failed", () => onSessionCompactFailed(injector));
 	pi.on("context", (event, ctx) => onContext(injector, config, event, ctx));
 }
 

@@ -32,8 +32,13 @@ export type PiContextMessage = {
 export type PiInjector = {
 	/** Mutates the given request-copy messages in place; returns nothing. */
 	inject(messages: PiContextMessage[], signal?: AbortSignal): Promise<void>;
-	/** One-shot: the next inject replays only — no fetch, no new decision. */
+	/**
+	 * One-shot replay skip. Arm only after session_compact with willRetry.
+	 * The next inject replays and does not fetch.
+	 */
 	noteCompaction(): void;
+	/** Drop a replay skip that will not be the immediate resume. */
+	clearCompaction(): void;
 	/** Re-key decision identity on session_start. */
 	rekey(sessionId: string): void;
 };
@@ -323,6 +328,9 @@ export function createPiInjector(options: {
 		inject,
 		noteCompaction() {
 			compactionPending = true;
+		},
+		clearCompaction() {
+			compactionPending = false;
 		},
 		rekey(nextSessionId: string) {
 			sessionId = nextSessionId;

@@ -150,6 +150,8 @@ export type ProvenPack = {
 	renderedItems?: RenderedPackItem[];
 	/** metrics.total_items from the same response. */
 	itemCount?: number;
+	/** metrics.pack_tokens from the same response, when present. */
+	packTokens?: number;
 };
 
 function canonicalJson(value: unknown): string {
@@ -213,9 +215,29 @@ async function readJson(res: Response): Promise<unknown> {
 }
 
 /**
+ * PackResponse contract check. A valid zero-item pack has a string `pack_text`
+ * and numeric `metrics.total_items` (0 is success). `{}`, a non-string `pack_text`,
+ * a missing item count, a non-array `rendered_items`, or an `error` field is not a pack.
+ */
+export function parseProvenPack(body: unknown): ProvenPack | null {
+	if (!isRecord(body) || "error" in body) return null;
+	if (typeof body.pack_text !== "string") return null;
+	if (!isRecord(body.metrics)) return null;
+	const totalItems = body.metrics.total_items;
+	if (typeof totalItems !== "number" || !Number.isFinite(totalItems)) return null;
+	const pack: ProvenPack = { packText: body.pack_text.trim(), itemCount: totalItems };
+	const packTokens = body.metrics.pack_tokens;
+	if (typeof packTokens === "number" && Number.isFinite(packTokens)) pack.packTokens = packTokens;
+	if (body.rendered_items === undefined) return pack;
+	if (!Array.isArray(body.rendered_items)) return null;
+	pack.renderedItems = body.rendered_items as RenderedPackItem[];
+	return pack;
+}
+
+/**
  * GET /api/prompt-pack-profile, then POST /api/pack with db_path + identity_target.
- * Returns the pack text plus renderer span fields when the response carries them;
- * null means unproven or failed and the caller may fall back.
+ * Returns a contract-valid pack, including a zero-item pack; null means unproven,
+ * failed, or a body that is not a PackResponse, and the caller may fall back.
  */
 export async function proveAndPostPack(
 	config: PiExtensionConfig,
@@ -256,15 +278,7 @@ export async function proveAndPostPack(
 		signal: args.signal,
 	});
 	if (!res.ok) return null;
-	const body = await readJson(res);
-	if (!isRecord(body)) return null;
-	const pack: ProvenPack = { packText: String(body.pack_text ?? "").trim() };
-	if (Array.isArray(body.rendered_items)) {
-		pack.renderedItems = body.rendered_items as RenderedPackItem[];
-	}
-	const totalItems = isRecord(body.metrics) ? body.metrics.total_items : undefined;
-	if (typeof totalItems === "number") pack.itemCount = totalItems;
-	return pack;
+	return parseProvenPack(await readJson(res));
 }
 
 /** Probe viewer with a cheap GET. Returns true when reachable. */

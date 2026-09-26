@@ -7,14 +7,16 @@ import { execFile } from "node:child_process";
 import { existsSync, lstatSync, readFileSync } from "node:fs";
 import { basename, dirname, resolve } from "node:path";
 import type { PiExtensionConfig } from "./config.js";
+import { logPiInjectPack } from "./plugin-log.js";
 import {
 	checkIngestAvailable,
 	clearStreamFailure,
 	ensureViewerRunning,
-	isRecord,
 	isStreamInBackoff,
 	isViewerTargetConflict,
 	markStreamFailure,
+	type ProvenPack,
+	parseProvenPack,
 	piHooksUrl,
 	proveAndPostPack,
 	type RenderedPackItem,
@@ -79,6 +81,29 @@ export type PackFetch = {
 	/** metrics.total_items from the same span-bearing response. */
 	itemCount?: number;
 };
+
+function packFetchFromProven(pack: ProvenPack): PackFetch {
+	const result: PackFetch = { text: pack.packText, preformatted: false };
+	if (pack.renderedItems) result.renderedItems = pack.renderedItems;
+	if (pack.itemCount != null) result.itemCount = pack.itemCount;
+	return result;
+}
+
+function logFetchedPack(
+	origin: "local" | "viewer",
+	pack: ProvenPack,
+	query: string,
+	project: string | null,
+): void {
+	logPiInjectPack({
+		origin,
+		items: pack.itemCount ?? 0,
+		packTokens: pack.packTokens ?? 0,
+		queryLen: query.length,
+		empty: !pack.packText,
+		project,
+	});
+}
 
 /** Boundary flush signals that need the long CLI budget (HTTP cannot flush). */
 function isBoundaryFlushEvent(piEvent: string): boolean {
@@ -268,9 +293,11 @@ export class PiCodememClient {
 
 	/**
 	 * Profile-proven POST /api/pack, then CLI pack --json / pi-hook-inject fallback.
-	 * A successful span-bearing response ends the chain, including zero items —
-	 * plain-text pi-hook-inject runs only when no span-bearing response is
-	 * obtainable. `opts.tokenBudget` sizes the pack request (default injectTokenBudget).
+	 * A contract-valid span-bearing response ends the chain, including a zero-item
+	 * pack. `{}` and error-shaped bodies are not success and fall through.
+	 * Plain-text pi-hook-inject runs only when no contract-valid response is
+	 * obtainable. Span-bearing successes log `inject.pack.ok source=pi`.
+	 * `opts.tokenBudget` sizes the pack request (default injectTokenBudget).
 	 */
 	async fetchPackText(
 		context: string,
@@ -294,22 +321,10 @@ export class PiCodememClient {
 				signal,
 				timeoutMs: CLI_PACK_TIMEOUT_MS,
 			});
-			const parsed = JSON.parse(stdout) as {
-				pack_text?: unknown;
-				rendered_items?: unknown;
-				metrics?: unknown;
-			};
-			const result: PackFetch = {
-				text: String(parsed.pack_text ?? "").trim(),
-				preformatted: false,
-			};
-			if (Array.isArray(parsed.rendered_items)) {
-				result.renderedItems = parsed.rendered_items as RenderedPackItem[];
-			}
-			if (isRecord(parsed.metrics) && typeof parsed.metrics.total_items === "number") {
-				result.itemCount = parsed.metrics.total_items;
-			}
-			return result;
+			const parsed = parseProvenPack(JSON.parse(stdout));
+			if (!parsed) throw new Error("pack response is not a PackResponse");
+			logFetchedPack("local", parsed, query, this.project);
+			return packFetchFromProven(parsed);
 		} catch {
 			// Last resort: pi-hook-inject prints the framed block without span data.
 		}
@@ -351,10 +366,8 @@ export class PiCodememClient {
 				signal: controller.signal,
 			});
 			if (!pack) return null;
-			const result: PackFetch = { text: pack.packText, preformatted: false };
-			if (pack.renderedItems) result.renderedItems = pack.renderedItems;
-			if (pack.itemCount != null) result.itemCount = pack.itemCount;
-			return result;
+			logFetchedPack("viewer", pack, context, this.project);
+			return packFetchFromProven(pack);
 		} catch {
 			return null;
 		} finally {

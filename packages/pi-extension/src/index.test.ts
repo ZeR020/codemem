@@ -105,6 +105,8 @@ describe("extension factory lifecycle", () => {
 			"tool_call",
 			"tool_result",
 			"session_before_compact",
+			"session_compact",
+			"session_compact_failed",
 			"context",
 		];
 		for (const name of expectedEvents) {
@@ -661,7 +663,7 @@ describe("injection (context)", () => {
 					return jsonOk({
 						pack_text: packText,
 						items: [1],
-						metrics: { pack_tokens: 10 },
+						metrics: { total_items: 1, pack_tokens: 10 },
 					});
 				}
 				if (url.includes("/api/raw-events/status")) {
@@ -806,7 +808,7 @@ describe("injection hostile framing", () => {
 					return jsonOk({
 						pack_text: hostile,
 						items: [1],
-						metrics: { pack_tokens: 10 },
+						metrics: { total_items: 1, pack_tokens: 10 },
 					});
 				}
 				if (url.includes("/api/raw-events/status")) {
@@ -1002,5 +1004,129 @@ describe("message_end payload feeds core adapter", () => {
 		expect(adapter?.source).toBe("pi");
 		expect(adapter?.event_type).toBe("prompt");
 		expect(adapter?.event_id).toMatch(/^pi_evt_[0-9a-f]{24}$/);
+	});
+});
+
+describe("compaction replay skip follows Pi resume", () => {
+	afterEach(resetPiExtensionTest);
+
+	async function packsAfter(
+		steps: Array<
+			(handlers: Map<string, Handler[]>, ctx: ReturnType<typeof createMockCtx>) => Promise<void>
+		>,
+	): Promise<number> {
+		vi.stubEnv("CODEMEM_PI_INJECT_PROMPTS", "1");
+		__setTestExecImpl(async () => ({ stdout: "", stderr: "" }));
+		const cwd = "/tmp/codemem-pi-test";
+		let packs = 0;
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (input: RequestInfo | URL) => {
+				const url = String(input);
+				if (url.includes("/api/prompt-pack-profile")) return matchingProfile(cwd);
+				if (url.includes("/api/raw-events/status")) return jsonOk({ ingest: { available: true } });
+				if (url.includes("/api/pack")) {
+					packs += 1;
+					return jsonOk({ pack_text: "pack", metrics: { total_items: 1, pack_tokens: 2 } });
+				}
+				return { ok: false, status: 404, json: async () => ({}), text: async () => "" };
+			}),
+		);
+		const { pi, handlers } = createMockPi();
+		codememPiExtension(pi as never);
+		const ctx = createMockCtx();
+		await handlers.get("session_start")?.[0]?.({ type: "session_start", reason: "startup" }, ctx);
+		for (const step of steps) await step(handlers, ctx);
+		await handlers.get("context")?.[0]?.(
+			{
+				type: "context",
+				messages: [{ role: "user", content: "next question", timestamp: 1_700_000_000_099 }],
+			},
+			ctx,
+		);
+		return packs;
+	}
+
+	function beforeCompact(reason: "manual" | "threshold" | "overflow", willRetry: boolean) {
+		return async (handlers: Map<string, Handler[]>, ctx: ReturnType<typeof createMockCtx>) => {
+			await handlers.get("session_before_compact")?.[0]?.(
+				{
+					type: "session_before_compact",
+					reason,
+					willRetry,
+					signal: new AbortController().signal,
+					preparation: {},
+					branchEntries: [],
+				},
+				ctx,
+			);
+		};
+	}
+
+	function compact(reason: "manual" | "threshold" | "overflow", willRetry: boolean) {
+		return async (handlers: Map<string, Handler[]>) => {
+			await handlers.get("session_compact")?.[0]?.(
+				{
+					type: "session_compact",
+					reason,
+					willRetry,
+					fromExtension: false,
+					compactionEntry: { type: "compaction" },
+				},
+				undefined,
+			);
+		};
+	}
+
+	function compactFailed(aborted: boolean) {
+		return async (handlers: Map<string, Handler[]>) => {
+			await handlers.get("session_compact_failed")?.[0]?.(
+				{
+					type: "session_compact_failed",
+					reason: "overflow",
+					aborted,
+					willRetry: false,
+					fromExtension: false,
+					errorMessage: aborted ? undefined : "compaction failed",
+				},
+				undefined,
+			);
+		};
+	}
+
+	function userMessage() {
+		return async (handlers: Map<string, Handler[]>, ctx: ReturnType<typeof createMockCtx>) => {
+			await handlers.get("message_end")?.[0]?.(
+				{
+					type: "message_end",
+					message: { role: "user", content: "next question", timestamp: 1_700_000_000_099 },
+				},
+				ctx,
+			);
+		};
+	}
+
+	it("still fetches after manual, threshold, cancel, failure, and a new user turn", async () => {
+		expect(await packsAfter([])).toBe(1);
+		expect(await packsAfter([beforeCompact("manual", false)])).toBe(1);
+		expect(
+			await packsAfter([beforeCompact("manual", false), compact("manual", false), userMessage()]),
+		).toBe(1);
+		expect(
+			await packsAfter([
+				beforeCompact("threshold", false),
+				compact("threshold", false),
+				userMessage(),
+			]),
+		).toBe(1);
+		expect(await packsAfter([beforeCompact("overflow", true), compactFailed(true)])).toBe(1);
+		expect(await packsAfter([beforeCompact("overflow", false), compactFailed(false)])).toBe(1);
+		expect(
+			await packsAfter([beforeCompact("overflow", true), compact("overflow", true), userMessage()]),
+		).toBe(1);
+	});
+
+	it("skips the fetch only when overflow compaction immediately resumes", async () => {
+		expect(await packsAfter([beforeCompact("overflow", true), compact("overflow", true)])).toBe(0);
 	});
 });
