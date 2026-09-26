@@ -16,7 +16,7 @@
  *   - Tools → pi.registerTool × 14 when pi.tools_mode === "native"
  *   - session_before_compact → flush only; it does not skip the next pack fetch
  *   - session_compact with willRetry → one-shot replay skip for the immediate resume
- *   - session_compact_failed, a non-resume compact, or a later user message clears that skip
+ *   - session_compact_failed, agent_settled, a non-resume compact, or a later user message clears that skip
  */
 
 import { existsSync, readFileSync } from "node:fs";
@@ -529,6 +529,7 @@ export default function codememPiExtension(pi: ExtensionAPI): void {
 	pi.on("session_before_compact", (event, ctx) => onBeforeCompact(state, client, pi, event, ctx));
 	pi.on("session_compact", (event) => onSessionCompact(injector, event));
 	pi.on("session_compact_failed", () => onSessionCompactFailed(injector));
+	pi.on("agent_settled", () => injector.clearCompaction());
 	pi.on("context", (event, ctx) => onContext(injector, config, event, ctx));
 }
 

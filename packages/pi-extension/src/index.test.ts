@@ -107,6 +107,7 @@ describe("extension factory lifecycle", () => {
 			"session_before_compact",
 			"session_compact",
 			"session_compact_failed",
+			"agent_settled",
 			"context",
 		];
 		for (const name of expectedEvents) {
@@ -1128,5 +1129,17 @@ describe("compaction replay skip follows Pi resume", () => {
 
 	it("skips the fetch only when overflow compaction immediately resumes", async () => {
 		expect(await packsAfter([beforeCompact("overflow", true), compact("overflow", true)])).toBe(0);
+	});
+
+	it("clears the skip if the resume settles before context", async () => {
+		expect(
+			await packsAfter([
+				beforeCompact("overflow", true),
+				compact("overflow", true),
+				async (handlers) => {
+					await handlers.get("agent_settled")?.[0]?.({ type: "agent_settled" }, undefined);
+				},
+			]),
+		).toBe(1);
 	});
 });
