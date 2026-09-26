@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { type ExecCodememFn, PiCodememClient } from "./client.js";
 import { defaultPiExtensionConfig } from "./config.js";
 import { createPiInjector, type PiContextMessage } from "./inject.js";
-import { CODEMEM_MEMORIES_HEADER } from "./payloads.js";
+import { CODEMEM_MEMORIES_HEADER, stableMessageEntryId } from "./payloads.js";
 import { createViewerRuntime } from "./viewer.js";
 
 /** A valid renderer fingerprint is sha256-shaped in span validation. */
@@ -31,7 +31,11 @@ function makeExecSpy(queue: QueuedResponse[]) {
 	return { calls, execImpl, fetchCount };
 }
 
-function makeInjector(execImpl: ExecCodememFn, configOverrides: Record<string, unknown> = {}) {
+function makeInjector(
+	execImpl: ExecCodememFn,
+	configOverrides: Record<string, unknown> = {},
+	persistDecision?: (key: string, decision: { block: string; fingerprints: string[] }) => void,
+) {
 	const config = defaultPiExtensionConfig(configOverrides);
 	const client = new PiCodememClient(config, createViewerRuntime(), { execImpl });
 	let seq = 0;
@@ -44,6 +48,7 @@ function makeInjector(execImpl: ExecCodememFn, configOverrides: Record<string, u
 			seq += 1;
 			return `n:${seq}`;
 		},
+		persistDecision,
 	});
 	injector.rekey("sess-inject-test");
 	return { config, injector };
@@ -317,6 +322,96 @@ describe("createPiInjector compaction", () => {
 		await injector.inject(after);
 		expect(fetchCount()).toBe(1);
 		expect(latestText(after[0])).toContain("should not run");
+	});
+});
+
+describe("createPiInjector persistence", () => {
+	/** Session-entry shape written by pi.appendEntry("codemem.inject", data). */
+	const persistedEntry = (key: string, block: string, fingerprints: string[] = []) => ({
+		type: "custom",
+		customType: "codemem.inject",
+		data: { v: 1, key, block, fingerprints },
+	});
+
+	it("restore then inject: the matching timestamped message replays the restored bytes with no fetch", async () => {
+		const { execImpl, fetchCount } = makeExecSpy([spannedPackBody("pack one", [])]);
+		const { injector } = makeInjector(execImpl);
+		const key = stableMessageEntryId("sess-inject-test", "user", "first", 1_000);
+		injector.restore([persistedEntry(key, "FROZEN BYTES")]);
+
+		const messages = [userMsg("first", 1_000)];
+		await injector.inject(messages);
+
+		expect(fetchCount()).toBe(0);
+		expect(latestText(messages[0])).toBe("first\n\nFROZEN BYTES");
+	});
+
+	it("a different user message in the same request is not given the restored block and may fetch", async () => {
+		const { execImpl, fetchCount } = makeExecSpy([spannedPackBody("pack one", [])]);
+		const { injector } = makeInjector(execImpl);
+		const key = stableMessageEntryId("sess-inject-test", "user", "first", 1_000);
+		injector.restore([persistedEntry(key, "FROZEN BYTES")]);
+
+		const messages = [userMsg("first", 1_000), userMsg("second", 2_000)];
+		await injector.inject(messages);
+
+		expect(fetchCount()).toBe(1);
+		expect(latestText(messages[0])).toBe("first\n\nFROZEN BYTES");
+		expect(latestText(messages[1])).toContain("pack one");
+		expect(latestText(messages[1])).not.toContain("FROZEN BYTES");
+	});
+
+	it("a restored entry whose key belongs to another session id does not attach", async () => {
+		const { execImpl, fetchCount } = makeExecSpy([spannedPackBody("pack one", [])]);
+		const { injector } = makeInjector(execImpl);
+		const foreignKey = stableMessageEntryId("sess-other", "user", "first", 1_000);
+		injector.restore([persistedEntry(foreignKey, "FOREIGN BYTES")]);
+
+		const messages = [userMsg("first", 1_000)];
+		await injector.inject(messages);
+
+		expect(fetchCount()).toBe(1);
+		expect(latestText(messages[0])).toContain("pack one");
+		expect(latestText(messages[0])).not.toContain("FOREIGN BYTES");
+	});
+
+	it("a message with no timestamp is never persisted; a timestamped one is", async () => {
+		const persisted: Array<{ key: string; decision: unknown }> = [];
+		const { execImpl, fetchCount } = makeExecSpy([
+			spannedPackBody("pack one", []),
+			spannedPackBody("pack two", []),
+		]);
+		const { injector } = makeInjector(execImpl, {}, (key, decision) => {
+			persisted.push({ key, decision });
+		});
+
+		await injector.inject([userMsg("no timestamp")]);
+		expect(persisted).toEqual([]);
+
+		await injector.inject([userMsg("first", 1_000)]);
+		expect(fetchCount()).toBe(2);
+		expect(persisted).toHaveLength(1);
+		expect(persisted[0]?.key).toBe(
+			stableMessageEntryId("sess-inject-test", "user", "first", 1_000),
+		);
+		expect(persisted[0]?.decision).toEqual({
+			block: expect.stringContaining("pack two"),
+			fingerprints: [],
+		});
+	});
+
+	it("compaction-away: a restored decision whose user text is absent attaches nothing; the latest message fetches", async () => {
+		const { execImpl, fetchCount } = makeExecSpy([spannedPackBody("pack one", [])]);
+		const { injector } = makeInjector(execImpl);
+		const key = stableMessageEntryId("sess-inject-test", "user", "gone", 1_000);
+		injector.restore([persistedEntry(key, "GHOST BYTES")]);
+
+		const messages = [userMsg("latest", 9_000)];
+		await injector.inject(messages);
+
+		expect(fetchCount()).toBe(1);
+		expect(latestText(messages[0])).toContain("pack one");
+		expect(latestText(messages[0])).not.toContain("GHOST BYTES");
 	});
 });
 
