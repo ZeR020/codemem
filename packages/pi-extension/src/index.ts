@@ -507,6 +507,8 @@ export default function codememPiExtension(pi: ExtensionAPI): void {
 				return message.timestamp;
 			}
 			// Not messageDiscriminator: that counter belongs to ingest entry ids.
+			// Pi's UserMessage.timestamp is required, so this fallback should never run.
+			// A missing timestamp is a new id on every context call and would refetch.
 			missingTimestampSeq += 1;
 			return `inject-n:${missingTimestampSeq}`;
 		},

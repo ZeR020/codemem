@@ -32,7 +32,7 @@ function makeExecSpy(queue: QueuedResponse[]) {
 }
 
 function makeInjector(execImpl: ExecCodememFn, configOverrides: Record<string, unknown> = {}) {
-	const config = defaultPiExtensionConfig(configOverrides);
+	const config = defaultPiExtensionConfig({ viewerEnabled: false, ...configOverrides });
 	const client = new PiCodememClient(config, createViewerRuntime(), { execImpl });
 	let seq = 0;
 	const injector = createPiInjector({
@@ -92,9 +92,27 @@ function latestText(message: PiContextMessage): string {
 
 afterEach(() => {
 	vi.unstubAllEnvs();
+	vi.unstubAllGlobals();
 });
 
 describe("createPiInjector replay", () => {
+	it("does not contact a live viewer; the CLI spy is the pack transport", async () => {
+		const fetchMock = vi.fn(async () => ({
+			ok: true,
+			status: 200,
+			json: async () => ({ service: "not-the-viewer" }),
+			text: async () => "",
+		}));
+		vi.stubGlobal("fetch", fetchMock);
+		const { execImpl, fetchCount } = makeExecSpy([spannedPackBody("from cli", [])]);
+		const { injector } = makeInjector(execImpl);
+		const messages = [userMsg("question", 1_700)];
+		await injector.inject(messages);
+		expect(fetchMock).not.toHaveBeenCalled();
+		expect(fetchCount()).toBe(1);
+		expect(latestText(messages[0])).toContain("from cli");
+	});
+
 	it("replays identical bytes onto two decided messages and the fetch spy stays at 0", async () => {
 		const { execImpl, fetchCount } = makeExecSpy([
 			spannedPackBody("pack one", []),
