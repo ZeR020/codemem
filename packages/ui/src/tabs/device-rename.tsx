@@ -1,4 +1,4 @@
-import { useRef, useState } from "preact/hooks";
+import { useEffect, useRef, useState } from "preact/hooks";
 import { renameKnownDevice } from "../lib/api/sync";
 import type { DeviceProjection, DevicesRendererOptions } from "./devices";
 
@@ -16,11 +16,22 @@ function failureMessage(error: unknown): string {
 	return "Device name was not saved. Refresh Devices and retry.";
 }
 
+// The menu that opened the form is closed by now. A disabled input (while
+// saving) cannot take focus, so fall back to the row's actions button.
+function focusRenameTarget(input: HTMLInputElement | null, deviceId: string) {
+	if (input && !input.disabled) {
+		input.focus();
+		return;
+	}
+	document.getElementById(`device-actions-${deviceId}`)?.focus();
+}
+
 function RenameForm({
 	busy,
 	disabled,
 	inputRef,
 	name,
+	onCancel,
 	onName,
 	onSave,
 }: {
@@ -28,11 +39,18 @@ function RenameForm({
 	disabled: boolean;
 	inputRef: ReturnType<typeof useRef<HTMLInputElement>>;
 	name: string;
+	onCancel: () => void;
 	onName: (value: string) => void;
 	onSave: (event: Event) => void;
 }) {
 	return (
-		<form className="devices-rename-form" onSubmit={onSave}>
+		<form
+			className="devices-rename-form"
+			onKeyDown={(event) => {
+				if (event.key === "Escape" && !busy) onCancel();
+			}}
+			onSubmit={onSave}
+		>
 			<label>
 				Device name
 				<input
@@ -46,23 +64,42 @@ function RenameForm({
 			<button className="settings-button" disabled={disabled} type="submit">
 				{busy ? "Saving…" : "Save name"}
 			</button>
+			<button className="settings-button" disabled={busy} onClick={onCancel} type="button">
+				Cancel
+			</button>
 		</form>
 	);
 }
 
-export function RenameDeviceAction({
+/** Rename form opened from the device row's actions menu. */
+export function RenameDevicePanel({
 	device,
+	focusRequest,
+	onClose,
+	open,
 	options,
 }: {
 	device: DeviceProjection;
+	/** Changes each time the menu asks for the form, so a repeat request refocuses it. */
+	focusRequest: number;
+	onClose: () => void;
+	open: boolean;
 	options: DevicesRendererOptions;
 }) {
-	const [open, setOpen] = useState(false);
 	const [name, setName] = useState(device.displayName);
 	const [busy, setBusy] = useState(false);
 	const [message, setMessage] = useState("");
 	const inputRef = useRef<HTMLInputElement>(null);
 	const disabled = busy || options.inventoryUnavailable === true || options.refreshError === true;
+	useEffect(() => {
+		if (!open) return;
+		setName(device.displayName);
+		setMessage("");
+	}, [open, device.displayName]);
+	useEffect(() => {
+		if (!open || focusRequest <= 0) return;
+		queueMicrotask(() => focusRenameTarget(inputRef.current, device.deviceId));
+	}, [open, focusRequest, device.deviceId]);
 	const save = async (event: Event) => {
 		event.preventDefault();
 		if (disabled) return;
@@ -76,37 +113,31 @@ export function RenameDeviceAction({
 		try {
 			await (options.renameDevice ?? renameKnownDevice)(device.deviceId, name.trim());
 			const refreshed = await options.onCommitted?.();
-			setOpen(false);
+			onClose();
 			setMessage(
 				refreshed === false ? "Name saved. Refresh Devices to see it." : "Device renamed.",
 			);
 		} catch (error) {
 			setMessage(failureMessage(error));
+			// Focus was on the Save button, disabled while saving; return it to the
+			// field once the form is enabled again.
+			setTimeout(() => inputRef.current?.focus(), 0);
 		} finally {
 			setBusy(false);
 		}
 	};
 	return (
 		<div className="devices-rename">
-			<button
-				aria-expanded={open}
-				className="sync-subview-link"
-				onClick={() => {
-					setOpen((current) => !current);
-					setName(device.displayName);
-					setMessage("");
-					queueMicrotask(() => inputRef.current?.focus());
-				}}
-				type="button"
-			>
-				Rename device…
-			</button>
 			{open ? (
 				<RenameForm
 					busy={busy}
 					disabled={disabled}
 					inputRef={inputRef}
 					name={name}
+					onCancel={() => {
+						setMessage("");
+						onClose();
+					}}
 					onName={setName}
 					onSave={(event) => void save(event)}
 				/>
