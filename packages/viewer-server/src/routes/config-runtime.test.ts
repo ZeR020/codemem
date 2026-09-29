@@ -70,6 +70,103 @@ it("returns resolved runtime after saving an explicit API choice", async () => {
 	});
 });
 
+it("schedules a live observer swap instead of claiming an immediate restart", async () => {
+	writeFileSync(join(home, "config.json"), JSON.stringify({ observer_runtime: "api_http" }));
+	const scheduleObserverApply = vi.fn(() => true);
+	const getObserverApplyStatus = vi.fn(() => ({ state: "applying" as const }));
+	const routes = configRoutes({ scheduleObserverApply, getObserverApplyStatus });
+	const response = await routes.request("/api/config", {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({ config: { observer_runtime: "codex_sidecar" } }),
+	});
+	expect(response.status).toBe(200);
+	const body = await response.json();
+	expect(body.effects.applying_keys).toEqual(["observer_runtime"]);
+	expect(body.effects.restart_required_keys).not.toContain("observer_runtime");
+	expect(body.observer_apply).toEqual({ state: "applying" });
+	expect(scheduleObserverApply).toHaveBeenCalledTimes(1);
+	expect((await (await routes.request("/api/config")).json()).observer_apply).toEqual({
+		state: "applying",
+	});
+});
+
+it("retries applying saved observer settings without another configuration write", async () => {
+	writeFileSync(join(home, "config.json"), JSON.stringify({ observer_runtime: "api_http" }));
+	const scheduleObserverApply = vi.fn(() => true);
+	const routes = configRoutes({
+		scheduleObserverApply,
+		getObserverApplyStatus: () => ({ state: "applying" }),
+	});
+	const response = await routes.request("/api/config/apply-observer", { method: "POST" });
+	expect(response.status).toBe(200);
+	expect((await response.json()).observer_apply).toEqual({ state: "applying" });
+	expect(scheduleObserverApply).toHaveBeenCalledTimes(1);
+	expect(JSON.parse(readFileSync(join(home, "config.json"), "utf8"))).toEqual({
+		observer_runtime: "api_http",
+	});
+});
+
+it("does not swap the observer for a saved value hidden by an environment override", async () => {
+	process.env.CODEMEM_OBSERVER_RUNTIME = "api_http";
+	writeFileSync(join(home, "config.json"), JSON.stringify({ observer_runtime: "api_http" }));
+	const scheduleObserverApply = vi.fn(() => true);
+	const response = await configRoutes({ scheduleObserverApply }).request("/api/config", {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({ config: { observer_runtime: "codex_sidecar" } }),
+	});
+	const effects = (await response.json()).effects;
+	expect(effects.applying_keys).toEqual([]);
+	expect(effects.ignored_by_env_keys).toContain("observer_runtime");
+	expect(scheduleObserverApply).not.toHaveBeenCalled();
+});
+
+it("applies an automatic runtime after removing an explicit API setting", async () => {
+	process.env.CLAUDE_CODE_SESSION = "fixture-session";
+	writeFileSync(join(home, "config.json"), JSON.stringify({ observer_runtime: "api_http" }));
+	const scheduleObserverApply = vi.fn(() => true);
+	const response = await configRoutes({ scheduleObserverApply }).request("/api/config", {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({ config: { observer_runtime: null } }),
+	});
+	const body = await response.json();
+	expect(body.config).not.toHaveProperty("observer_runtime");
+	expect(body.resolved_observer_runtime).toBe("claude_sidecar");
+	expect(body.effects.applying_keys).toContain("observer_runtime");
+	expect(scheduleObserverApply).toHaveBeenCalledOnce();
+});
+
+it("reports restart needed for a semantic observer change without a live-apply owner", async () => {
+	process.env.CLAUDE_CODE_SESSION = "fixture-session";
+	writeFileSync(join(home, "config.json"), JSON.stringify({ observer_runtime: "api_http" }));
+	const response = await configRoutes().request("/api/config", {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({ config: { observer_runtime: null } }),
+	});
+	expect((await response.json()).effects.restart_required_keys).toContain("observer_runtime");
+});
+
+it("reapplies tier routing when an explicit false override is removed", async () => {
+	writeFileSync(
+		join(home, "config.json"),
+		JSON.stringify({ observer_runtime: "api_http", observer_tier_routing_enabled: false }),
+	);
+	const scheduleObserverApply = vi.fn(() => true);
+	const response = await configRoutes({ scheduleObserverApply }).request("/api/config", {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({ config: { observer_tier_routing_enabled: null } }),
+	});
+	const body = await response.json();
+	expect(body.effective.observer_tier_routing_enabled).toBe(false);
+	expect(body.config).not.toHaveProperty("observer_tier_routing_enabled");
+	expect(body.effects.applying_keys).toContain("observer_tier_routing_enabled");
+	expect(scheduleObserverApply).toHaveBeenCalledOnce();
+});
+
 async function runtimePreview(config: Record<string, unknown> = {}) {
 	writeFileSync(
 		join(home, "config.json"),
