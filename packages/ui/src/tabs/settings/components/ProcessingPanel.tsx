@@ -1,18 +1,70 @@
 import { TextInput } from "../../../components/primitives/text-input";
 import type { SettingsPanelProps } from "../data/types";
 import { Field } from "./Field";
+import { ObserverModelAvailability } from "./ObserverModelAvailability";
 import { SettingsHint } from "./SettingsHint";
 import { SettingsSectionIntro } from "./SettingsSectionIntro";
 import { SettingsSwitchRow } from "./SettingsSwitchRow";
 
+function TierModelField({
+	tier,
+	values,
+	onTextInput,
+	tierProviders,
+}: Pick<SettingsPanelProps, "values" | "onTextInput" | "tierProviders"> & {
+	tier: "simple" | "rich";
+}) {
+	const id = tier === "simple" ? "observerSimpleModel" : "observerRichModel";
+	const copy = {
+		simple: {
+			help: "About simple tier model",
+			detail: "Used when a batch falls below rich-routing thresholds.",
+			tooltip:
+				"Used for lighter replay batches. Leave blank to keep codemem's routing defaults. Explicit simple-tier values override the built-in defaults.",
+		},
+		rich: {
+			help: "About rich tier model",
+			detail: "Used when routing detects a richer replay batch.",
+			tooltip:
+				"Used for larger or more complex replay batches. Leave blank to keep codemem's rich-tier defaults. Explicit rich-tier values override the built-in defaults.",
+		},
+	}[tier];
+	return (
+		<Field>
+			<div className="field-label">
+				<label htmlFor={id}>Model</label>
+				<button
+					aria-label={copy.help}
+					className="help-icon"
+					data-tooltip={copy.tooltip}
+					type="button"
+				>
+					?
+				</button>
+			</div>
+			<TextInput
+				id={id}
+				list={`${id}-catalog`}
+				onInput={onTextInput(id)}
+				placeholder="leave empty for default"
+				value={values[id]}
+			/>
+			<div className="small">{copy.detail}</div>
+			<ObserverModelAvailability id={id} values={values} provider={tierProviders?.[tier]} />
+		</Field>
+	);
+}
+
 export function ProcessingPanel({
 	values,
+	tierProviders,
 	showTieredRouting,
 	hiddenUnlessAdvanced,
 	onTextInput,
 	onSwitchInput,
 	getTieredRoutingHelperText,
 }: SettingsPanelProps) {
+	const modelFieldProps = { values, onTextInput, tierProviders };
 	return (
 		<>
 			<SettingsSectionIntro
@@ -64,26 +116,7 @@ export function ProcessingPanel({
 				</SettingsHint>
 				<div hidden={!showTieredRouting}>
 					<h4>Simple tier</h4>
-					<Field>
-						<div className="field-label">
-							<label htmlFor="observerSimpleModel">Model</label>
-							<button
-								aria-label="About simple tier model"
-								className="help-icon"
-								data-tooltip="Used for lighter replay batches. Leave blank to keep codemem's routing defaults. Explicit simple-tier values override the built-in defaults."
-								type="button"
-							>
-								?
-							</button>
-						</div>
-						<TextInput
-							id="observerSimpleModel"
-							onInput={onTextInput("observerSimpleModel")}
-							placeholder="leave empty for default"
-							value={values.observerSimpleModel}
-						/>
-						<div className="small">Used when a batch falls below rich-routing thresholds.</div>
-					</Field>
+					<TierModelField {...modelFieldProps} tier="simple" />
 					<Field className="field settings-advanced" hidden={hiddenUnlessAdvanced()}>
 						<label htmlFor="observerSimpleTemperature">Temperature</label>
 						<TextInput
@@ -122,26 +155,7 @@ export function ProcessingPanel({
 				</div>
 				<div hidden={!showTieredRouting}>
 					<h4>Rich tier</h4>
-					<Field>
-						<div className="field-label">
-							<label htmlFor="observerRichModel">Model</label>
-							<button
-								aria-label="About rich tier model"
-								className="help-icon"
-								data-tooltip="Used for larger or more complex replay batches. Leave blank to keep codemem's rich-tier defaults. Explicit rich-tier values override the built-in defaults."
-								type="button"
-							>
-								?
-							</button>
-						</div>
-						<TextInput
-							id="observerRichModel"
-							onInput={onTextInput("observerRichModel")}
-							placeholder="leave empty for default"
-							value={values.observerRichModel}
-						/>
-						<div className="small">Used when routing detects a richer replay batch.</div>
-					</Field>
+					<TierModelField {...modelFieldProps} tier="rich" />
 					<Field className="field settings-advanced" hidden={hiddenUnlessAdvanced()}>
 						<label htmlFor="observerRichTemperature">Temperature</label>
 						<TextInput
