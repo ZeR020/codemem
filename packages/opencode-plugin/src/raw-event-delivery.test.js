@@ -99,6 +99,92 @@ test("does not drain retained events while viewer transport backoff is active", 
 	}
 });
 
+function failedViewerDelivery(home, buildEnvelope) {
+	vi.stubGlobal(
+		"fetch",
+		vi.fn(async () => {
+			throw new DOMException("synthetic timeout", "TimeoutError");
+		}),
+	);
+	return createRawEventDelivery({
+		backoffMs: 10_000,
+		buildEnvelope,
+		classifyViewerFailure: () => "connection",
+		cwd: home,
+		discardResponseBody: () => {},
+		enabled: true,
+		failureActions: { connection: "check viewer" },
+		fetchRawEventsStatus: async () =>
+			new Response(JSON.stringify({ ingest: { available: true } }), { status: 200 }),
+		hostLog: async () => {},
+		hostNotify: null,
+		identityTarget: null,
+		isActive: () => true,
+		logLine: async () => {},
+		nextEventId: () => "same-event-id",
+		projectName: "synthetic",
+		promptPackDbPath: join(home, "mem.sqlite"),
+		rawEventsStatusTimeoutMs: 100,
+		rawEventsStatusUrl: "http://viewer/status",
+		rawEventsUrl: "http://viewer/events",
+		sessionStartedAt: () => 1,
+		spoolHome: home,
+		statusCheckMs: 30_000,
+	});
+}
+
+test("reuses an already durable event when only delivery timestamps changed", async () => {
+	const home = await mkdtemp(join(tmpdir(), "codemem-spool-timestamp-"));
+	let stamp = 0;
+	const delivery = failedViewerDelivery(home, () => ({
+		event_id: "same-event-id",
+		event_type: "user_prompt",
+		session_id: "session-1",
+		ts_wall_ms: ++stamp,
+		ts_mono_ms: stamp / 10,
+		payload: { prompt_text: "same semantic event" },
+	}));
+	try {
+		expect(
+			await delivery.deliver({ sessionID: "session-1", type: "user_prompt", payload: {} }),
+		).toBe(true);
+		const first = (await loadRawEventSpoolEntries({ homeDir: home })).entries[0].serialized;
+		expect(
+			await delivery.deliver({ sessionID: "session-1", type: "user_prompt", payload: {} }),
+		).toBe(true);
+		const after = await loadRawEventSpoolEntries({ homeDir: home });
+		expect(after.entries).toHaveLength(1);
+		expect(after.entries[0].serialized).toBe(first);
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+test("still rejects a duplicate ID with different event content", async () => {
+	const home = await mkdtemp(join(tmpdir(), "codemem-spool-semantic-conflict-"));
+	let stamp = 0;
+	const delivery = failedViewerDelivery(home, () => ({
+		event_id: "same-event-id",
+		event_type: "user_prompt",
+		session_id: "session-1",
+		ts_wall_ms: ++stamp,
+		ts_mono_ms: stamp / 10,
+		payload: { prompt_text: stamp === 1 ? "first content" : "different content" },
+	}));
+	try {
+		expect(
+			await delivery.deliver({ sessionID: "session-1", type: "user_prompt", payload: {} }),
+		).toBe(true);
+		const first = (await loadRawEventSpoolEntries({ homeDir: home })).entries[0].serialized;
+		expect(
+			await delivery.deliver({ sessionID: "session-1", type: "user_prompt", payload: {} }),
+		).toBe(false);
+		expect((await loadRawEventSpoolEntries({ homeDir: home })).entries[0].serialized).toBe(first);
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
 test("classifies a duplicate-ID spool conflict without logging event identity or content", async () => {
 	const home = await mkdtemp(join(tmpdir(), "codemem-spool-conflict-"));
 	let sequence = 0;
@@ -114,7 +200,7 @@ test("classifies a duplicate-ID spool conflict without logging event identity or
 			event_id: "private-event-id",
 			event_type: "user_prompt",
 			ts_wall_ms: ++sequence,
-			payload: { prompt_text: "private-content" },
+			payload: { prompt_text: sequence === 1 ? "private-content" : "different-private-content" },
 		}),
 		classifyViewerFailure: () => "connection",
 		cwd: home,
