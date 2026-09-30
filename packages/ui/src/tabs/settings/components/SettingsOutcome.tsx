@@ -145,12 +145,25 @@ export function settingsOutcomeFor(
 	};
 }
 
-function effectiveObserverRuntime(draft?: string): string {
+export function hasExplicitObserverRuntime(
+	draft = settingsView.value.renderState.values.observerRuntime,
+): boolean {
+	if (settingsState.envOverrides.observer_runtime)
+		return Boolean(String(settingsState.effectiveConfig.observer_runtime ?? "").trim());
+	if (settingsState.touchedKeys.has("observer_runtime")) return Boolean(draft?.trim());
+	return Boolean(String(settingsState.baseline.observer_runtime ?? "").trim());
+}
+
+export function effectiveObserverRuntime(draft?: string): string {
 	const overridden = settingsState.envOverrides.observer_runtime;
 	const runtimeValue = effectiveSetting("observerRuntime", draft);
 	const runtimeChanged =
 		settingsState.touchedKeys.has("observer_runtime") &&
 		runtimeValue !== settingsState.baseline.observer_runtime;
+	if (runtimeChanged && !runtimeValue && !overridden) {
+		const source = normalizedAuthSource(effectiveSetting("observerAuthSource"));
+		return settingsState.observerAutomaticRuntimeByAuthSource[source] || "api_http";
+	}
 	if (overridden || !runtimeChanged) {
 		const preview = draftAuthRuntime();
 		if (preview) return preview;
@@ -164,7 +177,7 @@ function effectiveObserverRuntime(draft?: string): string {
 
 function draftAuthRuntime(): string | undefined {
 	if (!settingsState.touchedKeys.has("observer_auth_source")) return undefined;
-	const source = String(effectiveSetting("observerAuthSource"));
+	const source = normalizedAuthSource(effectiveSetting("observerAuthSource"));
 	return settingsState.observerRuntimeByAuthSource[source];
 }
 
@@ -195,7 +208,7 @@ function conditionalOutcome(
 ): SettingsOutcomeDetails | undefined {
 	const sidecar = isSidecarRuntime(runtime);
 	const provider = String(effectiveSetting("observerProvider"));
-	if (controlId === "observerProvider" && sidecar)
+	if (controlId === "observerProvider" && sidecar && hasExplicitObserverRuntime())
 		return inactiveOutcome(controlId, "Local Claude and Codex sessions select their own provider");
 	if (controlId === "observerModel") return baseModelOutcome(runtime, provider);
 	const authSource = normalizedAuthSource(effectiveSetting("observerAuthSource"));

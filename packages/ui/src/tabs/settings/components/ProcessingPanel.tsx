@@ -11,7 +11,16 @@ function TierModelField({
 	values,
 	onTextInput,
 	tierProviders,
-}: Pick<SettingsPanelProps, "values" | "onTextInput" | "tierProviders"> & {
+	effectiveObserverRuntime,
+	hasExplicitObserverRuntime = true,
+}: Pick<
+	SettingsPanelProps,
+	| "values"
+	| "onTextInput"
+	| "tierProviders"
+	| "effectiveObserverRuntime"
+	| "hasExplicitObserverRuntime"
+> & {
 	tier: "simple" | "rich";
 }) {
 	const id = tier === "simple" ? "observerSimpleModel" : "observerRichModel";
@@ -50,21 +59,30 @@ function TierModelField({
 				value={values[id]}
 			/>
 			<div className="small">{copy.detail}</div>
-			<ObserverModelAvailability id={id} values={values} provider={tierProviders?.[tier]} />
+			<ObserverModelAvailability
+				id={id}
+				values={{
+					...values,
+					observerRuntime: hasExplicitObserverRuntime
+						? (effectiveObserverRuntime ?? values.observerRuntime)
+						: "api_http",
+				}}
+				provider={tierProviders?.[tier]}
+			/>
 		</Field>
 	);
 }
 
 export function ProcessingPanel({
 	values,
-	tierProviders,
 	showTieredRouting,
 	hiddenUnlessAdvanced,
 	onTextInput,
 	onSwitchInput,
 	getTieredRoutingHelperText,
+	...modelOptions
 }: SettingsPanelProps) {
-	const modelFieldProps = { values, onTextInput, tierProviders };
+	const modelFieldProps = { values, onTextInput, ...modelOptions };
 	return (
 		<>
 			<SettingsSectionIntro
