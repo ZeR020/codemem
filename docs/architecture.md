@@ -396,7 +396,16 @@ query the existing `raw_events` store (`source: "pi"`) directly — no new table
 migrations. Stored payload envelopes are scanned most-recent-first with a bounded recency window
 (no FTS index by design), tokens reuse the memory-search lexical primitives, and results carry a
 bounded content snippet with truncation markers and counts. The response shape is the shared
-contract later consumed by the viewer REST route, the pi-extension native tool, and the CLI.
+contract consumed by the CLI (`codemem pi-session-search`) today, and later by the viewer REST
+route and the pi-extension native tool.
+
+Both primitives are exposed on the CLI. `codemem pi-import-sessions` walks
+`~/.pi/agent/sessions/**/*.jsonl` (honors `PI_CODING_AGENT_DIR`), streaming per-file progress;
+`--extract` (off by default — observer-model cost scales with backlog) drains imported sessions
+through the standard `flushRawEvents` sweeper path so extracted memories carry pi attribution,
+while without it imported events stay searchable only. `codemem pi-session-search <query>` queries
+the same `searchPiSessions` primitive and prints a `Found N results` listing with attributed
+snippet lines, or the exact shared response object with `--json`.
 
 ### OpenCode session finalization triggers
 - `session.idle` — finalizes current local buffer

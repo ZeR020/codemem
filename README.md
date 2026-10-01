@@ -264,6 +264,8 @@ Caveats (v1):
 - Observer extraction from pi config supports **API-key providers only**. OAuth-only installs get an explicit `unconfigured (oauth-only)` status — never a silent 401. Set `observer_provider` / `observer_model` explicitly when needed. Selection is cheap-model-first.
 - The preferred HTTP pack path — prove `GET /api/prompt-pack-profile`, then a targeted `POST /api/pack` — is unledgered: pi injection does not write an opencode retrieval-ledger row.
 - `--pi-mcp` requires the third-party `pi-mcp-adapter` package; without it setup writes nothing MCP-related and explains the prerequisite. Native tools remain the default surface (`pi.tools_mode: native`).
+- Pre-install pi history is not imported automatically: session search only covers conversations captured since install. Backfill with `codemem pi-import-sessions` (walks `~/.pi/agent/sessions/**/*.jsonl`, honors `PI_CODING_AGENT_DIR`; `--extract` optionally runs memory extraction over the imported history).
+- Session search (`codemem pi-session-search`) is a lexical, most-recent-first scan over stored user/assistant text — no FTS index, and thinking/tool-call/tool-result content is not searched. Empty results are explicit, never an error.
 
 See [`packages/pi-extension/README.md`](packages/pi-extension/README.md) and [docs/plugin-reference.md](docs/plugin-reference.md) for config knobs and lifecycle details.
 
