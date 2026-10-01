@@ -5,57 +5,9 @@ import { TextInput } from "../../../components/primitives/text-input";
 import type { SettingsPanelProps } from "../data/types";
 import { formatAgentClientList } from "../data/value-helpers";
 import { Field } from "./Field";
-import { catalogValues, ObserverModelAvailability } from "./ObserverModelAvailability";
+import { ObserverModelSettings } from "./ObserverModelSettings";
 import { SettingsHint } from "./SettingsHint";
 import { SettingsSectionIntro } from "./SettingsSectionIntro";
-
-function MainModelField({
-	values,
-	onTextInput,
-	getObserverModelLabel,
-	getObserverModelTooltip,
-	getObserverModelDescription,
-	getObserverModelHint,
-}: Pick<
-	SettingsPanelProps,
-	| "values"
-	| "onTextInput"
-	| "getObserverModelLabel"
-	| "getObserverModelTooltip"
-	| "getObserverModelDescription"
-	| "getObserverModelHint"
->) {
-	let provider = values.observerProvider;
-	if (values.observerRuntime === "codex_sidecar") provider = "openai";
-	else if (values.observerRuntime === "claude_sidecar") provider = "anthropic";
-	return (
-		<Field>
-			<div className="field-label">
-				<label htmlFor="observerModel">{getObserverModelLabel()}</label>
-				<button
-					aria-label="About model defaults"
-					className="help-icon"
-					data-tooltip={getObserverModelTooltip()}
-					type="button"
-				>
-					?
-				</button>
-			</div>
-			<TextInput
-				id="observerModel"
-				list="observerModel-catalog"
-				onInput={onTextInput("observerModel")}
-				placeholder="leave empty for default"
-				value={values.observerModel}
-			/>
-			<div className="small">{getObserverModelDescription()}</div>
-			<div className="small" id="observerModelHint">
-				{getObserverModelHint()}
-			</div>
-			<ObserverModelAvailability id="observerModel" values={values} provider={provider} />
-		</Field>
-	);
-}
 
 function ConnectionModeField({
 	runtime,
@@ -107,15 +59,15 @@ function ConnectionModeField({
 	);
 }
 
-function ModelProviderField({
-	runtime,
-	values,
+function ProviderField({
+	value,
 	providerOptions,
 	onSelectValueChange,
-}: Pick<SettingsPanelProps, "values" | "providerOptions" | "onSelectValueChange"> & {
-	runtime: string;
+}: {
+	value: string;
+	providerOptions: SettingsPanelProps["providerOptions"];
+	onSelectValueChange: SettingsPanelProps["onSelectValueChange"];
 }) {
-	if (runtime === "claude_sidecar" || runtime === "codex_sidecar") return null;
 	return (
 		<Field>
 			<div className="field-label">
@@ -123,7 +75,7 @@ function ModelProviderField({
 				<button
 					aria-label="About model provider"
 					className="help-icon"
-					data-tooltip="Choose where model requests are sent. Use auto for recommended defaults."
+					data-tooltip="Choose where model requests are sent. Pi setup can also derive a provider and model from an API-key provider."
 					type="button"
 				>
 					?
@@ -138,14 +90,39 @@ function ModelProviderField({
 				options={[{ label: "auto (default)", value: "" }, ...providerOptions]}
 				placeholder="auto (default)"
 				triggerClassName="settings-select-trigger"
-				value={values.observerProvider}
+				value={value}
 				viewportClassName="settings-select-viewport"
 			/>
-			<div className="small">
-				Use `auto` unless you need to pin a specific provider. Pi setup can derive Direct API
-				provider/model from API-key providers only.
-			</div>
+			<div className="small">Use auto unless you need to pin a provider.</div>
 		</Field>
+	);
+}
+
+function ConnectionFields({
+	values,
+	runtime,
+	explicit,
+	providerOptions,
+	onSelectValueChange,
+}: Pick<SettingsPanelProps, "values" | "providerOptions" | "onSelectValueChange"> & {
+	runtime: string;
+	explicit: boolean;
+}) {
+	const local = runtime === "claude_sidecar" || runtime === "codex_sidecar";
+	return (
+		<>
+			<ConnectionModeField
+				runtime={explicit ? runtime : "automatic"}
+				onSelectValueChange={onSelectValueChange}
+			/>
+			{!explicit || !local ? (
+				<ProviderField
+					value={values.observerProvider}
+					providerOptions={providerOptions}
+					onSelectValueChange={onSelectValueChange}
+				/>
+			) : null}
+		</>
 	);
 }
 
@@ -153,6 +130,7 @@ export function ObserverPanel({
 	values,
 	effectiveObserverRuntime = values.observerRuntime,
 	hasExplicitObserverRuntime = true,
+	tierProviders,
 	observerMaxCharsDefault,
 	providerOptions,
 	showAuthFile,
@@ -160,6 +138,7 @@ export function ObserverPanel({
 	hiddenUnlessAdvanced,
 	onTextInput,
 	onSelectValueChange,
+	onSwitchInput,
 	getObserverModelLabel,
 	getObserverModelTooltip,
 	getObserverModelDescription,
@@ -175,23 +154,10 @@ export function ObserverPanel({
 			/>
 			<div className="settings-group">
 				<h3 className="settings-group-title">Connection</h3>
-				<ConnectionModeField
-					runtime={hasExplicitObserverRuntime ? effectiveObserverRuntime : "automatic"}
-					onSelectValueChange={onSelectValueChange}
-				/>
-				<ModelProviderField
-					runtime={hasExplicitObserverRuntime ? effectiveObserverRuntime : ""}
-					values={values}
-					providerOptions={providerOptions}
-					onSelectValueChange={onSelectValueChange}
-				/>
-				<MainModelField
-					values={catalogValues(values, effectiveObserverRuntime, hasExplicitObserverRuntime)}
-					onTextInput={onTextInput}
-					getObserverModelLabel={getObserverModelLabel}
-					getObserverModelTooltip={getObserverModelTooltip}
-					getObserverModelDescription={getObserverModelDescription}
-					getObserverModelHint={getObserverModelHint}
+				<ConnectionFields
+					{...{ values, providerOptions, onSelectValueChange }}
+					runtime={effectiveObserverRuntime}
+					explicit={hasExplicitObserverRuntime}
 				/>
 				<Field className="field settings-advanced" hidden={hiddenUnlessAdvanced()}>
 					<label htmlFor="codexCommand">Codex command (JSON argv)</label>
@@ -229,6 +195,17 @@ export function ObserverPanel({
 					</div>
 				</Field>
 			</div>
+			<ObserverModelSettings
+				values={{ ...values, observerRuntime: effectiveObserverRuntime }}
+				tierProviders={tierProviders}
+				hiddenUnlessAdvanced={hiddenUnlessAdvanced}
+				onTextInput={onTextInput}
+				onSwitchInput={onSwitchInput}
+				getObserverModelLabel={getObserverModelLabel}
+				getObserverModelTooltip={getObserverModelTooltip}
+				getObserverModelDescription={getObserverModelDescription}
+				getObserverModelHint={getObserverModelHint}
+			/>
 			{observerStatusBannerSlot}
 
 			<div className="settings-group">

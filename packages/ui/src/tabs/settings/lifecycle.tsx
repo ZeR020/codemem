@@ -26,17 +26,16 @@ import {
 } from "./data/config-loader";
 import { diffSettingsPayload } from "./data/diff-payload";
 import { createSettingsEventHandlers } from "./data/event-handlers";
-import type { ObserverApplyPayload } from "./data/form-state";
 import {
 	getObserverModelDescription as getObserverModelDescriptionRaw,
 	getObserverModelHint as getObserverModelHintRaw,
 	getObserverModelLabel as getObserverModelLabelRaw,
 	getObserverModelTooltip as getObserverModelTooltipRaw,
-	getTieredRoutingHelperText as getTieredRoutingHelperTextRaw,
 	hiddenUnlessAdvanced as hiddenUnlessAdvancedRaw,
 	protectedConfigHelp,
 } from "./data/model-accessors";
 import { buildSettingsNotice } from "./data/notice";
+import { updateObserverApply } from "./data/observer-apply";
 import { settingsState, settingsView } from "./data/state";
 import {
 	getSettingsViewState,
@@ -58,8 +57,6 @@ const getObserverModelHint = (): string =>
 		},
 		settingsState.envOverrides,
 	);
-const getTieredRoutingHelperText = (): string =>
-	getTieredRoutingHelperTextRaw(getSettingsViewState().renderState.values);
 const getObserverModelLabel = (): string =>
 	getObserverModelLabelRaw(getSettingsViewState().renderState.values);
 const getObserverModelTooltip = (): string =>
@@ -75,14 +72,6 @@ const { onTextInput, onSelectValueChange, onSwitchInput } = createSettingsEventH
 	updateFormState,
 	setDirty: (dirty) => setDirty(dirty),
 });
-
-function updateObserverApply(payload: unknown): void {
-	if (!payload || typeof payload !== "object") return;
-	const apply = (payload as { observer_apply?: ObserverApplyPayload }).observer_apply;
-	if (!apply || !["active", "applying", "failed"].includes(apply.state)) return;
-	settingsState.observerApply = apply;
-	updateRenderState({});
-}
 
 async function retryObserverApply(): Promise<void> {
 	try {
@@ -176,7 +165,6 @@ function SettingsDialogContent() {
 		getObserverModelTooltip,
 		getObserverModelDescription,
 		getObserverModelHint,
-		getTieredRoutingHelperText,
 		protectedConfigHelp,
 	};
 
