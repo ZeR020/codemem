@@ -46,7 +46,7 @@ export interface TieredObserverConfigSelection {
 
 export const SIMPLE_TIER_DEFAULTS: Partial<ObserverConfig> = {
 	observerProvider: "openai",
-	observerModel: "gpt-5.6-luna",
+	observerModel: "gpt-6-luna",
 	observerTemperature: 0.2,
 	observerReasoningEffort: "medium",
 };
@@ -91,6 +91,10 @@ function trimmedProvider(value: string | null | undefined): string | null {
 	return trimmed ? trimmed.toLowerCase() : null;
 }
 
+function tierModel(value: string | null | undefined): string | null {
+	return value?.trim() || null;
+}
+
 function resolveSimpleTierDefaults(provider: KnownTierProvider): Partial<ObserverConfig> {
 	return provider === "anthropic" ? SIMPLE_TIER_ANTHROPIC_DEFAULTS : SIMPLE_TIER_DEFAULTS;
 }
@@ -104,6 +108,7 @@ function normalizeRuntime(value: string | null | undefined): string {
 	if (
 		normalized === "claude_sidecar" ||
 		normalized === "codex_sidecar" ||
+		normalized === "api_key" ||
 		normalized === "opencode_v2"
 	)
 		return normalized;
@@ -147,6 +152,9 @@ export function buildTieredObserverSelection(
 	baseConfig: ObserverConfig,
 	decision: ExtractionReplayTierRoutingDecision,
 ): TieredObserverConfigSelection {
+	const modelOverride = tierModel(
+		decision.tier === "simple" ? baseConfig.observerSimpleModel : baseConfig.observerRichModel,
+	);
 	const normalizedRuntime = normalizeRuntime(baseConfig.observerRuntime);
 	const explicitConfigKeys = new Set(baseConfig.observerExplicitConfigKeys ?? []);
 	if (normalizedRuntime === "claude_sidecar") {
@@ -162,14 +170,7 @@ export function buildTieredObserverSelection(
 		const tierDefaults =
 			decision.tier === "simple" ? SIMPLE_TIER_ANTHROPIC_DEFAULTS : RICH_TIER_ANTHROPIC_DEFAULTS;
 		const observer = withProviderOverride(baseConfig, "anthropic", {
-			observerModel:
-				decision.tier === "simple"
-					? (baseConfig.observerSimpleModel ??
-						tierDefaults.observerModel ??
-						baseConfig.observerModel)
-					: (baseConfig.observerRichModel ??
-						tierDefaults.observerModel ??
-						baseConfig.observerModel),
+			observerModel: modelOverride ?? tierDefaults.observerModel ?? baseConfig.observerModel,
 			observerTemperature:
 				decision.tier === "simple"
 					? (baseConfig.observerSimpleTemperature ??
@@ -216,10 +217,7 @@ export function buildTieredObserverSelection(
 				: trimmedProvider(baseConfig.observerRichProvider)) ??
 			trimmedProvider(baseConfig.observerProvider);
 		const observer = withProviderOverride(baseConfig, "openai", {
-			observerModel:
-				decision.tier === "simple"
-					? (baseConfig.observerSimpleModel ?? baseConfig.observerModel)
-					: (baseConfig.observerRichModel ?? baseConfig.observerModel),
+			observerModel: codexTierModel(baseConfig, decision.tier),
 			observerTemperature:
 				decision.tier === "simple"
 					? (baseConfig.observerSimpleTemperature ?? baseConfig.observerTemperature)
@@ -259,8 +257,7 @@ export function buildTieredObserverSelection(
 			const useOpenAIResponses =
 				knownProvider === "openai" && shouldUseOpenAIResponses(baseConfig, explicitConfigKeys);
 			const observer = withProviderOverride(baseConfig, knownProvider, {
-				observerModel:
-					baseConfig.observerSimpleModel ?? tierDefaults.observerModel ?? baseConfig.observerModel,
+				observerModel: modelOverride ?? tierDefaults.observerModel ?? baseConfig.observerModel,
 				observerTemperature:
 					baseConfig.observerSimpleTemperature ??
 					tierDefaults.observerTemperature ??
@@ -288,7 +285,7 @@ export function buildTieredObserverSelection(
 		const preservedProvider =
 			trimmedProvider(baseConfig.observerSimpleProvider) ?? baseConfig.observerProvider ?? null;
 		const observer = withProviderOverride(baseConfig, preservedProvider, {
-			observerModel: baseConfig.observerSimpleModel ?? baseConfig.observerModel,
+			observerModel: modelOverride ?? baseConfig.observerModel,
 			observerTemperature: baseConfig.observerSimpleTemperature ?? baseConfig.observerTemperature,
 			observerOpenAIUseResponses: undefined,
 			observerReasoningEffort: null,
@@ -312,8 +309,7 @@ export function buildTieredObserverSelection(
 		const isOpenAI = knownProvider === "openai";
 		const useOpenAIResponses = isOpenAI && shouldUseOpenAIResponses(baseConfig, explicitConfigKeys);
 		const observer = withProviderOverride(baseConfig, knownProvider, {
-			observerModel:
-				baseConfig.observerRichModel ?? tierDefaults.observerModel ?? baseConfig.observerModel,
+			observerModel: modelOverride ?? tierDefaults.observerModel ?? baseConfig.observerModel,
 			observerTemperature:
 				baseConfig.observerRichTemperature ??
 				tierDefaults.observerTemperature ??
@@ -352,7 +348,7 @@ export function buildTieredObserverSelection(
 	const preservedProvider =
 		trimmedProvider(baseConfig.observerRichProvider) ?? baseConfig.observerProvider ?? null;
 	const observer = withProviderOverride(baseConfig, preservedProvider, {
-		observerModel: baseConfig.observerRichModel ?? baseConfig.observerModel,
+		observerModel: modelOverride ?? baseConfig.observerModel,
 		observerTemperature: baseConfig.observerRichTemperature ?? baseConfig.observerTemperature,
 		observerOpenAIUseResponses: undefined,
 		observerReasoningEffort: null,
@@ -371,6 +367,24 @@ export function buildTieredObserverSelection(
 			observerRuntime: normalizedRuntime,
 		}),
 	};
+}
+
+function codexTierModel(
+	config: ObserverConfig,
+	tier: "simple" | "rich",
+): string | null | undefined {
+	const selected = (
+		tier === "simple" ? config.observerSimpleModel : config.observerRichModel
+	)?.trim();
+	if (selected) return selected;
+	// Older callers lack explicit-key metadata; preserve their supplied base model.
+	const explicitBase =
+		config.observerExplicitConfigKeys == null ||
+		config.observerExplicitConfigKeys.includes("observerModel");
+	const baseModel = config.observerModel?.trim();
+	if (baseModel && explicitBase) return baseModel;
+	const defaults = tier === "simple" ? SIMPLE_TIER_DEFAULTS : RICH_TIER_DEFAULTS;
+	return defaults.observerModel;
 }
 
 export function buildTieredObserverConfig(

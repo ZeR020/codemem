@@ -172,7 +172,9 @@ export function effectiveObserverRuntime(draft?: string): string {
 	const runtime = String(runtimeValue ?? "")
 		.trim()
 		.toLowerCase();
-	return isSidecarRuntime(runtime) ? runtime : "api_http";
+	return ["api_key", "opencode_v2"].includes(runtime) || isSidecarRuntime(runtime)
+		? runtime
+		: "api_http";
 }
 
 function draftAuthRuntime(): string | undefined {
@@ -447,11 +449,11 @@ export function SettingsOutcome({
 		);
 	}
 	let summary = timing;
-	if (timing === "After viewer restart") summary = "Restart required";
+	if (timing === "After viewer restart") summary = "Change details";
 	else if (timing.startsWith("After removing ")) summary = `Environment-controlled · ${timing}`;
 	else if (scope === "No current effect" || stage === "Sidecar authentication")
 		summary = `Inactive · ${timing}`;
-	else if (timing.startsWith("After viewer restart,")) summary = "Restart required · Conditional";
+	else if (timing.startsWith("After viewer restart,")) summary = "Change details";
 	return (
 		<details className="settings-outcome" data-settings-outcome-for={controlId}>
 			<summary>{summary}</summary>

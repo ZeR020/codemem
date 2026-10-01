@@ -407,7 +407,7 @@ Example agent requests:
 
 ## Observer model defaults
 
-- OpenAI: `gpt-5.1-codex-mini`
+- OpenAI: `gpt-6-luna` (tier routing uses `gpt-6-luna` for simple batches and `gpt-5.6-terra` for rich batches)
 - Anthropic: `claude-4.5-haiku` (mapped to Anthropic direct API alias `claude-haiku-4-5` when using `api_http`)
 
 Provider/model selection can be overridden with `CODEMEM_OBSERVER_PROVIDER` and
@@ -440,19 +440,25 @@ compatibility-breaking release with release notes.
 
 ### Observer auth modes
 
-Observer execution supports API, Claude, and Codex runtime paths.
+Observer connections support API keys, an OpenCode account, and local Claude or Codex sessions.
 
-- Runtime values: `api_http`, `claude_sidecar`, `codex_sidecar`. For newly captured OpenCode 2 raw events, implicit OpenCode OAuth routing (including a saved `api_http` with no explicit credential or custom endpoint) uses the local V2 service's stateless generation path. V1/unmarked events remain on the legacy path; mixed-version streams flush at generation boundaries. Explicit API credentials, custom endpoints, auth file/command, and sidecar choices are preserved.
+- Explicit runtime values: `api_key` (API key), `opencode_v2` (OpenCode account), `claude_sidecar` (Local Claude session), and `codex_sidecar` (Local Codex session). API-key mode requires a configured API credential, including for custom endpoints, and excludes cached subscription sign-ins. OpenCode-account mode requires the running local service and never falls back to a direct API key or imports Pi provider/model defaults. Missing credentials or an unavailable service produce a visible observer error.
+- API-key mode with provider `opencode` accepts `OPENCODE_API_KEY` only for the built-in OpenCode Zen endpoint; custom endpoints require their own explicitly configured credential. That variable is not used for other providers. Empty or whitespace-only tier model overrides use the provider's tier defaults, or the saved base model for a custom provider.
+- Settings shows restart guidance beside Save changes when an edited value requires it, and reports the actual result after saving. Field disclosures retain the affected scope and existing-data impact without repeating restart warnings; observer timing comes from the save result. Inactive observer tuning still explains when a connection ignores a value. Removing an authentication environment override can change an automatic connection, but does not activate API authentication for an explicitly selected local session. Unused pack limits do not require a restart.
+- Automatic detection has its own connection choice, so you can explicitly select a connection even when it matches the detected one. Saving Automatic clears the pinned runtime and restores detection; its preview ignores the saved runtime pin. The provider remains editable for automatic connections because it can still affect OpenCode requests; model guidance follows that editable provider. API-key and OpenCode-account connections show model catalogs; explicitly selected local sessions do not. Checking observer status refreshes automatic tier routing when apply finishes, without overwriting a connection draft, an edited routing switch, or an explicit configuration/environment setting. An edited routing switch is saved as an explicit choice even when it matches the active automatic value.
+- Authentication recovery guidance uses a server preview that ignores the auth-source environment override without changing the running process. It offers removal/restart recovery only when the saved source would use an API connection; local Claude sessions that remain local keep inactive guidance.
+- Legacy `api_http` and omitted runtime settings retain their existing routing until you explicitly select a connection. For newly captured OpenCode 2 raw events, implicit OpenCode OAuth routing (including a saved `api_http` with no explicit credential or custom endpoint) uses the local service. Older unmarked events remain on their prior path; mixed-version streams flush at generation boundaries. Unrelated Settings edits do not migrate a connection.
 - The V2 service uses the chosen provider/model and whichever account is active for that provider in OpenCode; codemem does not choose subscription versus API billing. Settings' OpenCode V2 catalog suggestions are not proof of access through the selected connection. During OpenCode location startup, codemem retries only the exact pre-generation model-selection rejection for up to about eight seconds, without changing the provider or model. Other failures are not retried; a model that remains unavailable fails visibly.
-- V2's stateless one-shot API lacks a provider-enforced output-token cap and reports no usage. The local timeout and response-size limit bound only codemem's wait and accepted data, not provider generation or billing. The Codex/Claude sidecars and legacy OpenCode OAuth Codex path also have no provider-enforced output cap. To require a provider-side cap, configure direct `api_http` with an explicit API key for OpenAI Responses or Anthropic Messages; that route can be billed separately. Historical recovery does not automatically move to V2.
+- OpenCode's stateless one-shot API lacks a provider-enforced output-token cap and reports no usage. The local timeout and response-size limit constrain only codemem's wait and accepted data, not provider generation. The Codex/Claude sidecars and legacy OpenCode OAuth Codex path also have no provider-enforced output cap. To require a provider-side cap, select `api_key` for OpenAI Responses or Anthropic Messages. Historical recovery does not automatically move to the OpenCode service.
 - `claude_sidecar` runs observer calls via local Claude runtime auth (no `ANTHROPIC_API_KEY` required).
 - `claude_sidecar` uses `claude_command` (or `CODEMEM_CLAUDE_COMMAND`) as argv prefix for launching Claude CLI. Default: `["claude"]`.
 - `codex_sidecar` runs observer calls via the local `codex` CLI (`codex exec`), so Codex / ChatGPT Pro users get memory extraction with **no API key** — auth is delegated to the Codex CLI (`~/.codex`). It uses `codex_command` (or `CODEMEM_CODEX_COMMAND`) as the argv prefix. Default: `["codex"]`. The spawned process runs with `--ephemeral --ignore-user-config -s read-only` and codemem's own hooks suppressed, so it never recurses into capture.
 - codemem auto-selects `codex_sidecar` only when no `observer_runtime` is set, no API key is available from any provider, the OpenCode OAuth cache has no usable credentials, the `codex` CLI is resolvable, and `~/.codex/auth.json` exists. Otherwise set `observer_runtime = "codex_sidecar"` (or `CODEMEM_OBSERVER_RUNTIME=codex_sidecar`) explicitly.
 - Default models:
-- `api_http`: `gpt-5.1-codex-mini` unless `observer_model` is set.
+- `api_key` and legacy `api_http`: `gpt-6-luna` for OpenAI unless `observer_model` is set.
+- `opencode_v2`: the selected provider's default model unless `observer_model` is set; OpenAI uses `gpt-6-luna`. With OpenAI tier routing enabled, simple/rich defaults are `gpt-6-luna` / `gpt-5.6-terra`.
 - `claude_sidecar`: `claude-4.5-haiku` unless `observer_model` is set.
-- `codex_sidecar`: `gpt-5.1-codex-mini` unless `observer_model` is set; the selected model is passed to `codex exec` via `-m` (tier routing).
+- `codex_sidecar`: `gpt-6-luna` unless `observer_model` is set; with tier routing enabled, simple/rich defaults are `gpt-6-luna` / `gpt-5.6-terra`. Explicit tier models take precedence over an explicit base model, which takes precedence over these defaults. The selected model is passed to `codex exec` via `-m`.
 - Anthropic direct API calls accept Anthropic model IDs/aliases; use `claude-haiku-4-5-20251001` if you need a pinned snapshot instead of the moving alias.
 - If `observer_model` is unsupported in Claude CLI, codemem retries once without `--model`. The same fallback applies to `codex_sidecar`: an unavailable tier model is retried once without `-m`.
 - Supported auth sources: `auto`, `env`, `file`, `command`, `none`.
@@ -466,7 +472,7 @@ For command-refreshed gateway auth, configure a command token source plus templa
 {
   "observer_provider": "your-gateway-provider",
   "observer_base_url": "https://gateway.example/v1",
-  "observer_runtime": "api_http",
+  "observer_runtime": "api_key",
   "observer_auth_source": "command",
   "observer_auth_command": ["iap-auth", "--audience", "example"],
   "observer_auth_timeout_ms": 1500,
@@ -713,13 +719,13 @@ If you run multiple adapters for the same project (for example OpenCode + Claude
 | `CODEMEM_INJECT_RETAINED_TOKEN_BUDGET` | Opt-in approximate cap for retained OpenCode automatic message blocks, off by default. Only an explicit positive safe integer (for example `8000`) enables it; unset, invalid, or nonpositive values disable it. Count full wrapped blocks currently retained, including replay/reconstruction. Compaction notifications do not reset allowance. Does not apply to legacy system injection or explicit MCP recall. |
 | `CODEMEM_INJECT_TOKEN_BUDGET` | Positive approximate token cap for OpenCode's complete wrapped injection (default `800`). OpenCode reserves its context prefix before sending the remaining budget through Viewer or CLI; unset, zero, negative, and invalid values use `800`. An override too small to leave a positive pack budget injects nothing because `0` means unlimited to generic pack calls. Pack accounting uses `ceil(characters / 4)`, not the provider tokenizer. |
 | `CODEMEM_USE_OPENCODE_RUN` | Use `opencode run` for observer generation (default off). |
-| `CODEMEM_OPENCODE_MODEL` | Model for `opencode run` (default `gpt-5.1-codex-mini`). |
+| `CODEMEM_OPENCODE_MODEL` | Model for `opencode run` (default `gpt-6-luna`). |
 | `CODEMEM_OPENCODE_AGENT` | Agent for `opencode run` (optional). |
 | `CODEMEM_OBSERVER_PROVIDER` | Force `openai`, `anthropic`, or a custom provider key (optional). |
-| `CODEMEM_OBSERVER_MODEL` | Override observer model (default `gpt-5.1-codex-mini` or `claude-4.5-haiku`). |
+| `CODEMEM_OBSERVER_MODEL` | Override observer model (default `gpt-6-luna` or `claude-4.5-haiku`). |
 | `CODEMEM_OBSERVER_API_KEY` | API key for observer model (optional). |
 | `CODEMEM_CLAUDE_COMMAND` | JSON argv array for Claude CLI invocation used by `claude_sidecar` (default `["claude"]`). |
-| `CODEMEM_OBSERVER_RUNTIME` | Observer runtime mode (`api_http` or `claude_sidecar`). |
+| `CODEMEM_OBSERVER_RUNTIME` | Observer connection: `api_key`, `opencode_v2`, `claude_sidecar`, or `codex_sidecar`. Omitted or legacy `api_http` values retain automatic routing. |
 | `CODEMEM_OBSERVER_OUTPUT_MODE` | Observer output contract: `legacy_xml` (default); `auto` enables JSON Schema only on proven direct API cells and preselects XML elsewhere; `json_schema` explicitly asserts compatible custom OpenAI (`observer_base_url`) or Anthropic (`CODEMEM_ANTHROPIC_ENDPOINT`) gateway support. Malformed constrained output fails closed without XML reparsing. |
 | `CODEMEM_ANTHROPIC_ENDPOINT` | Anthropic Messages API endpoint override. With provider `anthropic`, API-key auth, and output mode `json_schema`, this explicitly opts a compatible endpoint into constrained output. |
 | `CODEMEM_OBSERVER_AUTH_SOURCE` | Observer auth source (`auto`, `env`, `file`, `command`, `none`). |
