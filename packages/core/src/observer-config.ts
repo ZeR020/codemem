@@ -1431,7 +1431,10 @@ export function resolveCustomProviderFromModel(
 ): string | null {
 	if (!model?.includes("/")) return null;
 	const prefix = model.split("/")[0] ?? "";
-	return prefix && providers.has(prefix) ? prefix : null;
+	if (!prefix) return null;
+	if (providers.has(prefix)) return prefix;
+	const normalizedPrefix = prefix.toLowerCase();
+	return [...providers].find((provider) => provider.toLowerCase() === normalizedPrefix) ?? null;
 }
 
 // ---------------------------------------------------------------------------
@@ -1617,7 +1620,9 @@ export function resolveCustomProviderModel(
 	}
 
 	const prefix = `${provider}/`;
-	const shortName = name.startsWith(prefix) ? name.slice(prefix.length) : name;
+	const shortName = name.toLowerCase().startsWith(prefix.toLowerCase())
+		? name.slice(prefix.length)
+		: name;
 
 	const models = asRecord(providerConfig.models);
 	let modelId: string | null = shortName;

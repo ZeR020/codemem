@@ -5,6 +5,7 @@ import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { buildTieredObserverConfig } from "./extraction-tier-routing.js";
 import { probeAvailableCredentials } from "./observer-auth.js";
 import { loadObserverConfig, ObserverAuthError, ObserverClient } from "./observer-client.js";
+import { resolveCustomProviderFromModel } from "./observer-config.js";
 import { observerForRawEvents } from "./raw-event-flush.js";
 
 const generate = vi.hoisted(() => vi.fn());
@@ -187,6 +188,66 @@ it("legacy api_http still uses its existing subscription route", () => {
 	);
 	expect(observer.getStatus().auth.type).toBe("codex_consumer");
 });
+
+it.each([
+	["gateway", "Gateway/Org/Model"],
+	["Gateway", "GATEWAY/Org/Model"],
+])("infers configured custom provider %s from %s in Auto mode", async (provider, model) => {
+	const configDir = join(home, ".config/opencode");
+	mkdirSync(configDir, { recursive: true });
+	writeFileSync(
+		join(configDir, "opencode.json"),
+		JSON.stringify({ provider: { [provider]: { models: { "Org/Model": {} } } } }),
+	);
+	generate.mockResolvedValue({ text: "{}", error: null });
+	const observer = new ObserverClient(
+		loadObserverConfig({ observer_runtime: "opencode_v2", observer_model: model }),
+	);
+	await observer.observe("system", "user");
+	expect(generate).toHaveBeenCalledWith({
+		provider,
+		model: "Org/Model",
+		prompt: "system\n\nuser",
+	});
+});
+
+it("keeps exact custom provider matches ahead of case-insensitive aliases", () => {
+	const providers = new Set(["gateway", "Gateway"]);
+	expect(resolveCustomProviderFromModel("Gateway/Org/Model", providers)).toBe("Gateway");
+	expect(resolveCustomProviderFromModel("missing/Org/Model", providers)).toBeNull();
+	expect(resolveCustomProviderFromModel("OrgModel", providers)).toBeNull();
+});
+
+it.each(["api_key", "api_http"])(
+	"maps mixed-case custom prefixes before %s direct dispatch",
+	async (runtime) => {
+		const configDir = join(home, ".config/opencode");
+		mkdirSync(configDir, { recursive: true });
+		writeFileSync(
+			join(configDir, "opencode.json"),
+			JSON.stringify({
+				provider: {
+					Gateway: {
+						options: { baseURL: "https://gateway.example/v1", apiKey: "fixture-gateway-key" },
+						models: { "Org/Model": { id: "MappedModelCase" } },
+					},
+				},
+			}),
+		);
+		const fetchMock = vi.fn().mockResolvedValue(
+			new Response(JSON.stringify({ choices: [{ message: { content: "{}" } }] }), {
+				status: 200,
+			}),
+		);
+		vi.stubGlobal("fetch", fetchMock);
+		const observer = new ObserverClient(
+			loadObserverConfig({ observer_runtime: runtime, observer_model: "GATEWAY/Org/Model" }),
+		);
+		await observer.observeStructuredJson("system", "user", "test", { type: "object" });
+		expect(fetchMock.mock.calls[0]?.[0]).toBe("https://gateway.example/v1/chat/completions");
+		expect(JSON.parse(fetchMock.mock.calls[0]?.[1].body).model).toBe("MappedModelCase");
+	},
+);
 
 it.each([
 	{ provider: "opencode", selected: undefined, expected: "gpt-6-luna" },
