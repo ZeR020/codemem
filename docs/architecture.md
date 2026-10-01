@@ -391,6 +391,13 @@ re-imports dedupe against live-captured sessions. Idempotency is per destination
 unchanged files (size/mtime) are skipped via a `pi_import_state` table inside that database, and
 deterministic event ids make reprocessing safe.
 
+A lexical search primitive complements the import: core `searchPiSessions`/`extractPiSessionText`
+query the existing `raw_events` store (`source: "pi"`) directly — no new tables, indexes, or
+migrations. Stored payload envelopes are scanned most-recent-first with a bounded recency window
+(no FTS index by design), tokens reuse the memory-search lexical primitives, and results carry a
+bounded content snippet with truncation markers and counts. The response shape is the shared
+contract later consumed by the viewer REST route, the pi-extension native tool, and the CLI.
+
 ### OpenCode session finalization triggers
 - `session.idle` — finalizes current local buffer
 - `session.created` — finalizes before switching to a new session
