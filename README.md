@@ -251,7 +251,7 @@ What you get:
 
 - **Ingest** — extension POSTs to `POST /api/pi-hooks` (a compatibility alias that normalizes the payload once and runs it through the canonical ingest envelope with `source: "pi"`, the same event identity as `POST /api/raw-events`), with `codemem pi-hook-ingest` CLI fallback (spool when offline)
 - **Injection** — appends a `## codemem memories` block to the latest user message of the request copy on pi's `context` event; older messages replay the same bytes (never the system prompt, never the saved session). `CODEMEM_INJECT_RETAINED_TOKEN_BUDGET` optionally caps retained injected tokens
-- **Tools** — all 14 `memory_*` tools registered natively via `pi.registerTool` (HTTP preferred, CLI fallback). No `pi-mcp-adapter` required for tools
+- **Tools** — all 15 `memory_*` tools registered natively via `pi.registerTool` (HTTP preferred, CLI fallback), including `memory_session_search` over stored pi conversation text. No `pi-mcp-adapter` required for tools
 - **Compaction** — pi-only observe-only boundary: `session_before_compact` flushes extraction before pi discards context; never replaces pi's summarizer. A later pack fetch is skipped only when that compaction immediately resumes the turn
 - **Fork/resume** — stream identity re-keys on every `session_start`
 - **Project identity** — the extension resolves the project from the nearest Git root (same walk as the other adapters)
@@ -265,7 +265,7 @@ Caveats (v1):
 - The preferred HTTP pack path — prove `GET /api/prompt-pack-profile`, then a targeted `POST /api/pack` — is unledgered: pi injection does not write an opencode retrieval-ledger row.
 - `--pi-mcp` requires the third-party `pi-mcp-adapter` package; without it setup writes nothing MCP-related and explains the prerequisite. Native tools remain the default surface (`pi.tools_mode: native`).
 - Pre-install pi history is not imported automatically: session search only covers conversations captured since install. Backfill with `codemem pi-import-sessions` (walks `~/.pi/agent/sessions/**/*.jsonl`, honors `PI_CODING_AGENT_DIR`; `--extract` optionally runs memory extraction over the imported history).
-- Session search (`codemem pi-session-search`) is a lexical, most-recent-first scan over stored user/assistant text — no FTS index, and thinking/tool-call/tool-result content is not searched. Empty results are explicit, never an error.
+- Session search (`codemem pi-session-search`, `memory_session_search`, `GET /api/pi/sessions/search`) is a lexical, most-recent-first scan over stored user/assistant text — no FTS index, and thinking/tool-call/tool-result content is not searched. Empty results are explicit, never an error.
 
 See [`packages/pi-extension/README.md`](packages/pi-extension/README.md) and [docs/plugin-reference.md](docs/plugin-reference.md) for config knobs and lifecycle details.
 

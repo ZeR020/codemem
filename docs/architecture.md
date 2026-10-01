@@ -65,7 +65,7 @@ Support tiers describe operational expectations for each adapter path:
 | OpenCode 1 plugin | Supported | Primary reference adapter for lifecycle events and injection behavior. Minimum host 1.18.29. |
 | OpenCode 2 plugin | Beta | Same package, `setup()` entrypoint, validated on the exact stable `@opencode/cli@2.0.12` and `@opencode/plugin@2.0.12` releases. Captures conversation, tool, terminal usage, and lifecycle activity with bounded cleanup and keeps the hyphenated `mem-status`, `mem-recent`, and `mem-stats` tool IDs. `session.context` performs automatic recall only when the latest user message has a non-empty, non-whitespace ID; retries and tool continuations replay retained context byte-for-byte, while compaction, title, and generate hooks stay isolated. Disable with `CODEMEM_PLUGIN_IGNORE=1` or return to OpenCode 1 without a database migration. |
 | Claude hooks/plugin | Supported | Hook-first queue path with CLI/runtime fallback and parity slices tracked in adapter stack PRs. |
-| pi extension | Supported | Thin pi-package (`packages/pi-extension`, `packages/core/src/pi-hooks.ts`): extension → `POST /api/pi-hooks` alias → canonical ingest envelope (`source: "pi"`) → observer → memories; turn-local `systemPrompt` injection; 14 native `memory_*` tools; observe-only compaction boundary; fork/resume-aware streams; Git-root project identity. Observer derivation from pi config is API-key-only in v1 (OAuth → explicit `unconfigured (oauth-only)`). |
+| pi extension | Supported | Thin pi-package (`packages/pi-extension`, `packages/core/src/pi-hooks.ts`): extension → `POST /api/pi-hooks` alias → canonical ingest envelope (`source: "pi"`) → observer → memories; turn-local `systemPrompt` injection; 15 native `memory_*` tools (the MCP server stays at 14 — `memory_session_search` ships on pi-native, `GET /api/pi/sessions/search`, and CLI only); session-search + `codemem pi-import-sessions` history backfill; observe-only compaction boundary; fork/resume-aware streams; Git-root project identity. Observer derivation from pi config is API-key-only in v1 (OAuth → explicit `unconfigured (oauth-only)`). |
 | Codex plugin (hooks + MCP) | Supported | Functional capture pipeline (`plugins/codex/`, `packages/core/src/codex-hooks.ts`) dogfooded end-to-end: edge normalization → `POST /api/raw-events` → observer → memories. Prompt-time injection is present and env-gated but not fully validated on strict models. |
 | Windsurf integration | Experimental | Planned via shared adapter contract after OpenCode/Claude stabilization. |
 | Cursor integration | Experimental | Planned via shared adapter contract after OpenCode/Claude stabilization. |
@@ -384,28 +384,13 @@ before pi discards context. The preferred HTTP pack path — prove `GET /api/pro
 targeted `POST /api/pack` — is unledgered (no opencode retrieval-ledger row). The queue/sweeper
 behavior is shared with the other adapters.
 
-A history-import primitive rounds out the pi flow. The core `importPiSessions`/
-`parsePiSessionJsonl` import walks `~/.pi/agent/sessions/**/*.jsonl` (honoring
-`PI_CODING_AGENT_DIR`) and inserts the same `source: "pi"` raw events with deterministic ids, so
-re-imports dedupe against live-captured sessions. Idempotency is per destination database:
-unchanged files (size/mtime) are skipped via a `pi_import_state` table inside that database, and
-deterministic event ids make reprocessing safe.
-
-A lexical search primitive complements the import: core `searchPiSessions`/`extractPiSessionText`
-query the existing `raw_events` store (`source: "pi"`) directly — no new tables, indexes, or
-migrations. Stored payload envelopes are scanned most-recent-first with a bounded recency window
-(no FTS index by design), tokens reuse the memory-search lexical primitives, and results carry a
-bounded content snippet with truncation markers and counts. The response shape is the shared
-contract consumed by the CLI (`codemem pi-session-search`) today, and later by the viewer REST
-route and the pi-extension native tool.
-
-Both primitives are exposed on the CLI. `codemem pi-import-sessions` walks
-`~/.pi/agent/sessions/**/*.jsonl` (honors `PI_CODING_AGENT_DIR`), streaming per-file progress;
-`--extract` (off by default — observer-model cost scales with backlog) drains imported sessions
-through the standard `flushRawEvents` sweeper path so extracted memories carry pi attribution,
-while without it imported events stay searchable only. `codemem pi-session-search <query>` queries
-the same `searchPiSessions` primitive and prints a `Found N results` listing with attributed
-snippet lines, or the exact shared response object with `--json`.
+History import and session search round out the pi flow. `codemem pi-import-sessions` walks
+`~/.pi/agent/sessions/**/*.jsonl` (honors `PI_CODING_AGENT_DIR`) and inserts the same `source: "pi"`
+raw events with deterministic ids, so re-imports dedupe against live-captured sessions; `--extract`
+(off by default) drains imported sessions through the standard `flushRawEvents` sweeper path.
+Session search — `GET /api/pi/sessions/search`, the native `memory_session_search` tool, and
+`codemem pi-session-search` — is a most-recent-first lexical (LIKE) scan over those stored raw
+events with no FTS index, covering user/assistant text blocks only.
 
 ### OpenCode session finalization triggers
 - `session.idle` — finalizes current local buffer
