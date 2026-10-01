@@ -87,7 +87,16 @@ export function describeEffectiveSettings(
 	if (hasEnvironmentOverrides) {
 		return "Fields show configuration-resolved values. Runtime behavior may apply automatic provider defaults. Environment settings supply some fields.";
 	}
-	return "Fields show configuration-resolved values. Active observer and tier choices are shown separately. Restart-dependent changes are labeled below.";
+	return "Fields show configuration-resolved values. The current connection and models are shown separately while changes apply.";
+}
+
+function updateRuntimeMetadata(data: ConfigPayload): void {
+	settingsState.resolvedObserverRuntime = data.resolved_observer_runtime ?? null;
+	settingsState.observerRuntimeByAuthSource = data.observer_runtime_by_auth_source ?? {};
+	settingsState.observerRuntimeAfterAuthOverrideRemoval =
+		data.observer_runtime_after_auth_override_removal ?? {};
+	settingsState.observerAutomaticRuntimeByAuthSource =
+		data.observer_automatic_runtime_by_auth_source ?? {};
 }
 
 export function renderConfigModal(payload: unknown) {
@@ -106,10 +115,7 @@ export function renderConfigModal(payload: unknown) {
 
 	settingsState.envOverrides = envOverrides;
 	settingsState.effectiveConfig = { ...config, ...data.effective };
-	settingsState.resolvedObserverRuntime = data.resolved_observer_runtime ?? null;
-	settingsState.observerRuntimeByAuthSource = data.observer_runtime_by_auth_source ?? {};
-	settingsState.observerAutomaticRuntimeByAuthSource =
-		data.observer_automatic_runtime_by_auth_source ?? {};
+	updateRuntimeMetadata(data);
 	settingsState.observerApply = data.observer_apply ?? null;
 	settingsState.observerTierRoutingExplicit = hasExplicitTierRouting(data);
 	settingsState.protectedKeys = new Set(protectedKeys);

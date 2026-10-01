@@ -7,7 +7,6 @@ import { formatAgentClientList } from "../data/value-helpers";
 import { Field } from "./Field";
 import { ObserverModelSettings } from "./ObserverModelSettings";
 import { SettingsHint } from "./SettingsHint";
-import { SettingsSectionIntro } from "./SettingsSectionIntro";
 
 function ConnectionModeField({
 	runtime,
@@ -126,10 +125,15 @@ function ConnectionFields({
 	);
 }
 
+function isLocalSession(runtime: string): boolean {
+	return runtime === "claude_sidecar" || runtime === "codex_sidecar";
+}
+
 export function ObserverPanel({
 	values,
 	effectiveObserverRuntime = values.observerRuntime,
 	hasExplicitObserverRuntime = true,
+	allowAutomaticAuthChanges = false,
 	tierProviders,
 	observerMaxCharsDefault,
 	providerOptions,
@@ -148,10 +152,7 @@ export function ObserverPanel({
 }: SettingsPanelProps & { observerStatusBannerSlot: ComponentChildren }) {
 	return (
 		<>
-			<SettingsSectionIntro
-				detail={`Set how codemem reaches your model provider and where it should look for credentials. Shared across ${formatAgentClientList()}.`}
-				title="Connection and credentials"
-			/>
+			<p className="small observer-panel-intro">Shared across {formatAgentClientList()}.</p>
 			<div className="settings-group">
 				<h3 className="settings-group-title">Connection</h3>
 				<ConnectionFields
@@ -208,7 +209,10 @@ export function ObserverPanel({
 			/>
 			{observerStatusBannerSlot}
 
-			<div className="settings-group">
+			<div
+				className="settings-group"
+				hidden={isLocalSession(effectiveObserverRuntime) && !allowAutomaticAuthChanges}
+			>
 				<h3 className="settings-group-title">Authentication</h3>
 				<Field>
 					<div className="field-label">

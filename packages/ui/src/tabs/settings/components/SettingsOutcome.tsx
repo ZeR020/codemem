@@ -181,6 +181,18 @@ function draftAuthRuntime(): string | undefined {
 	return settingsState.observerRuntimeByAuthSource[source];
 }
 
+export function canEditAutomaticAuth(draft?: string): boolean {
+	if (settingsState.envOverrides.observer_auth_source) return true;
+	const changed =
+		settingsState.touchedKeys.has("observer_runtime") &&
+		draft !== settingsState.baseline.observer_runtime;
+	if (changed && !settingsState.envOverrides.observer_runtime) {
+		if (draft?.trim()) return false;
+		return Object.values(settingsState.observerAutomaticRuntimeByAuthSource).includes("api_http");
+	}
+	return Object.values(settingsState.observerRuntimeByAuthSource).includes("api_http");
+}
+
 function effectiveSetting(controlId: string, draft?: unknown): unknown {
 	const key = INPUT_TO_CONFIG_KEY[controlId as keyof typeof INPUT_TO_CONFIG_KEY];
 	if (key && settingsState.envOverrides[key]) return settingsState.effectiveConfig[key];
@@ -331,6 +343,89 @@ function tuningOutcome(controlId: string, sidecar: boolean): SettingsOutcomeDeta
 	};
 }
 
+function ObserverEffectDetails({ controlId, existingData, scope, stage }: SettingsOutcomeDetails) {
+	return (
+		<details className="settings-outcome" data-settings-outcome-for={controlId}>
+			<summary>Change details</summary>
+			<div className="settings-outcome-details">
+				<span>
+					<strong>Affects:</strong> {stage}
+				</span>
+				<span>
+					<strong>Scope:</strong> {scope}
+				</span>
+				<span>
+					<strong>Existing data:</strong> {existingData}
+				</span>
+			</div>
+		</details>
+	);
+}
+
+function ObserverEffectNote({ scope, stage, timing }: SettingsOutcomeDetails) {
+	if (scope === "No current effect" || stage === "Sidecar authentication")
+		return <div className="settings-effect-note small">Inactive · {timing}</div>;
+	if (/only/i.test(scope)) return <div className="settings-effect-note small">{scope}</div>;
+	return null;
+}
+
+function observerFieldOverride(configKey: string, stage: string): unknown {
+	const ownOverride = settingsState.envOverrides[configKey];
+	if (ownOverride) return ownOverride;
+	if (stage === "Sidecar authentication" && !hasExplicitObserverRuntime())
+		return settingsState.envOverrides.observer_auth_source;
+	return undefined;
+}
+
+function savedAuthUsesApi(): boolean {
+	const value = settingsState.touchedKeys.has("observer_auth_source")
+		? settingsView.value.renderState.values.observerAuthSource
+		: settingsState.baseline.observer_auth_source;
+	const source = normalizedAuthSource(value);
+	return (
+		(settingsState.observerRuntimeAfterAuthOverrideRemoval[source] ??
+			settingsState.observerRuntimeByAuthSource[source]) === "api_http"
+	);
+}
+
+function ObserverFieldOutcome({
+	configKey,
+	...details
+}: SettingsOutcomeDetails & { configKey: string }) {
+	const { scope, stage, timing } = details;
+	const override = observerFieldOverride(configKey, stage);
+	const inactive = scope === "No current effect" || stage === "Sidecar authentication";
+	if (typeof override !== "string" || !override.trim()) {
+		return (
+			<>
+				<ObserverEffectNote {...details} />
+				<ObserverEffectDetails {...details} />
+			</>
+		);
+	}
+	let guidance = "Remove that environment setting and restart the viewer to apply changes here.";
+	const authOverride = settingsState.envOverrides.observer_auth_source;
+	if (
+		stage === "Sidecar authentication" &&
+		!hasExplicitObserverRuntime(settingsView.value.renderState.values.observerRuntime) &&
+		savedAuthUsesApi() &&
+		typeof authOverride === "string" &&
+		authOverride.trim()
+	) {
+		const controllingOverrides = [...new Set([authOverride.trim(), override.trim()])].join(" and ");
+		guidance = `Inactive for the current connection · ${timing}. Remove ${controllingOverrides} and restart the viewer to use the saved authentication settings. The connection may change after removal.`;
+	} else if (inactive)
+		guidance = `Inactive · ${timing}. Removing the environment setting does not activate this field for the current connection.`;
+	return (
+		<>
+			<div className="settings-env-note small">
+				Controlled by {override.trim()}. {guidance}
+			</div>
+			<ObserverEffectDetails {...details} />
+		</>
+	);
+}
+
 export function SettingsOutcome({
 	controlId,
 	existingData,
@@ -338,6 +433,19 @@ export function SettingsOutcome({
 	stage,
 	timing,
 }: SettingsOutcomeDetails) {
+	const configKey = INPUT_TO_CONFIG_KEY[controlId as keyof typeof INPUT_TO_CONFIG_KEY];
+	if (configKey?.startsWith("observer_")) {
+		return (
+			<ObserverFieldOutcome
+				configKey={configKey}
+				controlId={controlId}
+				existingData={existingData}
+				scope={scope}
+				stage={stage}
+				timing={timing}
+			/>
+		);
+	}
 	let summary = timing;
 	if (timing === "After viewer restart") summary = "Restart required";
 	else if (timing.startsWith("After removing ")) summary = `Environment-controlled · ${timing}`;

@@ -134,7 +134,45 @@ it.each([false, true])(
 	},
 );
 
+it.each(["claude_sidecar", "codex_sidecar"])(
+	"keeps the provider editable for automatically resolved %s",
+	(runtime) => {
+		mount = document.createElement("div");
+		document.body.appendChild(mount);
+		const base = props();
+		act(() =>
+			render(
+				<ObserverPanel
+					{...base}
+					values={{ ...base.values, observerRuntime: runtime }}
+					hasExplicitObserverRuntime={false}
+					effectiveObserverRuntime={runtime}
+				/>,
+				mount as HTMLDivElement,
+			),
+		);
+		expect(mount.querySelector("#observerProvider")).not.toBeNull();
+	},
+);
 describe("ObserverPanel", () => {
+	it("keeps authentication available for an automatically detected local session", () => {
+		mount = document.createElement("div");
+		document.body.appendChild(mount);
+		const base = props();
+		act(() =>
+			render(
+				<ObserverPanel
+					{...base}
+					values={{ ...base.values, observerRuntime: "codex_sidecar" }}
+					allowAutomaticAuthChanges
+				/>,
+				mount as HTMLDivElement,
+			),
+		);
+		expect(
+			mount.querySelector("#observerAuthSource")?.closest<HTMLElement>(".settings-group")?.hidden,
+		).toBe(false);
+	});
 	it("shows the provider when authentication previews a direct API connection", () => {
 		mount = document.createElement("div");
 		document.body.appendChild(mount);
@@ -248,6 +286,7 @@ describe("ObserverPanel connection details", () => {
 		act(() => render(<ObserverPanel {...props()} />, mount as HTMLDivElement));
 
 		expect(mount.textContent).toContain("opencode, claude, codex, and pi");
+		expect(mount.querySelector(".settings-section-intro")).toBeNull();
 		expect(
 			mount.querySelector('[aria-label="About model provider"]')?.getAttribute("data-tooltip"),
 		).toMatch(/Pi setup can also derive a provider/i);

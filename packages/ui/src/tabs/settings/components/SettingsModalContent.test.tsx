@@ -88,6 +88,18 @@ function pressEnter(target: HTMLElement, modifiers: KeyboardEventInit = {}) {
 }
 
 describe("Settings form keyboard actions", () => {
+	it("keeps pending-save guidance by Save instead of repeating restart guesses", () => {
+		renderDirtySettings();
+		expect(requiredElement("#settingsStatus").textContent).toBe("Unsaved changes");
+		expect(requiredElement(".settings-save-help").textContent).toContain(
+			"If anything needs a restart, we'll tell you after saving",
+		);
+		const outcome = mount.querySelector('[data-settings-outcome-for="observerRuntime"]');
+		expect(outcome?.textContent).toContain("Existing data:");
+		expect(outcome?.textContent).not.toContain("Takes effect:");
+		expect(outcome?.textContent).not.toContain("restart");
+	});
+
 	it.each([".settings-outcome", ".settings-config-details"])(
 		"preserves native disclosure activation in dirty Settings: %s",
 		(selector) => {

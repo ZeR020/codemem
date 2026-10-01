@@ -4,6 +4,7 @@ import { diffSettingsPayload } from "../data/diff-payload";
 import { settingsState, settingsView } from "../data/state";
 import { updateFormState } from "../data/state-ops";
 import {
+	canEditAutomaticAuth,
 	effectiveObserverRuntime,
 	hasExplicitObserverRuntime,
 	settingsOutcomeFor,
@@ -39,6 +40,51 @@ it.each(["auto", " AUTO ", "Auto", "unknown"])(
 		expect(collectSettingsPayload().observer_runtime).toBe("");
 	},
 );
+
+it("allows auth-only edits for automatic sidecars but not explicit local drafts", () => {
+	renderConfigModal({
+		config: {},
+		resolved_observer_runtime: "codex_sidecar",
+		observer_runtime_by_auth_source: { auto: "codex_sidecar", command: "api_http" },
+	});
+	expect(canEditAutomaticAuth("codex_sidecar")).toBe(true);
+	settingsState.touchedKeys.add("observer_runtime");
+	expect(canEditAutomaticAuth("claude_sidecar")).toBe(false);
+	expect(canEditAutomaticAuth("codex_sidecar")).toBe(false);
+});
+
+it("keeps explicit local runtimes separate from direct credentials", () => {
+	renderConfigModal({
+		config: { observer_runtime: "codex_sidecar" },
+		resolved_observer_runtime: "codex_sidecar",
+		observer_runtime_by_auth_source: { auto: "codex_sidecar", command: "codex_sidecar" },
+	});
+	expect(canEditAutomaticAuth("codex_sidecar")).toBe(false);
+});
+
+it("allows authentication edits while switching a pinned local session to Automatic", () => {
+	renderConfigModal({
+		config: { observer_runtime: "codex_sidecar" },
+		resolved_observer_runtime: "codex_sidecar",
+		observer_runtime_by_auth_source: { auto: "codex_sidecar", command: "codex_sidecar" },
+		observer_automatic_runtime_by_auth_source: { auto: "codex_sidecar", command: "api_http" },
+	});
+	settingsState.touchedKeys.add("observer_runtime");
+	updateFormState({ observerRuntime: "" });
+	expect(canEditAutomaticAuth("")).toBe(true);
+	editAuthSource("command");
+	expect(effectiveObserverRuntime()).toBe("api_http");
+});
+
+it("exposes authentication environment guidance even when every preview stays local", () => {
+	renderConfigModal({
+		config: {},
+		resolved_observer_runtime: "codex_sidecar",
+		observer_runtime_by_auth_source: { auto: "codex_sidecar", command: "codex_sidecar" },
+		env_overrides: { observer_auth_source: "CODEMEM_OBSERVER_AUTH_SOURCE" },
+	});
+	expect(canEditAutomaticAuth("codex_sidecar")).toBe(true);
+});
 
 function editAuthSource(source: string) {
 	settingsState.touchedKeys.add("observer_auth_source");
