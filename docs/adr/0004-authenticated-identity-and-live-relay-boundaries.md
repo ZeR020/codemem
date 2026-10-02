@@ -41,10 +41,19 @@ with the Work Identity or an eligible Team.
   and email addresses never auto-link an Identity. Email is display-only, not
   an authorization credential.
 - A provider link references an actor; it has no separate Identity lifecycle
-  or merge authority (ADR 0001, Decision 1). Mapping authority, uniqueness,
-  and revocation remain implementation decisions.
-- The first provider is configurable Google OIDC using only `openid` and
-  `email` scopes. GitHub OAuth is not treated as generic OIDC automatically.
+  or merge authority (ADR 0001, Decision 1). Persistence, enforcement, and
+  revocation propagation remain implementation decisions.
+- The initial account rule is one Google account to one existing actor-backed
+  Identity per coordinator, with one account link per Identity and no
+  multiplicity flag. See the inert metadata contract in
+  [`../contracts/coordinator-auth-account-link.md`](../contracts/coordinator-auth-account-link.md).
+- The first provider is configurable Google OIDC using `openid email profile`
+  scopes. Name and picture are optional display metadata, with a fallback avatar;
+  they never prove ownership. GitHub OAuth is not treated as generic OIDC automatically.
+- Do not request Google offline access or retain Google access, refresh, or ID
+  tokens after the login ceremony. Store the verified issuer/subject link and
+  permitted display metadata, not a reusable Google credential. Profile metadata
+  may be refreshed at a later sign-in; it need not remain current between logins.
 - Use a mature, portable OIDC verifier. Do not parse JWTs or implement crypto
   by hand for coordinator auth. The existing MCP verifier is not a reference
   implementation to copy; changing that separate flow is out of scope.
@@ -92,10 +101,23 @@ explicit opt-in.
 - Sign-in belongs to an auth-enabled coordinator, not to local Codemem use.
   Existing direct sync without mandatory coordinator authentication remains
   available. No separate Codemem password registration is introduced.
+- Successful login creates a Codemem-owned account-management session, not just
+  a permanent account attestation. Sign-out ends that session; it does not remove
+  the account link, revoke enrolled devices, or stop their approved background sync.
+  Device revocation is a separate explicit action. Session access still requires
+  the existing account-link and authorization checks; login cannot claim an Identity.
+- Optional sign-in/linking implementation is approved under the reviewed ownership,
+  browser-completion, and transactional mapping safeguards below. This approval
+  does not cover production configuration or deployment, mandatory-auth activation,
+  recovery activation, or relay. Detailed protocol validation and security review
+  remain engineering gates, not substitutes for these product rules.
 - Migration starts with optional linking from an existing enrolled device.
   Preserve Teams, actor IDs, device keys, Project grants, and memory authorship;
   do not reinvite existing members. Missing or uncertain Identity links need
   explicit review, not email matching or automatic actor adoption.
+- The existing mixed Identity keeps its actor ID; do not force a personal/work
+  split or change reinvites or default sharing. A future split is explicit and
+  reviewed, never inferred from historical authorship.
   Invitation-derived actor claims are not independent account ownership proof;
   derived add-device invitations do not upgrade that proof automatically.
 - Additional devices require explicit approval from an existing trusted device,
@@ -153,7 +175,8 @@ Loopback alone does not protect against someone pasting the secret to an attacke
 or a compromised/shared local host; do not claim it does.
 
 The proposal does not decide enrollment UX, recovery evidence, or the
-account-linking protocol. No binding behavior is approved by this ADR.
+account-linking protocol. The account-link metadata contract does not approve a
+new auth architecture or any binding behavior.
 
 ## Deferred decisions and required gates
 
