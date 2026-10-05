@@ -4,7 +4,15 @@ import { join } from "node:path";
 import type { Database as SqliteDatabase } from "better-sqlite3";
 import { describe, expect, it, vi } from "vitest";
 import { BetterSqliteCoordinatorStore } from "./better-sqlite-coordinator-store.js";
-import type { CoordinatorAuthControllerReviewInput } from "./coordinator-auth-controller.js";
+import {
+	AUTH_CONTROLLER_INSERT_SQL,
+	AUTH_CONTROLLER_RETRY_ACTIVE_SQL,
+	AUTH_CONTROLLER_RETRY_ELIGIBLE_SQL,
+	authControllerInsertValues,
+	authControllerRetryActiveValues,
+	authControllerRetryEligibleValues,
+	type CoordinatorAuthControllerReviewInput,
+} from "./coordinator-auth-controller.js";
 import {
 	type Backend,
 	enroll,
@@ -446,6 +454,204 @@ function registerValidationTests(test: ReturnType<typeof it.extend<{ fixture: Fi
 	});
 }
 
+function registerSnapshotPerformanceTests(
+	test: ReturnType<typeof it.extend<{ fixture: Fixture }>>,
+) {
+	test("materializes snapshot JSON once and compares sets without correlated scans", async ({
+		fixture: { store, db },
+	}) => {
+		// Arrange: explain the insert and both live retry guards against the fixture schema.
+		await enroll(store);
+		const input = review({ verifiedSnapshot: { enrollmentIdentityId: null, invites: [] } });
+		for (const [sql, values] of [
+			[AUTH_CONTROLLER_INSERT_SQL, authControllerInsertValues(input, "now")],
+			[AUTH_CONTROLLER_RETRY_ELIGIBLE_SQL, authControllerRetryEligibleValues(input)],
+			[AUTH_CONTROLLER_RETRY_ACTIVE_SQL, authControllerRetryActiveValues(input)],
+		] as const) {
+			// Act
+			const plan = db.prepare(`EXPLAIN QUERY PLAN ${sql}`).all(...values) as {
+				detail: string;
+			}[];
+			const details = plan.map((row) => row.detail);
+			// Assert: the actual D1 retry must retain the single materialized JSON scan.
+			expect(details.filter((detail) => /SCAN j VIRTUAL TABLE/.test(detail))).toHaveLength(1);
+			expect(details).toContain("MATERIALIZE snapshot_invites");
+			expect(
+				details.includes("EXCEPT USING TEMP B-TREE") ||
+					(details.includes("MERGE (EXCEPT)") && details.includes("USE TEMP B-TREE FOR ORDER BY")),
+			).toBe(true);
+			expect(details.some((detail) => /CORRELATED/.test(detail))).toBe(false);
+		}
+	});
+	test("guards all 4096 tuples below the JSON cap, including nullable identity fields", async ({
+		fixture: { store, db },
+	}) => {
+		await enroll(store);
+		const invites = Array.from({ length: 4096 }, (_, index) => ({
+			inviteId: `i${index}`,
+			kind: "add_device" as const,
+			actorId: "identity-a",
+			assignedIdentityId: index % 2 === 0 ? null : "identity-a",
+			targetIdentityId: index % 2 === 0 ? "identity-a" : null,
+			digest: "c".repeat(64),
+		}));
+		const input = review({ verifiedSnapshot: { enrollmentIdentityId: null, invites } });
+		expect(Buffer.byteLength(JSON.stringify(input.verifiedSnapshot))).toBeLessThan(1_000_000);
+		const insert = db.prepare(`INSERT INTO coordinator_invites (
+			invite_id, group_id, token, policy, expires_at, created_at, consumed_at,
+			bound_device_id, bound_public_key, bound_fingerprint, invite_kind,
+			recipient_actor_id, assigned_identity_id, target_identity_id, reviewed_preview_digest
+		) VALUES (?, ?, ?, 'auto', '2030', 'now', 'consumed', ?, ?, ?, ?, ?, ?, ?, ?)`);
+		db.transaction(() => {
+			for (const invite of invites)
+				insert.run(
+					invite.inviteId,
+					input.groupId,
+					invite.inviteId,
+					input.deviceId,
+					input.publicKey,
+					input.fingerprint,
+					invite.kind,
+					invite.actorId,
+					invite.assignedIdentityId,
+					invite.targetIdentityId,
+					invite.digest,
+				);
+		})();
+		expect(authControllerInsertValues(input, "now")).toHaveLength(16);
+		expect(await store.createAuthControllerAttestation(input)).toMatchObject({ kind: "created" });
+		// Order is not evidence; an unchanged maximum-size retry must stay valid.
+		const reordered = {
+			...input,
+			verifiedSnapshot: { enrollmentIdentityId: null, invites: [...invites].reverse() },
+		};
+		expect(await store.createAuthControllerAttestation(reordered)).toMatchObject({
+			kind: "existing",
+		});
+		for (const sql of [
+			"UPDATE coordinator_invites SET assigned_identity_id = 'identity-a' WHERE invite_id = 'i4094'",
+			"UPDATE coordinator_invites SET target_identity_id = NULL WHERE invite_id = 'i4094'",
+		]) {
+			db.exec(sql);
+			expect(await store.createAuthControllerAttestation(input)).toEqual({
+				kind: "rejected",
+				error: "review_stale",
+			});
+			db.exec(
+				"UPDATE coordinator_invites SET assigned_identity_id = NULL, target_identity_id = 'identity-a' WHERE invite_id = 'i4094'",
+			);
+		}
+		expect(
+			db.prepare("SELECT count(*) AS count FROM coordinator_auth_controller_attestations").get(),
+		).toEqual({ count: 1 });
+	});
+}
+
+function registerSnapshotTests(test: ReturnType<typeof it.extend<{ fixture: Fixture }>>) {
+	test.for([
+		null,
+		undefined,
+		{},
+		{ enrollmentIdentityId: null, invites: null },
+		{ enrollmentIdentityId: "invalid\n", invites: [] },
+		{ enrollmentIdentityId: null, invites: new Array(4097) },
+		{ enrollmentIdentityId: null, invites: new Array(1) },
+		{ enrollmentIdentityId: null, invites: [{ inviteId: "a" }] },
+	])(
+		"rejects malformed optional snapshot %j",
+		async (verifiedSnapshot, { fixture: { store, db } }) => {
+			await enroll(store);
+			const input = { ...review(), verifiedSnapshot } as CoordinatorAuthControllerReviewInput;
+			expect(await store.createAuthControllerAttestation(input)).toEqual({
+				kind: "rejected",
+				error: "invalid_review_input",
+			});
+			expect(db.prepare("SELECT * FROM coordinator_auth_controller_attestations").all()).toEqual(
+				[],
+			);
+		},
+	);
+	test.for(["snapshot", "identity", "list", "item", "field", "inherited"] as const)(
+		"captures snapshot own data only: %s",
+		async (variant, { fixture: { store } }) => {
+			await enroll(store);
+			const getter = vi.fn(() => {
+				throw new Error("must not execute");
+			});
+			const invite = {
+				inviteId: "a",
+				kind: "team_member" as const,
+				actorId: "identity-a",
+				assignedIdentityId: "identity-a",
+				targetIdentityId: null,
+				digest: "c".repeat(64),
+			};
+			const verifiedSnapshot = { enrollmentIdentityId: null, invites: [invite] };
+			let input = review({ verifiedSnapshot });
+			if (variant === "snapshot") Object.defineProperty(input, "verifiedSnapshot", { get: getter });
+			if (variant === "identity")
+				Object.defineProperty(verifiedSnapshot, "enrollmentIdentityId", { get: getter });
+			if (variant === "list") Object.defineProperty(verifiedSnapshot, "invites", { get: getter });
+			if (variant === "item") Object.defineProperty(verifiedSnapshot.invites, "0", { get: getter });
+			if (variant === "field") Object.defineProperty(invite, "digest", { get: getter });
+			if (variant === "inherited") {
+				input = review();
+				Object.setPrototypeOf(input, { verifiedSnapshot });
+			}
+			expect(await store.createAuthControllerAttestation(input)).toEqual({
+				kind: "rejected",
+				error: "invalid_review_input",
+			});
+			expect(getter).not.toHaveBeenCalled();
+		},
+	);
+	test("rejects duplicate refs and oversized captured JSON", async ({ fixture: { store } }) => {
+		await enroll(store);
+		const invite = {
+			inviteId: "a".repeat(256),
+			kind: "team_member" as const,
+			actorId: "i".repeat(256),
+			assignedIdentityId: "i".repeat(256),
+			targetIdentityId: "i".repeat(256),
+			digest: "c".repeat(64),
+		};
+		for (const invites of [
+			[invite, invite],
+			Array.from({ length: 1500 }, (_, index) => ({
+				...invite,
+				inviteId: `${index}`.padEnd(256, "a"),
+			})),
+		]) {
+			expect(
+				await store.createAuthControllerAttestation(
+					review({ verifiedSnapshot: { enrollmentIdentityId: null, invites } }),
+				),
+			).toEqual({ kind: "rejected", error: "invalid_review_input" });
+		}
+	});
+	test("captures an empty snapshot before an asynchronous caller mutation", async ({
+		fixture: { store },
+	}) => {
+		await enroll(store);
+		const verifiedSnapshot = { enrollmentIdentityId: null, invites: [] };
+		const pending = store.createAuthControllerAttestation(review({ verifiedSnapshot }));
+		Object.assign(verifiedSnapshot, { enrollmentIdentityId: "changed", invites: null });
+		expect(await pending).toMatchObject({ kind: "created" });
+	});
+	test("empty guarded snapshot rejects a changed enrollment Identity", async ({
+		fixture: { store, db },
+	}) => {
+		await enroll(store);
+		setIdentity(db, "identity-a");
+		expect(
+			await store.createAuthControllerAttestation(
+				review({ verifiedSnapshot: { enrollmentIdentityId: null, invites: [] } }),
+			),
+		).toEqual({ kind: "rejected", error: "review_stale" });
+		expect(db.prepare("SELECT * FROM coordinator_auth_controller_attestations").all()).toEqual([]);
+	});
+}
+
 function registerFailureTests(test: ReturnType<typeof it.extend<{ fixture: Fixture }>>) {
 	test("rejects an accessor even when Object.prototype supplies its expected value", async ({
 		fixture: { store, db },
@@ -522,6 +728,38 @@ function registerFailureTests(test: ReturnType<typeof it.extend<{ fixture: Fixtu
 }
 
 function registerD1ReadRaceTests(test: ReturnType<typeof it.extend<{ fixture: Fixture }>>) {
+	test("rejects an exact D1 retry revoked immediately before its final guarded read", async ({
+		fixture: { store, db },
+	}) => {
+		// Arrange: intercept SQL, not the early active helper removed by the fix.
+		await enroll(store);
+		const input = review({ verifiedSnapshot: { enrollmentIdentityId: null, invites: [] } });
+		expect((await store.createAuthControllerAttestation(input)).kind).toBe("created");
+		let revocation: Promise<boolean> | undefined;
+		const beforeRead = vi.fn((query: string) => {
+			if (!/^\s*WITH snapshot\b/u.test(query) || !/SELECT (?:1 AS eligible|a\.\*)/u.test(query))
+				return;
+			if (!revocation)
+				revocation = store.revokeAuthControllerAttestation(
+					input.coordinatorId,
+					input.attestationId,
+				);
+		});
+		const racing = new D1CoordinatorStore(sqliteD1(db, { beforeRead }));
+		// Act: revocation lands after the conflict read and before final eligibility.
+		const retry = await racing.createAuthControllerAttestation(input);
+		// Assert: an unchanged snapshot cannot approve cached, revoked authority.
+		expect(revocation).toBeDefined();
+		expect(await revocation).toBe(true);
+		expect(retry).toMatchObject({ kind: "rejected" });
+		expect(
+			await store.getActiveAuthControllerAttestation(input.coordinatorId, input.attestationId),
+		).toBeNull();
+		expect(
+			db.prepare("SELECT count(*) AS count FROM coordinator_auth_controller_attestations").get(),
+		).toEqual({ count: 1 });
+	});
+
 	test("recovers a persisted review by exact retry after the D1 post-insert read fails", async ({
 		fixture: { store, db },
 	}) => {
@@ -816,6 +1054,8 @@ describe.each(["SQLite", "D1"] as const)("%s auth-controller store parity", (bac
 	registerLiveTests(test);
 	registerValidationTests(test);
 	registerFailureTests(test);
+	registerSnapshotTests(test);
+	registerSnapshotPerformanceTests(test);
 	registerPersistenceTests(test, backend);
 	registerBindingTests(test);
 	if (backend === "D1") registerD1ReadRaceTests(test);

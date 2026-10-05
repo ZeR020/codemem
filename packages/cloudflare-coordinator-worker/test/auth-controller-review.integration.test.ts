@@ -2,6 +2,7 @@ import { env } from "cloudflare:workers";
 import { generateKeyPairSync, randomUUID, sign } from "node:crypto";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { createCoordinatorApp } from "../../core/src/coordinator-api.js";
+import { AUTH_CONTROLLER_RETRY_ACTIVE_SQL, authControllerRetryActiveValues } from "../../core/src/coordinator-auth-controller.js";
 import { D1CoordinatorStore } from "../../core/src/d1-coordinator-store.js";
 import { buildCanonicalRequest, SIGNATURE_VERSION } from "../../core/src/sync-auth.js";
 import { fingerprintPublicKey } from "../../core/src/sync-fingerprint.js";
@@ -23,11 +24,12 @@ afterEach(async () => {
 			...["link_audit_log", "link_attempts", "controller_attestations"].map((table) => env.COORDINATOR_DB.prepare(`DELETE FROM coordinator_auth_${table} WHERE coordinator_id = ?`).bind(f.config.coordinatorId)),
 			env.COORDINATOR_DB.prepare("DELETE FROM request_nonces WHERE device_id = ?").bind(f.deviceId),
 			env.COORDINATOR_DB.prepare("DELETE FROM enrolled_devices WHERE group_id = ?").bind(f.input.group_id),
+			env.COORDINATOR_DB.prepare("DELETE FROM coordinator_invites WHERE group_id = ?").bind(f.input.group_id),
 			env.COORDINATOR_DB.prepare("DELETE FROM groups WHERE group_id = ?").bind(f.input.group_id),
 		]);
 	}
 });
-async function setup() {
+async function setup(database = env.COORDINATOR_DB) {
 	const { publicKey: pub, privateKey } = generateKeyPairSync("ed25519");
 	const raw = Buffer.from(pub.export({ type: "spki", format: "der" })).subarray(-32);
 	const kind = Buffer.from("ssh-ed25519");
@@ -38,7 +40,7 @@ async function setup() {
 	const deviceId = randomUUID();
 	const config = { enabled: true, coordinatorId: randomUUID(), issuer: "https://accounts.example.test", revision: "a".repeat(64), redirectUri: "https://coordinator.example.test/auth/callback" };
 	const input = { group_id: randomUUID(), device_id: deviceId, identity_id: randomUUID(), fingerprint: fingerprintPublicKey(publicKey) };
-	const store = new D1CoordinatorStore(env.COORDINATOR_DB, { authClock: () => NOW });
+	const store = new D1CoordinatorStore(database, { authClock: () => NOW });
 	await store.createGroup(input.group_id);
 	await store.enrollDevice(input.group_id, { deviceId, publicKey, fingerprint: input.fingerprint });
 	const app = createCoordinatorApp({ storeFactory: () => store, requestVerifier: verifyCloudflareCoordinatorRequest, runtime: { adminSecret: () => secret, now: () => new Date(NOW).toISOString() }, authLink: { config, storeFactory: () => store } });
@@ -86,4 +88,155 @@ it("real operator preview/commit replaces seeded authority and unlocks a signed 
 	expect(await f.store.getEnrollment(f.input.group_id, f.deviceId)).toEqual(enrollment);
 	const text = JSON.stringify(preview);
 	for (const hidden of [secret, f.publicKey, "public_key", "subject", "email", "token"]) expect(text).not.toContain(hidden);
+});
+
+async function seedReviewedInvite(f: Fixture) {
+	const invite = await f.store.createInvite({ groupId: f.input.group_id, policy: "auto", expiresAt: "2030-01-01T00:00:00Z" });
+	await env.COORDINATOR_DB.prepare("UPDATE coordinator_invites SET invite_kind = 'add_device', consumed_at = 'consumed', bound_device_id = ?, bound_public_key = ?, bound_fingerprint = ?, recipient_actor_id = ?, target_identity_id = ?, reviewed_preview_digest = ? WHERE invite_id = ?")
+		.bind(f.deviceId, f.publicKey, f.input.fingerprint, f.input.identity_id, f.input.identity_id, "c".repeat(64), invite.invite_id).run();
+	return invite.invite_id;
+}
+it.each([
+	"DELETE FROM coordinator_invites WHERE invite_id = ?",
+	"UPDATE coordinator_invites SET revoked_at = 'revoked' WHERE invite_id = ?",
+	"UPDATE coordinator_invites SET recipient_actor_id = 'changed' WHERE invite_id = ?",
+	"UPDATE coordinator_invites SET assigned_identity_id = 'changed' WHERE invite_id = ?",
+	"UPDATE coordinator_invites SET target_identity_id = 'changed' WHERE invite_id = ?",
+	"UPDATE coordinator_invites SET reviewed_preview_digest = 'changed' WHERE invite_id = ?",
+	"UPDATE coordinator_invites SET bound_public_key = 'changed' WHERE invite_id = ?",
+])("native D1 rejects evidence mutation after listInvites: %s", async (sql) => {
+	const f = await setup();
+	const inviteId = await seedReviewedInvite(f);
+	const initial = await (await review(f)).json<{ evidence_digest: string }>();
+	const list = f.store.listInvites.bind(f.store);
+	vi.spyOn(f.store, "listInvites").mockImplementation(async (group) => {
+		const result = await list(group);
+		await env.COORDINATOR_DB.prepare(sql).bind(inviteId).run();
+		return result;
+	});
+	const response = await review(f, initial.evidence_digest);
+	expect(response.status).toBe(409);
+	expect(await response.json()).toEqual({ error: "review_stale" });
+	expect(await rows(f)).toEqual([]);
+});
+it.each([false, true])("native D1 rejects a new invite after an empty snapshot, replay=%s", async (replay) => {
+	const f = await setup();
+	const initial = await (await review(f)).json<{ evidence_digest: string }>();
+	if (replay) expect((await review(f, initial.evidence_digest)).status).toBe(201);
+	const before = await rows(f);
+	const create = f.store.createAuthControllerAttestation.bind(f.store);
+	vi.spyOn(f.store, "createAuthControllerAttestation").mockImplementation(async (input) => {
+		await seedReviewedInvite(f);
+		return create(input);
+	});
+	const response = await review(f, initial.evidence_digest);
+	expect(response.status).toBe(409);
+	expect(await response.json()).toEqual({ error: "review_stale" });
+	expect(await rows(f)).toEqual(before);
+});
+it.each([false, true])("native D1 rejects null-to-matching enrollment Identity after listInvites, replay=%s", async (replay) => {
+	const f = await setup();
+	await seedReviewedInvite(f);
+	const initial = await (await review(f)).json<{ evidence_digest: string }>();
+	if (replay) expect((await review(f, initial.evidence_digest)).status).toBe(201);
+	const before = await rows(f);
+	const list = f.store.listInvites.bind(f.store);
+	vi.spyOn(f.store, "listInvites").mockImplementation(async (group) => {
+		const invites = await list(group);
+		await env.COORDINATOR_DB.prepare("UPDATE enrolled_devices SET identity_id = ? WHERE group_id = ? AND device_id = ?")
+			.bind(f.input.identity_id, f.input.group_id, f.deviceId).run();
+		return invites;
+	});
+	const response = await review(f, initial.evidence_digest);
+	expect(response.status).toBe(409);
+	expect(await response.json()).toEqual({ error: "review_stale" });
+	expect(await rows(f)).toEqual(before);
+});
+it.each(["invite", "attestation"] as const)("native D1 retry rejects %s revoked before its final guarded read", async (target) => {
+	// Arrange: wrap native prepared statements while preserving bind cloning.
+	let beforeRead: (() => Promise<void>) | undefined;
+	const wrap = (statement: D1PreparedStatement, query: string): D1PreparedStatement => new Proxy(statement, {
+		get(statement, property) {
+			if (property === "bind") return (...values: unknown[]) => wrap(statement.bind(...values), query);
+			if (property === "first") return async (...args: Parameters<D1PreparedStatement["first"]>) => {
+				if (/^\s*WITH snapshot\b/u.test(query) && /SELECT (?:1 AS eligible|a\.\*)/u.test(query)) await beforeRead?.();
+				return statement.first(...args);
+			};
+			const value = Reflect.get(statement, property);
+			return typeof value === "function" ? value.bind(statement) : value;
+		},
+	});
+	const database = new Proxy(env.COORDINATOR_DB, {
+		get(database, property) {
+			if (property === "prepare") return (query: string) => wrap(database.prepare(query), query);
+			const value = Reflect.get(database, property);
+			return typeof value === "function" ? value.bind(database) : value;
+		},
+	});
+	const f = await setup(database);
+	const inviteId = await seedReviewedInvite(f);
+	const initial = await (await review(f)).json<{ evidence_digest: string }>();
+	expect((await review(f, initial.evidence_digest)).status).toBe(201);
+	const before = await rows(f);
+	const attestationId = before[0].attestation_id as string;
+	const revoke = vi.fn(async () => {
+		beforeRead = undefined;
+		if (target === "attestation") {
+			expect(await f.store.revokeAuthControllerAttestation(f.config.coordinatorId, attestationId)).toBe(true);
+			return;
+		}
+		await env.COORDINATOR_DB.prepare("UPDATE coordinator_invites SET revoked_at = 'revoked' WHERE invite_id = ?").bind(inviteId).run();
+	});
+	beforeRead = revoke;
+	// Act: replay the same operator confirmation against changed live authority.
+	const response = await review(f, initial.evidence_digest);
+	// Assert: native SQL must execute after revocation, never return stale success.
+	expect(revoke).toHaveBeenCalledTimes(1);
+	expect(response.status).toBe(409);
+	expect(await response.json()).toEqual({ error: "review_stale" });
+	if (target === "invite") {
+		expect(await rows(f)).toEqual(before);
+	} else {
+		expect(await f.store.getActiveAuthControllerAttestation(f.config.coordinatorId, attestationId)).toBeNull();
+		expect(await rows(f)).toHaveLength(1);
+	}
+});
+it("native D1 guards all 201 invitations with fixed SQL binds and a limited response sample", async () => {
+	const f = await setup();
+	const ids: string[] = [];
+	for (let index = 0; index < 201; index++) ids.push(await seedReviewedInvite(f));
+	const response = await review(f);
+	const wire = await response.text();
+	const initial = JSON.parse(wire);
+	expect(new TextEncoder().encode(wire).byteLength).toBeLessThan(16384);
+	expect(initial.reviewed_invite_count).toBe(201);
+	expect(initial.reviewed_invites).toHaveLength(10);
+	const hiddenId = ids.find((id) => !initial.reviewed_invites.some((ref: { invite_id: string }) => ref.invite_id === id));
+	const create = f.store.createAuthControllerAttestation.bind(f.store);
+	const spy = vi.spyOn(f.store, "createAuthControllerAttestation").mockImplementation(async (input) => {
+		await env.COORDINATOR_DB.prepare("UPDATE coordinator_invites SET reviewed_preview_digest = ? WHERE invite_id = ?").bind("d".repeat(64), hiddenId).run();
+		return create(input);
+	});
+	const stale = await review(f, initial.evidence_digest);
+	expect(stale.status).toBe(409);
+	expect(await stale.json()).toEqual({ error: "review_stale" });
+	expect(await rows(f)).toEqual([]);
+	spy.mockRestore();
+	const fresh = await (await review(f)).json<{ evidence_digest: string }>();
+	// Arrange: measure the active retry only after a real confirmation stores its derived ID.
+	expect((await review(f, fresh.evidence_digest)).status).toBe(201);
+	const stored = await rows(f);
+	expect(stored).toHaveLength(1);
+	vi.spyOn(f.store, "createAuthControllerAttestation").mockImplementation(async (input) => {
+		// Act: use the actual reviewed snapshot and persisted attestation ID.
+		const active = await env.COORDINATOR_DB.prepare(AUTH_CONTROLLER_RETRY_ACTIVE_SQL)
+			.bind(...authControllerRetryActiveValues({ ...input, attestationId: stored[0].attestation_id as string })).all();
+		// Assert: the native guard returns the stored row within a linear scan budget.
+		expect(active.results).toEqual(stored);
+		// A generous linear scan budget, not a machine-dependent timing limit.
+		expect(active.meta.rows_read).toBeGreaterThan(0);
+		expect(active.meta.rows_read).toBeLessThan(201 * 20 + 100);
+		return create(input);
+	});
+	expect((await review(f, fresh.evidence_digest)).status).toBe(200);
 });
