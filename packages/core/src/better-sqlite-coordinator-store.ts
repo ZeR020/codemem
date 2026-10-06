@@ -16,6 +16,70 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import type { Database as DatabaseType } from "better-sqlite3";
 import Database from "better-sqlite3";
+import {
+	AUTH_ACCOUNT_PROFILE_SCHEMA_SQL,
+	AuthAccountProfileOperations,
+	type CoordinatorAuthAccountProfileInput,
+} from "./coordinator-auth-account-profile.js";
+import {
+	AUTH_BROWSER_TXN_SCHEMA_SQL,
+	type CoordinatorAuthBrowserConfig,
+	type CoordinatorAuthBrowserTransactionConsumeInput,
+	type CoordinatorAuthBrowserTransactionMaintenanceOptions,
+	type CoordinatorAuthBrowserTransactionRetirementOptions,
+	type CoordinatorAuthBrowserTransactionScope,
+	type CoordinatorAuthBrowserTransactionStartInput,
+	CoordinatorAuthBrowserTransactions,
+	type CoordinatorAuthLinkBrowserTransactionResolveInput,
+	type CoordinatorAuthSigninBrowserTransactionCancelInput,
+} from "./coordinator-auth-browser-transaction.js";
+import {
+	AUTH_CONTROLLER_ACTIVE_SQL,
+	AUTH_CONTROLLER_CONFLICT_SQL,
+	AUTH_CONTROLLER_INSERT_SQL,
+	AUTH_CONTROLLER_RETRY_ELIGIBLE_SQL,
+	AUTH_CONTROLLER_REVOKE_SQL,
+	AUTH_CONTROLLER_SCHEMA_SQL,
+	authControllerConflictValues,
+	authControllerInsertValues,
+	authControllerRetryEligibleValues,
+	authControllerRetryResult,
+	type CoordinatorAuthControllerAttestation,
+	type CoordinatorAuthControllerCreateResult,
+	type CoordinatorAuthControllerReviewInput,
+	captureAuthControllerReview,
+	isAuthControllerId,
+	isAuthControllerUniqueError,
+} from "./coordinator-auth-controller.js";
+import {
+	type AuthLinkBackend,
+	AuthLinkOperations,
+	type AuthLinkStatement,
+} from "./coordinator-auth-link.js";
+import {
+	AUTH_LINK_BROWSER_START_COLUMN_SQL,
+	AUTH_LINK_SCHEMA_SQL,
+	type CoordinatorAuthLinkClaimInput,
+	type CoordinatorAuthLinkConfig,
+	type CoordinatorAuthLinkConfirmInput,
+	type CoordinatorAuthLinkCreateInput,
+	type CoordinatorAuthLinkFailInput,
+	type CoordinatorAuthLinkFinalizeInput,
+	type CoordinatorAuthLinkMaintenanceOptions,
+	type CoordinatorAuthLinkOidcInput,
+	type CoordinatorAuthLinkOptions,
+	type CoordinatorAuthLinkRequester,
+} from "./coordinator-auth-link-contract.js";
+import { AuthSessionOperations } from "./coordinator-auth-session.js";
+import {
+	AUTH_SESSION_RETENTION_COLUMN_SQL,
+	AUTH_SESSION_SCHEMA_SQL,
+	type CoordinatorAuthAccountSignInInput,
+	type CoordinatorAuthBoundLinkSessionRedeemInput,
+	type CoordinatorAuthLinkSessionRedeemInput,
+	type CoordinatorAuthSessionPurgeOptions,
+	type CoordinatorAuthSessionScope,
+} from "./coordinator-auth-session-contract.js";
 import type {
 	CoordinatorLegacyTeamCompletionManifestV1,
 	CoordinatorLegacyTeamCompletionRecord,
@@ -290,7 +354,51 @@ function insertBootstrapGrantSync(
 	return rowToRecord<CoordinatorBootstrapGrant>(row);
 }
 
+function upgradeAuthSessionRetentionSchema(db: DatabaseType): void {
+	const present = db
+		.prepare(
+			"SELECT 1 FROM pragma_table_info('coordinator_auth_session_receipts') WHERE name = 'purge_eligible'",
+		)
+		.get();
+	if (present) return;
+	db.transaction(() => {
+		const columns = db.prepare("PRAGMA table_info(coordinator_auth_session_receipts)").all() as {
+			name: string;
+		}[];
+		if (columns.length === 0 || columns.some((column) => column.name === "purge_eligible")) return;
+		db.exec(
+			`ALTER TABLE coordinator_auth_session_receipts ADD COLUMN ${AUTH_SESSION_RETENTION_COLUMN_SQL}`,
+		);
+	}).immediate();
+}
+
+function upgradeAuthLinkBrowserStartSchema(db: DatabaseType): void {
+	const present = db
+		.prepare(
+			"SELECT 1 FROM pragma_table_info('coordinator_auth_link_attempts') WHERE name = 'browser_start_hash'",
+		)
+		.get();
+	if (present) return;
+	db.transaction(() => {
+		const columns = db.prepare("PRAGMA table_info(coordinator_auth_link_attempts)").all() as {
+			name: string;
+		}[];
+		if (columns.length === 0 || columns.some((column) => column.name === "browser_start_hash"))
+			return;
+		db.exec(
+			`ALTER TABLE coordinator_auth_link_attempts ADD COLUMN ${AUTH_LINK_BROWSER_START_COLUMN_SQL}`,
+		);
+	}).immediate();
+}
+
 function initializeSchema(db: DatabaseType): void {
+	db.exec(AUTH_CONTROLLER_SCHEMA_SQL);
+	upgradeAuthLinkBrowserStartSchema(db);
+	db.exec(AUTH_LINK_SCHEMA_SQL);
+	upgradeAuthSessionRetentionSchema(db);
+	db.exec(AUTH_SESSION_SCHEMA_SQL);
+	db.exec(AUTH_ACCOUNT_PROFILE_SCHEMA_SQL);
+	db.exec(AUTH_BROWSER_TXN_SCHEMA_SQL);
 	db.exec(`
 		CREATE TABLE IF NOT EXISTS groups (
 			group_id TEXT PRIMARY KEY,
@@ -580,10 +688,203 @@ export function connectCoordinator(path?: string): DatabaseType {
 export class BetterSqliteCoordinatorStore implements CoordinatorStore {
 	readonly path: string;
 	readonly db: DatabaseType;
+	private readonly authLinks: AuthLinkOperations;
+	private readonly authSessions: AuthSessionOperations;
+	private readonly authAccountProfiles: AuthAccountProfileOperations;
+	private readonly authBrowserTransactions: CoordinatorAuthBrowserTransactions;
 
-	constructor(path?: string) {
+	constructor(path?: string, options: CoordinatorAuthLinkOptions = {}) {
 		this.path = path ?? DEFAULT_COORDINATOR_DB_PATH;
 		this.db = connectCoordinator(this.path);
+		const authBackend: AuthLinkBackend = {
+			first: async <T>(statement: AuthLinkStatement) =>
+				(this.db.prepare(statement.sql).get(...statement.values) as T | undefined) ?? null,
+			run: async (statement) =>
+				this.db
+					.transaction(() => this.db.prepare(statement.sql).run(...statement.values).changes)
+					.immediate(),
+			batch: async (statements) => {
+				this.db
+					.transaction(() => {
+						for (const statement of statements)
+							this.db.prepare(statement.sql).run(...statement.values);
+					})
+					.immediate();
+			},
+		};
+		this.authLinks = new AuthLinkOperations(authBackend, options.authClock);
+		this.authSessions = new AuthSessionOperations(authBackend, options.authClock);
+		this.authAccountProfiles = new AuthAccountProfileOperations(authBackend, options.authClock);
+		this.authBrowserTransactions = new CoordinatorAuthBrowserTransactions(
+			authBackend,
+			options.authClock,
+		);
+	}
+
+	async startAuthBrowserTransaction(
+		input: CoordinatorAuthBrowserTransactionStartInput,
+		config: CoordinatorAuthBrowserConfig,
+	) {
+		return this.authBrowserTransactions.startAuthBrowserTransaction(input, config);
+	}
+	async consumeAuthBrowserTransaction(
+		input: CoordinatorAuthBrowserTransactionConsumeInput,
+		config: CoordinatorAuthBrowserConfig,
+	) {
+		return this.authBrowserTransactions.consumeAuthBrowserTransaction(input, config);
+	}
+	async resolveAuthLinkBrowserTransaction(
+		input: CoordinatorAuthLinkBrowserTransactionResolveInput,
+		config: CoordinatorAuthBrowserConfig,
+	) {
+		return this.authBrowserTransactions.resolveAuthLinkBrowserTransaction(input, config);
+	}
+	async cancelAuthSigninBrowserTransaction(
+		input: CoordinatorAuthSigninBrowserTransactionCancelInput,
+		scope: CoordinatorAuthBrowserTransactionScope,
+	) {
+		return this.authBrowserTransactions.cancelAuthSigninBrowserTransaction(input, scope);
+	}
+	async retireAuthBrowserTransactions(
+		config: CoordinatorAuthBrowserConfig,
+		options?: CoordinatorAuthBrowserTransactionRetirementOptions,
+	) {
+		return this.authBrowserTransactions.retireAuthBrowserTransactions(config, options);
+	}
+	async purgeAuthSigninBrowserTransactions(
+		scope: CoordinatorAuthBrowserTransactionScope,
+		options?: CoordinatorAuthBrowserTransactionMaintenanceOptions,
+	) {
+		return this.authBrowserTransactions.purgeAuthSigninBrowserTransactions(scope, options);
+	}
+	async maintainAuthBrowserTransactions(
+		scope: CoordinatorAuthBrowserTransactionScope,
+		options?: CoordinatorAuthBrowserTransactionMaintenanceOptions,
+	) {
+		return this.authBrowserTransactions.maintainAuthBrowserTransactions(scope, options);
+	}
+
+	async redeemAuthLinkSession(
+		input: CoordinatorAuthLinkSessionRedeemInput,
+		config: CoordinatorAuthLinkConfig,
+	) {
+		return this.authSessions.redeemAuthLinkSession(input, config);
+	}
+	async redeemAuthLinkSessionWithBrowserTransaction(
+		input: CoordinatorAuthBoundLinkSessionRedeemInput,
+		config: CoordinatorAuthBrowserConfig,
+	) {
+		return this.authSessions.redeemAuthLinkSessionWithBrowserTransaction(input, config);
+	}
+	async preserveAuthLinkSessionCompletion(
+		input: CoordinatorAuthBoundLinkSessionRedeemInput,
+		config: CoordinatorAuthBrowserConfig,
+	) {
+		return this.authSessions.preserveAuthLinkSessionCompletion(input, config);
+	}
+	async purgeAuthGuardedSigninSessions(
+		scope: CoordinatorAuthSessionScope,
+		options?: CoordinatorAuthSessionPurgeOptions,
+	) {
+		return this.authSessions.purgeAuthGuardedSigninSessions(scope, options);
+	}
+	async purgeAuthGuardedSigninReceipts(
+		scope: CoordinatorAuthSessionScope,
+		options?: CoordinatorAuthSessionPurgeOptions,
+	) {
+		return this.authSessions.purgeAuthGuardedSigninReceipts(scope, options);
+	}
+	async signInWithAuthAccount(
+		input: CoordinatorAuthAccountSignInInput,
+		config: CoordinatorAuthLinkConfig,
+	) {
+		return this.authSessions.signInWithAuthAccount(input, config);
+	}
+	async signInWithConsumedBrowserTransaction(
+		input: CoordinatorAuthAccountSignInInput,
+		config: CoordinatorAuthBrowserConfig,
+	) {
+		return this.authSessions.signInWithConsumedBrowserTransaction(input, config);
+	}
+	async readAuthSession(credentialHash: string, config: CoordinatorAuthLinkConfig) {
+		return this.authSessions.readAuthSession(credentialHash, config);
+	}
+	async recordAuthAccountProfile(
+		input: CoordinatorAuthAccountProfileInput,
+		config: CoordinatorAuthLinkConfig,
+	) {
+		return this.authAccountProfiles.recordAuthAccountProfile(input, config);
+	}
+	async readAuthSessionAccount(credentialHash: string, config: CoordinatorAuthLinkConfig) {
+		return this.authAccountProfiles.readAuthSessionAccount(credentialHash, config);
+	}
+	async clearRevokedAuthAccountProfile(
+		input: { linkId: string },
+		scope: { coordinatorId: string },
+	) {
+		return this.authAccountProfiles.clearRevokedAuthAccountProfile(input, scope);
+	}
+	async signOutAuthSession(credentialHash: string, scope: CoordinatorAuthSessionScope) {
+		return this.authSessions.signOutAuthSession(credentialHash, scope);
+	}
+	async revokeAuthAccountLink(input: { linkId: string }, scope: CoordinatorAuthSessionScope) {
+		return this.authSessions.revokeAuthAccountLink(input, scope);
+	}
+
+	async maintainAuthLinkAttempts(
+		config: CoordinatorAuthLinkConfig,
+		options?: CoordinatorAuthLinkMaintenanceOptions,
+	) {
+		return this.authLinks.maintainAuthLinkAttempts(config, options);
+	}
+	async createAuthLinkAttempt(
+		input: CoordinatorAuthLinkCreateInput,
+		config: CoordinatorAuthLinkConfig,
+	) {
+		return this.authLinks.createAuthLinkAttempt(input, config);
+	}
+	async claimAuthLinkAttempt(
+		input: CoordinatorAuthLinkClaimInput,
+		config: CoordinatorAuthLinkConfig,
+	) {
+		return this.authLinks.claimAuthLinkAttempt(input, config);
+	}
+	async recordAuthLinkOidcVerified(
+		input: CoordinatorAuthLinkOidcInput,
+		config: CoordinatorAuthLinkConfig,
+	) {
+		return this.authLinks.recordAuthLinkOidcVerified(input, config);
+	}
+	async confirmAuthLinkAttempt(
+		input: CoordinatorAuthLinkConfirmInput,
+		config: CoordinatorAuthLinkConfig,
+	) {
+		return this.authLinks.confirmAuthLinkAttempt(input, config);
+	}
+	async readAuthLinkCompletionDestination(
+		input: CoordinatorAuthLinkClaimInput,
+		config: CoordinatorAuthLinkConfig,
+	) {
+		return this.authLinks.readAuthLinkCompletionDestination(input, config);
+	}
+	async finalizeAuthLinkAttempt(
+		input: CoordinatorAuthLinkFinalizeInput,
+		config: CoordinatorAuthLinkConfig,
+	) {
+		return this.authLinks.finalizeAuthLinkAttempt(input, config);
+	}
+	async failAuthLinkAttempt(
+		input: CoordinatorAuthLinkFailInput,
+		config: CoordinatorAuthLinkConfig,
+	) {
+		return this.authLinks.failAuthLinkAttempt(input, config);
+	}
+	async getAuthLinkAttemptStatus(
+		attemptId: string,
+		requester: CoordinatorAuthLinkRequester,
+		config: CoordinatorAuthLinkConfig,
+	) {
+		return this.authLinks.getAuthLinkAttemptStatus(attemptId, requester, config);
 	}
 
 	private enrollDeviceSync(groupId: string, opts: CoordinatorEnrollDeviceInput): void {
@@ -614,6 +915,93 @@ export class BetterSqliteCoordinatorStore implements CoordinatorStore {
 
 	async close(): Promise<void> {
 		this.db.close();
+	}
+
+	async createAuthControllerAttestation(
+		input: CoordinatorAuthControllerReviewInput,
+	): Promise<CoordinatorAuthControllerCreateResult> {
+		const review = captureAuthControllerReview(input);
+		if (!review) return { kind: "rejected", error: "invalid_review_input" };
+		return this.db
+			.transaction((): CoordinatorAuthControllerCreateResult => {
+				try {
+					const inserted = this.db
+						.prepare(AUTH_CONTROLLER_INSERT_SQL)
+						.run(...authControllerInsertValues(review, nowISO()));
+					if (inserted.changes === 0)
+						return {
+							kind: "rejected",
+							error: review.verifiedSnapshot ? "review_stale" : "enrollment_mismatch",
+						};
+				} catch (error) {
+					if (!isAuthControllerUniqueError(error)) throw error;
+					return this.resolveAuthControllerRetrySync(review);
+				}
+				const attestation = this.getActiveAuthControllerAttestationSync(
+					review.coordinatorId,
+					review.attestationId,
+				);
+				if (!attestation) throw new Error("auth_controller_persistence_incomplete");
+				return { kind: "created", attestation };
+			})
+			.immediate();
+	}
+
+	private resolveAuthControllerRetrySync(
+		input: CoordinatorAuthControllerReviewInput,
+	): CoordinatorAuthControllerCreateResult {
+		if (
+			!this.db
+				.prepare(AUTH_CONTROLLER_RETRY_ELIGIBLE_SQL)
+				.get(...authControllerRetryEligibleValues(input))
+		)
+			return {
+				kind: "rejected",
+				error: input.verifiedSnapshot ? "review_stale" : "enrollment_mismatch",
+			};
+		const row = this.db
+			.prepare(AUTH_CONTROLLER_CONFLICT_SQL)
+			.get(...authControllerConflictValues(input)) as
+			| CoordinatorAuthControllerAttestation
+			| undefined;
+		const result = authControllerRetryResult(input, row ?? null);
+		if (result.kind === "rejected") return result;
+		const active = this.getActiveAuthControllerAttestationSync(
+			input.coordinatorId,
+			input.attestationId,
+		);
+		if (!active) return { kind: "rejected", error: "enrollment_mismatch" };
+		return { kind: "existing", attestation: active };
+	}
+
+	private getActiveAuthControllerAttestationSync(
+		coordinatorId: string,
+		attestationId: string,
+	): CoordinatorAuthControllerAttestation | null {
+		return (
+			(this.db.prepare(AUTH_CONTROLLER_ACTIVE_SQL).get(coordinatorId, attestationId) as
+				| CoordinatorAuthControllerAttestation
+				| undefined) ?? null
+		);
+	}
+
+	async getActiveAuthControllerAttestation(
+		coordinatorId: string,
+		attestationId: string,
+	): Promise<CoordinatorAuthControllerAttestation | null> {
+		if (!isAuthControllerId(coordinatorId) || !isAuthControllerId(attestationId)) return null;
+		return this.getActiveAuthControllerAttestationSync(coordinatorId, attestationId);
+	}
+
+	async revokeAuthControllerAttestation(
+		coordinatorId: string,
+		attestationId: string,
+	): Promise<boolean> {
+		if (!isAuthControllerId(coordinatorId) || !isAuthControllerId(attestationId)) return false;
+		return (
+			this.db.prepare(AUTH_CONTROLLER_REVOKE_SQL).run(nowISO(), coordinatorId, attestationId)
+				.changes > 0
+		);
 	}
 
 	async createGroup(groupId: string, displayName?: string | null): Promise<void> {

@@ -232,3 +232,191 @@ CREATE TABLE IF NOT EXISTS coordinator_legacy_team_completions (
 
 CREATE INDEX IF NOT EXISTS idx_coordinator_legacy_team_completions_group
 ON coordinator_legacy_team_completions(group_id, completed_at, candidate_ref);
+
+-- Empty by design: enrollment labels do not constitute admin-reviewed authority.
+-- No foreign keys: retain revoked proofs even after enrollment removal.
+CREATE TABLE IF NOT EXISTS coordinator_auth_controller_attestations (
+	attestation_id TEXT NOT NULL,
+	coordinator_id TEXT NOT NULL,
+	identity_id TEXT NOT NULL,
+	group_id TEXT NOT NULL,
+	device_id TEXT NOT NULL,
+	public_key TEXT NOT NULL,
+	fingerprint TEXT NOT NULL CHECK (length(fingerprint) = 64 AND fingerprint NOT GLOB '*[^0-9a-f]*'),
+	review_receipt_id TEXT NOT NULL,
+	evidence_digest TEXT NOT NULL CHECK (length(evidence_digest) = 64 AND evidence_digest NOT GLOB '*[^0-9a-f]*'),
+	enrollment_identity_id TEXT,
+	revision INTEGER NOT NULL DEFAULT 1 CHECK (revision = 1),
+	created_at TEXT NOT NULL,
+	revoked_at TEXT,
+	PRIMARY KEY (coordinator_id, attestation_id),
+	UNIQUE (coordinator_id, group_id, device_id, fingerprint),
+	UNIQUE (coordinator_id, review_receipt_id)
+);
+
+CREATE TABLE IF NOT EXISTS coordinator_auth_link_attempts (
+ coordinator_id TEXT NOT NULL,
+ attempt_id TEXT NOT NULL,
+ identity_id TEXT NOT NULL,
+ group_id TEXT NOT NULL,
+ device_id TEXT NOT NULL,
+ public_key TEXT NOT NULL,
+ fingerprint TEXT NOT NULL CHECK (length(fingerprint) = 64 AND fingerprint NOT GLOB '*[^0-9a-f]*'),
+ controller_attestation_id TEXT NOT NULL,
+ controller_review_receipt_id TEXT NOT NULL,
+ controller_revision INTEGER NOT NULL CHECK (controller_revision = 1),
+ issuer TEXT NOT NULL,
+ auth_config_revision TEXT NOT NULL CHECK (length(auth_config_revision) = 64 AND auth_config_revision NOT GLOB '*[^0-9a-f]*'),
+ runtime_verifier_hash TEXT NOT NULL CHECK (length(runtime_verifier_hash) = 64 AND runtime_verifier_hash NOT GLOB '*[^0-9a-f]*'),
+ loopback_redirect TEXT NOT NULL,
+ state TEXT NOT NULL CHECK (state IN ('pending','browser_claimed','oidc_verified','confirmed','finalized','session_redeemed','expired','failed')),
+ browser_transaction_hash TEXT CHECK (browser_transaction_hash IS NULL OR (length(browser_transaction_hash) = 64 AND browser_transaction_hash NOT GLOB '*[^0-9a-f]*')),
+ account_subject TEXT CHECK (account_subject IS NULL OR length(account_subject) BETWEEN 1 AND 255),
+ completion_secret_hash TEXT CHECK (completion_secret_hash IS NULL OR (length(completion_secret_hash) = 64 AND completion_secret_hash NOT GLOB '*[^0-9a-f]*')),
+ link_id TEXT,
+ failure_reason TEXT CHECK (failure_reason IS NULL OR failure_reason IN ('device_cancelled','browser_cancelled','provider_failure','config_failure')),
+ created_at_ms INTEGER NOT NULL CHECK (typeof(created_at_ms) = 'integer' AND created_at_ms >= 0 AND created_at_ms <= 9007199254140991),
+ expires_at_ms INTEGER NOT NULL CHECK (typeof(expires_at_ms) = 'integer' AND expires_at_ms = created_at_ms + 600000),
+ claimed_at_ms INTEGER,
+ oidc_verified_at_ms INTEGER,
+ confirmed_at_ms INTEGER,
+ finalized_at_ms INTEGER,
+ failed_at_ms INTEGER,
+ browser_start_hash TEXT CHECK (browser_start_hash IS NULL OR (length(browser_start_hash) = 64 AND browser_start_hash NOT GLOB '*[^0-9a-f]*')),
+ PRIMARY KEY (coordinator_id, attempt_id),
+ UNIQUE (coordinator_id, runtime_verifier_hash),
+ UNIQUE (coordinator_id, browser_transaction_hash),
+ UNIQUE (coordinator_id, completion_secret_hash),
+ UNIQUE (coordinator_id, link_id),
+ CHECK (state <> 'pending' OR (browser_transaction_hash IS NULL AND account_subject IS NULL AND completion_secret_hash IS NULL AND link_id IS NULL)),
+ CHECK (state NOT IN ('browser_claimed','oidc_verified','confirmed','finalized','session_redeemed') OR browser_transaction_hash IS NOT NULL),
+ CHECK (state NOT IN ('oidc_verified','confirmed','finalized','session_redeemed') OR account_subject IS NOT NULL),
+ CHECK (state NOT IN ('confirmed','finalized','session_redeemed') OR completion_secret_hash IS NOT NULL),
+ CHECK ((state IN ('finalized','session_redeemed') AND link_id IS NOT NULL AND finalized_at_ms IS NOT NULL) OR (state NOT IN ('finalized','session_redeemed') AND link_id IS NULL AND finalized_at_ms IS NULL)),
+ CHECK ((state = 'failed' AND failure_reason IS NOT NULL AND failed_at_ms IS NOT NULL) OR (state <> 'failed' AND failure_reason IS NULL AND failed_at_ms IS NULL))
+);
+CREATE TABLE IF NOT EXISTS coordinator_auth_account_links (
+ coordinator_id TEXT NOT NULL,
+ link_id TEXT NOT NULL,
+ issuer TEXT NOT NULL,
+ subject TEXT NOT NULL CHECK (length(subject) BETWEEN 1 AND 255),
+ identity_id TEXT NOT NULL,
+ attempt_id TEXT NOT NULL,
+ controller_attestation_id TEXT NOT NULL,
+ auth_config_revision TEXT NOT NULL CHECK (length(auth_config_revision) = 64 AND auth_config_revision NOT GLOB '*[^0-9a-f]*'),
+ created_at_ms INTEGER NOT NULL,
+ revoked_at_ms INTEGER,
+ PRIMARY KEY (coordinator_id, link_id),
+ UNIQUE (coordinator_id, issuer, subject),
+ UNIQUE (coordinator_id, identity_id),
+ UNIQUE (coordinator_id, attempt_id)
+);
+CREATE TABLE IF NOT EXISTS coordinator_auth_link_audit_log (
+ coordinator_id TEXT NOT NULL,
+ link_id TEXT NOT NULL,
+ action TEXT NOT NULL CHECK (action IN ('link_created','link_revoked')),
+ attempt_id TEXT NOT NULL,
+ identity_id TEXT NOT NULL,
+ group_id TEXT NOT NULL,
+ device_id TEXT NOT NULL,
+ fingerprint TEXT NOT NULL CHECK (length(fingerprint) = 64 AND fingerprint NOT GLOB '*[^0-9a-f]*'),
+ controller_attestation_id TEXT NOT NULL,
+ auth_config_revision TEXT NOT NULL CHECK (length(auth_config_revision) = 64 AND auth_config_revision NOT GLOB '*[^0-9a-f]*'),
+ created_at_ms INTEGER NOT NULL,
+ PRIMARY KEY (coordinator_id, link_id, action)
+);
+
+CREATE TABLE IF NOT EXISTS coordinator_auth_session_receipts (
+ coordinator_id TEXT NOT NULL,
+ browser_transaction_hash TEXT NOT NULL CHECK (length(browser_transaction_hash) = 64 AND browser_transaction_hash NOT GLOB '*[^0-9a-f]*'),
+ source TEXT NOT NULL CHECK (source IN ('link_redeem','signin')),
+ attempt_id TEXT,
+ link_id TEXT NOT NULL,
+ session_id TEXT NOT NULL,
+ auth_config_revision TEXT NOT NULL CHECK (length(auth_config_revision) = 64 AND auth_config_revision NOT GLOB '*[^0-9a-f]*'),
+ created_at_ms INTEGER NOT NULL CHECK (typeof(created_at_ms) = 'integer' AND created_at_ms BETWEEN 0 AND 9007199225940991),
+ purge_eligible INTEGER NOT NULL DEFAULT 0 CHECK (typeof(purge_eligible) = 'integer' AND purge_eligible IN (0,1) AND (purge_eligible = 0 OR (source = 'signin' AND attempt_id IS NULL))),
+ PRIMARY KEY (coordinator_id, browser_transaction_hash),
+ UNIQUE (coordinator_id, session_id),
+ UNIQUE (coordinator_id, attempt_id),
+ CHECK ((source = 'link_redeem' AND attempt_id IS NOT NULL) OR (source = 'signin' AND attempt_id IS NULL))
+);
+CREATE TABLE IF NOT EXISTS coordinator_auth_sessions (
+ coordinator_id TEXT NOT NULL,
+ session_id TEXT NOT NULL,
+ credential_hash TEXT NOT NULL CHECK (length(credential_hash) = 64 AND credential_hash NOT GLOB '*[^0-9a-f]*'),
+ browser_transaction_hash TEXT NOT NULL CHECK (length(browser_transaction_hash) = 64 AND browser_transaction_hash NOT GLOB '*[^0-9a-f]*'),
+ link_id TEXT NOT NULL,
+ identity_id TEXT NOT NULL,
+ issuer TEXT NOT NULL,
+ subject TEXT NOT NULL CHECK (length(subject) BETWEEN 1 AND 255),
+ auth_config_revision TEXT NOT NULL CHECK (length(auth_config_revision) = 64 AND auth_config_revision NOT GLOB '*[^0-9a-f]*'),
+ created_at_ms INTEGER NOT NULL CHECK (typeof(created_at_ms) = 'integer' AND created_at_ms BETWEEN 0 AND 9007199225940991),
+ expires_at_ms INTEGER NOT NULL CHECK (typeof(expires_at_ms) = 'integer' AND expires_at_ms BETWEEN 0 AND 9007199254740991 AND expires_at_ms = created_at_ms + 28800000),
+ revoked_at_ms INTEGER CHECK (revoked_at_ms IS NULL OR (typeof(revoked_at_ms) = 'integer' AND revoked_at_ms BETWEEN 0 AND 9007199254740991)),
+ PRIMARY KEY (coordinator_id, session_id),
+ UNIQUE (coordinator_id, credential_hash),
+ UNIQUE (coordinator_id, browser_transaction_hash)
+);
+
+CREATE INDEX IF NOT EXISTS idx_auth_sessions_link_config_expiry
+  ON coordinator_auth_sessions(coordinator_id, link_id, auth_config_revision, expires_at_ms);
+CREATE INDEX IF NOT EXISTS idx_auth_sessions_expiry
+ ON coordinator_auth_sessions(coordinator_id, expires_at_ms, session_id);
+CREATE INDEX IF NOT EXISTS idx_auth_session_receipts_purge
+ ON coordinator_auth_session_receipts(coordinator_id, purge_eligible, created_at_ms, browser_transaction_hash);
+
+CREATE INDEX IF NOT EXISTS idx_auth_link_attempts_device_created
+ ON coordinator_auth_link_attempts(coordinator_id, group_id, device_id, created_at_ms);
+CREATE INDEX IF NOT EXISTS idx_auth_link_attempts_identity_expiry
+ ON coordinator_auth_link_attempts(coordinator_id, identity_id, expires_at_ms);
+CREATE INDEX IF NOT EXISTS idx_auth_link_attempts_state_expiry
+ ON coordinator_auth_link_attempts(coordinator_id, state, expires_at_ms);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_auth_link_attempts_browser_start
+ ON coordinator_auth_link_attempts(coordinator_id, browser_start_hash);
+
+CREATE TABLE IF NOT EXISTS coordinator_auth_browser_transactions (
+ coordinator_id TEXT NOT NULL CHECK (length(coordinator_id) BETWEEN 1 AND 256),
+ browser_transaction_hash TEXT NOT NULL CHECK (length(browser_transaction_hash) = 64 AND browser_transaction_hash NOT GLOB '*[^0-9a-f]*'),
+ purpose TEXT NOT NULL CHECK (purpose IN ('signin','link')),
+ attempt_id TEXT CHECK (attempt_id IS NULL OR length(attempt_id) BETWEEN 1 AND 256),
+ state_hash TEXT NOT NULL CHECK (length(state_hash) = 64 AND state_hash NOT GLOB '*[^0-9a-f]*'),
+ binder_hash TEXT NOT NULL CHECK (length(binder_hash) = 64 AND binder_hash NOT GLOB '*[^0-9a-f]*'),
+ issuer TEXT NOT NULL,
+ auth_config_revision TEXT NOT NULL CHECK (length(auth_config_revision) = 64 AND auth_config_revision NOT GLOB '*[^0-9a-f]*'),
+ redirect_uri TEXT NOT NULL,
+ state TEXT NOT NULL CHECK (state IN ('pending','consumed','expired')),
+ nonce TEXT CHECK (nonce IS NULL OR (length(nonce) BETWEEN 43 AND 128 AND nonce NOT GLOB '*[^A-Za-z0-9._~-]*')),
+ pkce_verifier TEXT CHECK (pkce_verifier IS NULL OR (length(pkce_verifier) BETWEEN 43 AND 128 AND pkce_verifier NOT GLOB '*[^A-Za-z0-9._~-]*')),
+ claim_token TEXT,
+ created_at_ms INTEGER NOT NULL CHECK (typeof(created_at_ms) = 'integer' AND created_at_ms BETWEEN 0 AND 9007199254140991),
+ expires_at_ms INTEGER NOT NULL CHECK (typeof(expires_at_ms) = 'integer' AND expires_at_ms > created_at_ms AND expires_at_ms <= created_at_ms + 600000),
+ consumed_at_ms INTEGER CHECK (consumed_at_ms IS NULL OR (typeof(consumed_at_ms) = 'integer' AND consumed_at_ms >= created_at_ms AND consumed_at_ms < expires_at_ms AND consumed_at_ms <= 9007199254740991)),
+ PRIMARY KEY (coordinator_id, browser_transaction_hash),
+ UNIQUE (coordinator_id, state_hash),
+ UNIQUE (coordinator_id, binder_hash),
+ UNIQUE (coordinator_id, attempt_id),
+ UNIQUE (coordinator_id, claim_token),
+ CHECK ((purpose = 'link' AND attempt_id IS NOT NULL) OR (purpose = 'signin' AND attempt_id IS NULL)),
+ CHECK ((state = 'pending' AND nonce IS NOT NULL AND pkce_verifier IS NOT NULL) OR (state <> 'pending' AND nonce IS NULL AND pkce_verifier IS NULL)),
+ CHECK ((state = 'consumed' AND claim_token IS NOT NULL AND consumed_at_ms IS NOT NULL) OR (state <> 'consumed' AND claim_token IS NULL AND consumed_at_ms IS NULL))
+);
+CREATE INDEX IF NOT EXISTS idx_auth_browser_txn_purpose_created
+ ON coordinator_auth_browser_transactions(coordinator_id, purpose, created_at_ms);
+CREATE INDEX IF NOT EXISTS idx_auth_browser_txn_state_expiry
+ ON coordinator_auth_browser_transactions(coordinator_id, state, expires_at_ms);
+CREATE TABLE IF NOT EXISTS coordinator_auth_signin_purge_floors (
+ coordinator_id TEXT NOT NULL PRIMARY KEY CHECK (length(coordinator_id) BETWEEN 1 AND 256),
+ purged_through_created_at_ms INTEGER NOT NULL CHECK (typeof(purged_through_created_at_ms) = 'integer' AND purged_through_created_at_ms BETWEEN 0 AND 9007199254140991)
+);
+CREATE TABLE IF NOT EXISTS coordinator_auth_account_profiles (
+ coordinator_id TEXT NOT NULL,
+ link_id TEXT NOT NULL,
+ display_name TEXT CHECK (display_name IS NULL OR (typeof(display_name) = 'text' AND length(display_name) BETWEEN 1 AND 256)),
+ email TEXT CHECK (email IS NULL OR (typeof(email) = 'text' AND length(email) BETWEEN 1 AND 320)),
+ email_verified INTEGER CHECK (email_verified IS NULL OR (typeof(email_verified) = 'integer' AND email_verified IN (0,1) AND email IS NOT NULL)),
+ picture_url TEXT CHECK (picture_url IS NULL OR (typeof(picture_url) = 'text' AND length(picture_url) BETWEEN 1 AND 2048 AND substr(picture_url, 1, 8) = 'https://')),
+ source_session_id TEXT NOT NULL,
+ source_signed_in_at_ms INTEGER NOT NULL CHECK (typeof(source_signed_in_at_ms) = 'integer' AND source_signed_in_at_ms BETWEEN 0 AND 9007199225940991),
+ PRIMARY KEY (coordinator_id, link_id)
+);

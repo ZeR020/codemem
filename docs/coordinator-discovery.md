@@ -115,6 +115,103 @@ These group/device management commands operate on the built-in local coordinator
 Remote coordinator admin for invites and join-request review exists separately; remote device-admin parity remains a
 follow-up.
 
+## Optional account linking
+
+Review the existing device owner before starting optional Google account linking.
+The review uses the already configured coordinator-admin credential; it grants no
+new access and does not enable Google, relay, or account-link routes.
+
+Run this on the existing device first:
+
+```fish
+codemem coordinator review-device-owner team-alpha --coordinator "https://coord.example.com"
+```
+
+The command opens the existing device memory database read-only and previews the
+device, current Identity, memory-author counts, and active Team/direct-Project
+counts. The preview does **not** move memories, change keys, enroll a device,
+adopt an Identity, or change access. It also does not infer ownership from memory
+origin metadata.
+
+The first request is preview-only. In an interactive terminal, a second request
+is sent only after an explicit confirmation; the default answer is **No**. JSON
+and non-terminal runs stay preview-only. Before confirming, the command rereads
+the local device and Identity and stops if either or the coordinator endpoint
+changed.
+
+The reread also compares whether the current Identity and device-assignment records
+exist. Records appearing or disappearing during confirmation require a fresh
+preview, even when the derived Identity and device key are unchanged.
+
+The coordinator records an immutable controller review only after that explicit
+confirmation. It recomputes server-owned evidence before writing, so a changed
+enrollment, key, group, or reviewed invitation stops the request without a
+write. Existing conflicting or revoked reviews are never overwritten.
+The database compares all matching invitation evidence atomically during insertion
+and retry, so changes after the preview read cannot approve stale evidence.
+The CLI displays the total reviewed invitation count; JSON includes at most ten
+invitation references, but every matching invitation is checked.
+
+If the local database lacks the required actor or binding tables or columns, has another
+active local actor, or identifies a revoked or differently bound device, the
+command fails closed with `needs_review`. It does not initialize or migrate the
+database. Missing count tables display as unknown, not zero.
+
+The command reads the existing coordinator configuration for its endpoint and
+admin credential. Do not place that credential in command arguments or output.
+When using `--config`, ensure its Identity setting matches the configuration used
+by the runtime; selecting a review configuration does not change runtime settings.
+A differing `CODEMEM_DEVICE_ID` override stops the review without a write.
+`--config` selects that configuration, and `--db-path` selects the device memory
+database, not the coordinator's server database.
+
+After a successful review, linking remains a separate opt-in step:
+
+If the review used `--coordinator`, `--config`, or `--db-path` (including `-d`),
+repeat those selections when linking. Keep `CODEMEM_SYNC_COORDINATOR_URL` and
+`CODEMEM_KEYS_DIR` unchanged when they were part of the original setup. The
+next-step hint reminds you to reuse them rather than suggesting a command that
+silently targets saved defaults.
+
+Run it from a terminal on the device being linked:
+
+```fish
+codemem coordinator link-account team-alpha --coordinator "https://coord.example.com"
+codemem coordinator link-account team-alpha --coordinator "https://coord.example.com" --loopback-host "::1"
+```
+
+`--config` can select the saved coordinator configuration. Here, `--db-path`
+selects the **device's memory database**, not the coordinator database used by
+admin commands. `CODEMEM_KEYS_DIR` selects existing device keys when configured;
+the command never creates keys, enrolls a device, adopts another Identity, or
+changes Project access. Remote coordinators require HTTPS; literal HTTP loopback
+origins are allowed only for local development.
+
+Open the private link printed to terminal stderr, review the account, Identity,
+and device in the browser, then return to the coordinator tab to finish. Do not
+share or log the link. JSON and nonterminal execution are rejected before an
+attempt starts so the private URL cannot enter structured output.
+
+The command holds an exact IPv4 or IPv6 loopback listener before creating the
+attempt, signs its requests with the existing device key, and waits at most ten
+minutes. Interrupting it attempts to cancel only its own request. If cancellation
+or the final reply cannot be confirmed, the command reports that uncertainty
+instead of claiming a rollback; an already completed link may still exist.
+
+If linking says this device needs an active owner review (`auth_link_review_required`
+on the signed API), run the review command on this device with the same group and settings, then
+retry linking.
+
+If review conflicts, is revoked, or stops, ask the coordinator operator. A
+rejected request does not replace any existing account link, so do not create
+another Identity, key, or credential as a workaround.
+
+An account-link conflict can involve the Google account or the coordinator
+Identity, including a revoked binding; changing accounts does not necessarily
+resolve it. If this account already belongs to the intended Identity, sign in at
+the configured coordinator's `/auth/sign-in`; otherwise ask the operator.
+Replacing or removing account links is not supported by these commands.
+
 ## Discovery groups vs sync peers
 
 Coordinator group membership and sync peer relationships are not the same thing.
@@ -208,15 +305,21 @@ Dial preference is intentionally conservative:
 2. if mDNS returns addresses on the current LAN, codemem still tries those first
 3. otherwise codemem uses the stored address cache, which may have been refreshed by the coordinator
 
-Codemem keeps at most eight normalized addresses per peer in the active cache and during direct dialing. At least one
-fresh coordinator candidate comes first when available, even if paired addresses fill all eight slots. Explicitly paired
-addresses retain their own stored copy across later refreshes.
-Verified re-pairing addresses take priority over obsolete cached addresses, and the last successful address remains a
-preferred fallback even when the active list is full.
+Codemem keeps at most eight normalized addresses per peer in the active cache and during direct dialing. Fresh coordinator
+candidates come first, with up to six slots reserved when enough candidates exist, even if paired addresses fill the cache.
+Coordinator IPv6 link-local candidates come after other fresh candidates; order within each group stays unchanged. This
+keeps link-local interface addresses from crowding out candidates usable across network boundaries, without guessing which
+IPv4 address or network will work. Link-local addresses remain eligible, including manually paired and successful fallbacks.
+
+When six fresh candidates occupy the active cache, up to two protected fallbacks remain, with the last successful address
+first, followed by manually paired addresses. Fewer fresh candidates leave more room for fallbacks. Explicitly paired
+addresses retain their separate stored copy across refreshes. Verified re-pairing preserves the supplied address order and
+reserves enough slots for those addresses (up to eight), even when that leaves less room for fallbacks.
 
 For older peers whose addresses predate source tracking, codemem retains the original list separately and includes the
-first and last two as fallbacks when it compacts the active cache. This preserves the original data without allowing
-thousands of obsolete Docker, VPN, DHCP, or temporary IPv6 addresses to consume a daemon tick in serial attempts.
+first and last two as fallback candidates when it compacts the active cache; available fallback slots determine how many
+remain active. This preserves the original data without allowing thousands of obsolete Docker, VPN, DHCP, or temporary
+IPv6 addresses to consume a daemon tick in serial attempts.
 
 If the coordinator is unavailable, codemem falls back to cached addresses and mDNS.
 
@@ -243,6 +346,11 @@ CLI uses that remote admin path for invite creation and join-request review; rem
 
 Device participation auth still uses the enrolled device keypair for `presence` and `peers` endpoints; the admin secret
 is only for remote mutation/listing endpoints.
+
+Admin requests do not follow HTTP redirects, even to another path on the same
+origin. Configure `sync_coordinator_url` or `--coordinator` with the final API URL
+if a proxy or URL alias redirects requests. This prevents forwarding the admin
+credential; ordinary discovery and direct-sync request behavior is unchanged.
 
 ## Canonical deployment target
 
@@ -280,6 +388,16 @@ Use the Worker reference path only when you specifically want a serverless/edge 
 feature lag — new coordinator capabilities may land in the built-in coordinator first and may not be ported to the
 reference Worker immediately. When you do choose it, follow the dedicated Cloudflare runbook instead of relying on the
 older scattered example notes.
+
+## Direct peer HTTP connections
+
+Recipient-bound direct peer requests close their HTTP connection after each response, including status and snapshot reads. Sync preparation can block the sender's event loop long enough for an earlier connection to exceed the peer's idle timeout; reusing that connection can then fail before a write receives an HTTP response.
+
+This connection policy does not change signatures, device trust, sharing grants, request bodies, or cursor acknowledgements. It does not retry failed writes automatically. Coordinator and administrator requests keep their existing connection policy. The tradeoff is an extra connection handshake for each direct peer request.
+
+## Peer-memory cleanup
+
+Peer-memory cleanup resolves authorization once per scope within each cleanup transaction, rather than repeating the same database queries for every memory. Each new cleanup transaction starts with fresh lookups, so membership, revocation, and policy changes are not hidden by a cache shared across sync passes.
 
 ## Always-on peers
 

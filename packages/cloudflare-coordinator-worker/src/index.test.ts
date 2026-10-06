@@ -29,6 +29,353 @@ type SqliteStatement = {
 	raw: (value: boolean) => { all: (...values: unknown[]) => unknown[] };
 };
 
+it("migration 0019 adds only named nonunique indexes and retains expired evidence on repeat", () => {
+	// Arrange: a disposable legacy schema with retained, unlinked evidence.
+	const db = connectCoordinator(":memory:");
+	const names = [
+		"idx_auth_link_attempts_device_created",
+		"idx_auth_link_attempts_identity_expiry",
+		"idx_auth_link_attempts_state_expiry",
+	];
+	try {
+		for (const name of names) db.exec(`DROP INDEX IF EXISTS ${name}`);
+		db.prepare(`INSERT INTO coordinator_auth_link_attempts
+			(coordinator_id, attempt_id, identity_id, group_id, device_id, public_key, fingerprint,
+			controller_attestation_id, controller_review_receipt_id, controller_revision, issuer,
+			auth_config_revision, runtime_verifier_hash, loopback_redirect, state, browser_transaction_hash,
+			account_subject, completion_secret_hash, created_at_ms, expires_at_ms)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, 'expired', ?, ?, ?, 0, 600000)`).run(
+			"coordinator-a",
+			"legacy-attempt",
+			"identity-a",
+			"group-a",
+			"device-a",
+			"fixture-key",
+			"a".repeat(64),
+			"attestation-a",
+			"receipt-a",
+			"https://accounts.example.test",
+			"b".repeat(64),
+			"c".repeat(64),
+			"http://127.0.0.1:4567/codemem/auth/complete",
+			"d".repeat(64),
+			"retained-subject",
+			"e".repeat(64),
+		);
+		const tables = (
+			db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name").all() as {
+				name: string;
+			}[]
+		).map((row) => row.name);
+		const before = tables.map((table) => ({
+			columns: db.pragma(`table_info(${table})`),
+			rows: db.prepare(`SELECT * FROM ${table}`).all(),
+		}));
+		const ddl = db
+			.prepare("SELECT name, sql FROM sqlite_master WHERE type = 'table' ORDER BY name")
+			.all();
+		const migration = readFileSync(
+			join(import.meta.dirname, "../migrations/0019_add_auth_link_attempt_limit_indexes.sql"),
+			"utf8",
+		);
+		// Act
+		db.exec(migration);
+		db.exec(migration);
+		const indexes = names.map((name) => ({
+			name,
+			columns: db.prepare("SELECT name FROM pragma_index_info(?) ORDER BY seqno").all(name),
+			flags: db
+				.prepare(
+					"SELECT \"unique\", partial FROM pragma_index_list('coordinator_auth_link_attempts') WHERE name = ?",
+				)
+				.get(name),
+		}));
+		// Assert: no column changes, data backfill, subject scrubbing or row deletion.
+		expect(
+			tables.map((table) => ({
+				columns: db.pragma(`table_info(${table})`),
+				rows: db.prepare(`SELECT * FROM ${table}`).all(),
+			})),
+		).toEqual(before);
+		expect(
+			db.prepare("SELECT name, sql FROM sqlite_master WHERE type = 'table' ORDER BY name").all(),
+		).toEqual(ddl);
+		expect(indexes).toEqual([
+			{
+				name: names[0],
+				columns: ["coordinator_id", "group_id", "device_id", "created_at_ms"].map((name) => ({
+					name,
+				})),
+				flags: { unique: 0, partial: 0 },
+			},
+			{
+				name: names[1],
+				columns: ["coordinator_id", "identity_id", "expires_at_ms"].map((name) => ({ name })),
+				flags: { unique: 0, partial: 0 },
+			},
+			{
+				name: names[2],
+				columns: ["coordinator_id", "state", "expires_at_ms"].map((name) => ({ name })),
+				flags: { unique: 0, partial: 0 },
+			},
+		]);
+	} finally {
+		db.close();
+	}
+});
+
+it("migration 0018 adds empty sessions repeatedly without changing legacy or link ownership", () => {
+	// Arrange: only this disposable database represents the pre-session schema.
+	const db = connectCoordinator(":memory:");
+	const tables = ["coordinator_auth_session_receipts", "coordinator_auth_sessions"];
+	const unchanged = [
+		"groups",
+		"enrolled_devices",
+		"coordinator_auth_controller_attestations",
+		"coordinator_auth_link_attempts",
+		"coordinator_auth_account_links",
+		"coordinator_auth_link_audit_log",
+	];
+	try {
+		for (const table of tables) db.exec(`DROP TABLE ${table}`);
+		db.prepare("INSERT INTO groups (group_id, created_at) VALUES (?, ?)").run(
+			"legacy-session-group",
+			"2026-10-02T00:00:00.000Z",
+		);
+		db.prepare(`INSERT INTO enrolled_devices
+			(group_id, device_id, public_key, fingerprint, identity_id, enabled, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?)`).run(
+			"legacy-session-group",
+			"legacy-session-device",
+			"fixture-public-key",
+			"a".repeat(64),
+			"legacy-session-identity",
+			1,
+			"2026-10-02T00:00:00.000Z",
+		);
+		const before = unchanged.map((table) => db.prepare(`SELECT * FROM ${table}`).all());
+		const migration = readFileSync(
+			join(import.meta.dirname, "../migrations/0018_add_auth_sessions.sql"),
+			"utf8",
+		);
+		// Act
+		db.exec(migration);
+		db.exec(migration);
+		// Assert
+		for (const table of tables) expect(db.prepare(`SELECT * FROM ${table}`).all()).toEqual([]);
+		expect(unchanged.map((table) => db.prepare(`SELECT * FROM ${table}`).all())).toEqual(before);
+		// Negative: repeat application must retain the fixed session TTL CHECK.
+		expect(() =>
+			db
+				.prepare(`INSERT INTO coordinator_auth_sessions
+			(coordinator_id, session_id, credential_hash, browser_transaction_hash, link_id, identity_id,
+			issuer, subject, auth_config_revision, created_at_ms, expires_at_ms)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+				.run(
+					"coord-a",
+					"session-a",
+					"a".repeat(64),
+					"b".repeat(64),
+					"link-a",
+					"identity-a",
+					"https://accounts.example.test",
+					"opaque-subject",
+					"c".repeat(64),
+					0,
+					1,
+				),
+		).toThrow(/CHECK constraint failed/);
+	} finally {
+		db.close();
+	}
+});
+
+it("migration 0017 adds empty link storage idempotently without backfilling ownership", () => {
+	// Arrange: the migration acts only on this disposable pre-link database.
+	const db = connectCoordinator(":memory:");
+	const tables = [
+		"coordinator_auth_link_audit_log",
+		"coordinator_auth_account_links",
+		"coordinator_auth_link_attempts",
+	];
+	try {
+		for (const table of tables) db.exec(`DROP TABLE ${table}`);
+		db.prepare("INSERT INTO groups (group_id, created_at) VALUES (?, ?)").run(
+			"legacy-link-group",
+			"2026-10-02T00:00:00.000Z",
+		);
+		db.prepare(`INSERT INTO enrolled_devices
+			(group_id, device_id, public_key, fingerprint, identity_id, enabled, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?)`).run(
+			"legacy-link-group",
+			"legacy-link-device",
+			"fixture-public-key",
+			"a".repeat(64),
+			"legacy-link-identity",
+			1,
+			"2026-10-02T00:00:00.000Z",
+		);
+		const before = ["groups", "enrolled_devices", "coordinator_auth_controller_attestations"].map(
+			(table) => db.prepare(`SELECT * FROM ${table}`).all(),
+		);
+		const migration = readFileSync(
+			join(import.meta.dirname, "../migrations/0017_add_auth_account_links.sql"),
+			"utf8",
+		);
+		// Act
+		db.exec(migration);
+		db.exec(migration);
+		// Assert: no account, Identity, or review trust is inferred from legacy labels.
+		for (const table of tables) expect(db.prepare(`SELECT * FROM ${table}`).all()).toEqual([]);
+		expect(
+			["groups", "enrolled_devices", "coordinator_auth_controller_attestations"].map((table) =>
+				db.prepare(`SELECT * FROM ${table}`).all(),
+			),
+		).toEqual(before);
+		const columns = db.pragma("table_info(coordinator_auth_link_attempts)") as { name: string }[];
+		expect(columns.map((column) => column.name)).toEqual(
+			expect.arrayContaining([
+				"controller_attestation_id",
+				"controller_revision",
+				"runtime_verifier_hash",
+				"completion_secret_hash",
+				"expires_at_ms",
+			]),
+		);
+		// Negative: repeated migration does not relax the safe clock/deadline CHECK.
+		expect(() =>
+			db
+				.prepare(`INSERT INTO coordinator_auth_link_attempts
+			(coordinator_id, attempt_id, identity_id, group_id, device_id, public_key, fingerprint,
+			controller_attestation_id, controller_review_receipt_id, controller_revision, issuer,
+			auth_config_revision, runtime_verifier_hash, loopback_redirect, state, created_at_ms, expires_at_ms)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+				.run(
+					"coord-a",
+					"attempt-a",
+					"identity-a",
+					"legacy-link-group",
+					"legacy-link-device",
+					"fixture-public-key",
+					"a".repeat(64),
+					"attestation-a",
+					"receipt-a",
+					1,
+					"https://accounts.example.test",
+					"b".repeat(64),
+					"c".repeat(64),
+					"http://127.0.0.1:4567/codemem/auth/complete",
+					"pending",
+					0,
+					1,
+				),
+		).toThrow(/CHECK constraint failed/);
+	} finally {
+		db.close();
+	}
+});
+
+function preControllerMigrationFixture() {
+	const db = connectCoordinator(":memory:");
+	// Match the existing migration tests: drop only the new table in a disposable
+	// database to represent the schema before this migration existed.
+	db.exec("DROP TABLE coordinator_auth_controller_attestations");
+	db.prepare("INSERT INTO groups (group_id, created_at) VALUES (?, ?)").run(
+		"legacy-group",
+		"2026-10-02T00:00:00.000Z",
+	);
+	db.prepare(`INSERT INTO enrolled_devices
+		(group_id, device_id, public_key, fingerprint, identity_id, enabled, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`).run(
+		"legacy-group",
+		"legacy-device",
+		"fixture-public-key",
+		"a".repeat(64),
+		"legacy-identity",
+		1,
+		"2026-10-02T00:00:00.000Z",
+	);
+	const migration = readFileSync(
+		join(import.meta.dirname, "../migrations/0016_add_auth_controller_attestations.sql"),
+		"utf8",
+	);
+	return { db, migration };
+}
+
+describe("auth-controller migration 0016 (SQLite-backed schema checks)", () => {
+	it("creates empty review storage idempotently without trusting or changing legacy identities", () => {
+		// Arrange
+		const { db, migration } = preControllerMigrationFixture();
+		try {
+			const before = db.prepare("SELECT * FROM enrolled_devices").all();
+			// Act
+			db.exec(migration);
+			db.exec(migration);
+			// Assert
+			expect(
+				db.prepare("SELECT COUNT(*) AS count FROM coordinator_auth_controller_attestations").get(),
+			).toEqual({ count: 0 });
+			expect(db.prepare("SELECT * FROM enrolled_devices").all()).toEqual(before);
+			expect(db.prepare("SELECT identity_id FROM enrolled_devices").get()).toEqual({
+				identity_id: "legacy-identity",
+			});
+		} finally {
+			db.close();
+		}
+	});
+
+	it("accepts a reviewed revision-one row but rejects an unsupported revision", () => {
+		// Arrange
+		const { db, migration } = preControllerMigrationFixture();
+		try {
+			db.exec(migration);
+			const insert = db.prepare(`INSERT INTO coordinator_auth_controller_attestations
+				(attestation_id, coordinator_id, identity_id, group_id, device_id, public_key,
+				fingerprint, review_receipt_id, evidence_digest, enrollment_identity_id, revision, created_at)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+			const values = [
+				"coordinator-a",
+				"legacy-identity",
+				"legacy-group",
+				"legacy-device",
+				"fixture-public-key",
+				"a".repeat(64),
+			];
+			// Act
+			insert.run(
+				"review-a",
+				...values,
+				"receipt-a",
+				"b".repeat(64),
+				"legacy-identity",
+				1,
+				"2026-10-02T00:00:00.000Z",
+			);
+			const invalid = () =>
+				insert.run(
+					"review-b",
+					...values,
+					"receipt-b",
+					"b".repeat(64),
+					"legacy-identity",
+					2,
+					"2026-10-02T00:00:00.000Z",
+				);
+			// Assert
+			expect(invalid).toThrow(/CHECK constraint failed/u);
+			expect(
+				db
+					.prepare(
+						"SELECT attestation_id, revision, revoked_at FROM coordinator_auth_controller_attestations",
+					)
+					.all(),
+			).toEqual([{ attestation_id: "review-a", revision: 1, revoked_at: null }]);
+		} finally {
+			db.close();
+		}
+	});
+});
+
 class SqliteD1Statement implements D1PreparedStatementLike {
 	private bound: unknown[] = [];
 

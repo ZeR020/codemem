@@ -295,7 +295,7 @@ VW-->>PL: pack JSON
 PL->>OC: inject codemem context
 ```
 
-**Retrieval** combines two strategies: keyword search via SQLite FTS5 with BM25 scoring and semantic similarity via sqlite-vec embeddings. In the pack-building path, results from both are merged, exactly deduplicated, and re-ranked using recency and memory-kind boosts. Near-related memories stay fully rendered by default; use compact rendering or `CODEMEM_PACK_COMPRESSION=ids` only when you intentionally want ID-based expansion via `memory_get_observations`.
+**Retrieval** combines keyword search via SQLite FTS5 with BM25 scoring and semantic similarity via sqlite-vec embeddings. Hybrid packs combine channel ranks rather than raw scores; recency and other preferences break exact ties. See the [ranking contract](docs/pack-ranking.md). Near-related memories stay fully rendered by default; use compact rendering or `CODEMEM_PACK_COMPRESSION=ids` only when you intentionally want ID-based expansion via `memory_get_observations`.
 
 **Injection** happens automatically. The plugin builds a query from the current session context (first prompt, latest prompt, project, recently modified files), asks the long-lived local viewer to build the pack, and appends the result to the latest user message via `experimental.chat.messages.transform`. Before sending prompt-derived POST data, it performs a payload-free viewer/profile handshake and rejects redirects. Retryable viewer transport, version, database-target, effective identity/config-target, compression-setting, embedding-setting mismatch, or pre-handshake structured request failures fall back to the existing CLI path; structured request errors become terminal only after compatibility is established. Prior injected message blocks are replayed byte-for-byte on later turns so provider prompt caches can keep the stable prefix. Set `CODEMEM_INJECT_SURFACE=system` to use the legacy system-prompt surface. Raw-event capture uses a separate queue-first path: Viewer durably accepts the envelope before SQLite ingestion and returns `202`; if Viewer is unavailable, OpenCode saves the exact envelope to a private local spool and retries it over HTTP without launching a per-event CLI process. Bounded database, identity, contract, and connection notices omit target values, paths, payloads, subprocess output, and addresses. Each retrieval and current-request cache reuse is recorded through the viewer-backed local evidence ledger with bounded memory identities, machine-readable reason codes, delivery status, and safe repository-relative working-set paths; retryable ledger transport failures retain the CLI fallback. Repository-contained absolute tool paths are converted to repository-relative `/` paths before retrieval; outside-repository, traversing, blank, and overlong paths are omitted. Prompts, pack text, memory content, and absolute paths are not copied into the ledger, historical message reconstruction creates no new attempts, and recording failures never block injection. After a plugin restart, usable context also remains fail-open when fresh ledger-identity repair fails; fallback bytes are injected without attributing delivery to either the conflicted or failed attempt.
 
@@ -333,41 +333,17 @@ For architecture details, see [docs/architecture.md](docs/architecture.md).
 
 ## CLI
 
-| Group | Command | Description |
-|-------|---------|-------------|
-| **Core** | `codemem status` | Local operational roll-up (`--json` supported) |
-| | `codemem stats` | Database statistics |
-| | `codemem stats --attribution` | Bounded local retrieval-attribution diagnostics (`--json` supported) |
-| | `codemem recent` | Recent memories |
-| | `codemem search <query>` | Search memories |
-| | `codemem pack <context>` | Build a context-aware memory pack |
-| | `codemem pack trace <context>` | Inspect retrieval and pack assembly for a manual query |
-| | `codemem distill` | Mine recurring memories into reviewable context candidates |
-| | `codemem embed` | Backfill semantic embeddings |
-| **Memory** | `codemem memory show <id>` | Print a memory item as JSON |
-| | `codemem memory forget <id>` | Deactivate a memory item |
-| | `codemem memory remember` | Manually add a memory |
-| | `codemem memory inject <context>` | Raw pack text for prompt injection |
-| | `codemem memory export <output>` | Export memories by project |
-| | `codemem memory import <file>` | Import memories (idempotent) |
-| **Viewer** | `codemem serve [start\|stop\|restart]` | Launch / manage the web viewer |
-| **Sync** | `codemem sync enable\|disable` | Enable or disable peer-to-peer sync |
-| | `codemem sync status` | Device info and peer health |
-| | `codemem sync pair` | Advanced/legacy device pairing |
-| | `codemem sync once` | Run one immediate sync pass |
-| | `codemem sync doctor` | Diagnose sync configuration issues |
-| | `codemem sync bootstrap` | Bootstrap sync from a peer snapshot |
-| **Updates** | `codemem update install` | Install an eligible release from the installed channel |
-| | `codemem update check` | Check npm for a newer release on the installed channel (`--json` and `--refresh` supported) |
-| **Coordinator** | `codemem coordinator` | Self-hosted coordinator admin (groups, devices, invites) |
-| **Database** | `codemem db prune-memories` | Deactivate low-signal memories (`--dry-run` to preview) |
-| | `codemem db prune-observations` | Deactivate low-signal observations |
-| | `codemem db backfill-tags` | Populate missing `tags_text` values |
-| | `codemem db raw-events-status` | Show raw-event queue status |
-| **Config** | `codemem config` | View or update configuration |
-| | `codemem setup` | Interactive first-run setup |
-| **Plumbing** | `codemem mcp` | MCP stdio server; best-effort starts the local viewer unless `CODEMEM_VIEWER=0` or `CODEMEM_VIEWER_AUTO=0` is set |
-| | `codemem mcp http` | Local Streamable HTTP MCP server (`POST /mcp`, loopback-only by default) |
+Common starting points:
+
+```text
+codemem status
+codemem recent
+codemem search "project decisions"
+codemem serve start
+codemem update check
+```
+
+See the [command reference](docs/cli-reference.md) for command groups, memory management, sync diagnostics, and adapter plumbing.
 
 Run `codemem --help` for the human-facing command list. Adapter plumbing commands (`claude-hook-*`, `codex-hook-*`, `pi-hook-*`, `enqueue-raw-event`, and `prompt-pack-ledger`) remain executable for packaged-plugin and stale-client compatibility but are hidden from help and shell completion. `show`, `forget`, and `remember` still work as hidden top-level aliases. `export-memories` and `import-memories` remain visible but are deprecated — they warn on stderr and will be hidden from help and completion in a future release; use `codemem memory export` / `codemem memory import`.
 
@@ -571,6 +547,26 @@ Use **Health** for the current status. Globally revoked identity devices are omi
 
 Pair devices from **Devices**. Actor assignment, Spaces, grants, project mappings, and coordinator administration remain available in **Advanced** for existing integrations and diagnostics. They are not required for normal teammate sharing. Existing `#sync` and `#sync/diagnostics` links remain supported as Advanced compatibility routes. See [the user guide](docs/user-guide.md#advanced-operator-and-compatibility-guidance).
 
+#### Optional coordinator account linking
+
+Coordinator account linking is an advanced operator flow and is off by default. These commands do not configure Google or deploy a coordinator; an operator must first enable optional account linking on the coordinator. Local memory and direct sync remain usable without Google.
+
+First preview the owner on the device being linked; `--json` is always preview-only:
+
+```text
+codemem coordinator review-device-owner team-alpha --coordinator "https://coord.example.com" --json
+```
+
+The review reads the existing local device database and current Identity without running maintenance, changing configuration or credentials, rotating keys, adopting an Identity, moving memories, or changing grants. Interactive review defaults to **No**; only an operator confirmation records ownership evidence for linking, without changing device assignments or access. It requires the configured coordinator-admin credential.
+
+Ambiguous ownership stops the review; ownership records disappearing or changing during confirmation require a fresh preview. To link, reuse the exact `--coordinator`, `--config`, and `--db-path` (or `-d`) selections from the review, and choose the intended Google account in the browser. See [coordinator-backed discovery](docs/coordinator-discovery.md#optional-account-linking).
+
+Keep any `CODEMEM_SYNC_COORDINATOR_URL` or `CODEMEM_KEYS_DIR` setting unchanged between review and linking. If linking says this device needs an active owner review, run the review on this device with the same group and settings, then retry linking.
+
+A review conflict, revocation, or stopped review needs coordinator-operator help. A rejected link does not replace an existing link; do not create another Identity, key, or credential to work around it.
+
+An account-link conflict may involve the Google account or the coordinator Identity, including a revoked binding. If the account already belongs to the intended Identity, sign in at the configured coordinator's `/auth/sign-in`; otherwise, ask the operator. Replacing or removing account links is not supported by these commands.
+
 ### Device pairing and compatibility
 
 For a same-person device or compatibility workflow, open **Devices**, choose **Pair a device**, and copy the displayed command. Run it on the device you want to connect, copy that device's payload, then paste and review the payload back in **Devices**.
@@ -619,12 +615,13 @@ after testing. On OpenCode 2, that repository wrapper is a no-op: keep the confi
 for normal use, or follow the source-checkout steps above to load `packages/opencode-plugin`
 explicitly while testing unpublished changes.
 
-The repository's `.opencode/plugins/lint-feedback.js` auto-loads contributor-only OpenCode 1 and OpenCode 2 adapters backed by the shared lint-feedback implementation in `packages/opencode-plugin/src/`. The repository-owned entrypoint pins the local Biome command, runs it before and after JavaScript or TypeScript edits covered by `biome.json`, appends only new or worsened diagnostics to successful `edit`, `write`, or patch results, and preserves edits with one warning if linting fails or times out. OpenCode 2 shell commands have no post-execution hook, so changes made through shell commands require an explicit `pnpm lint:delta -- --base <ref>` checkpoint. Use `--staged` to inspect only the Git index, as the pre-commit hook does; the hook uses `--base auto` to compare from the merge base of a local remote-default ref, falling back to `HEAD`. `--staged` cannot be combined with `--head`. The wrapper and lint-feedback sources are excluded from `@codemem/opencode-plugin`; installing codemem does not enable this feedback hook.
+Contributor-only lint feedback and source-plugin testing are documented in [Contributing](CONTRIBUTING.md#repository-lint-feedback) and the [plugin reference](docs/plugin-reference.md#repository-only-lint-feedback); installing codemem does not enable checkout tooling.
 
 </details>
 
 ## Documentation
 
+- [Documentation index](docs/README.md) — user guides, maintained contracts, operations, and design history
 - [Architecture](docs/architecture.md) — data flow, retrieval, observer pipeline, design tradeoffs
 - [Coordinator-backed discovery](docs/coordinator-discovery.md) — self-hosted cross-network peer discovery
 - [User guide](docs/user-guide.md) — Projects, Sharing, Devices, Health, and Advanced operations

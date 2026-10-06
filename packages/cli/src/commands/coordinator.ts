@@ -48,6 +48,8 @@ import {
 	emitJsonError,
 	resolveDbOpt,
 } from "../shared-options.js";
+import { buildCoordinatorLinkAccountCommand } from "./coordinator-link-account.js";
+import { buildCoordinatorReviewDeviceOwnerCommand } from "./coordinator-review-device-owner.js";
 
 function readCoordinatorPublicKey(opts: { publicKey?: string; publicKeyFile?: string }): string {
 	const inline = String(opts.publicKey ?? "").trim();
@@ -107,10 +109,17 @@ function formatImportInviteError(error: unknown): string {
  * Build a fresh coordinator command tree. Each call returns independent
  * Commander instances so the tree can be mounted under multiple parents.
  */
-export function buildCoordinatorCommand(): Command {
+function createCoordinatorCommandRoot(): Command {
 	const cmd = new Command("coordinator")
 		.configureHelp(helpStyle)
 		.description("Manage coordinator invites, join requests, and relay server");
+	cmd.addCommand(buildCoordinatorLinkAccountCommand());
+	cmd.addCommand(buildCoordinatorReviewDeviceOwnerCommand());
+	return cmd;
+}
+
+export function buildCoordinatorCommand(): Command {
+	const cmd = createCoordinatorCommandRoot();
 
 	// ---- group-create ----
 

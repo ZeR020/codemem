@@ -67,6 +67,18 @@ pnpm --filter @codemem/ui build
 pnpm run codemem serve restart
 ```
 
+## Repository lint feedback
+
+The checkout-local `.opencode/plugins/lint-feedback.js` reports new or worsened Biome diagnostics after supported OpenCode edit tools. It is contributor tooling and is excluded from the published plugin. See the [plugin reference](docs/plugin-reference.md#repository-only-lint-feedback) for hook coverage and limitations.
+
+Shell-driven edits need an explicit checkpoint:
+
+```text
+pnpm lint:delta -- --base <ref>
+```
+
+Use `--staged` to inspect only the Git index; it cannot be combined with `--head`. The pre-commit hook uses `--base auto --staged` to compare from a local remote-default merge base, falling back to `HEAD`. Run hooks normally; an ignore-policy change currently requires a separate tooling change because the ratchet rejects it without an approval mechanism.
+
 ## Release workflow
 
 Releases are tag-driven (`vX.Y.Z`) and run via `.github/workflows/release.yml`.
@@ -99,3 +111,6 @@ pnpm run release:preflight-tag
 - Keep README focused on user onboarding.
 - Put advanced operational details in `docs/`.
 - If behavior changes, update the related docs in the same PR.
+- Use `docs/adr/` for durable architecture decisions, `docs/contracts/` for maintained interfaces and schemas, and `docs/design/` for reusable UI patterns.
+- Keep active designs in `docs/plans/`; mark historical or superseded designs clearly and link to current guidance. Do not create tool-named documentation hierarchies.
+- Track routine implementation steps, review corrections, release checklists, and completion evidence in Beads or the PR, not new committed plan files. Before removing an old plan, preserve unique rationale and repair references.

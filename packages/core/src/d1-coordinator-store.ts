@@ -1,3 +1,60 @@
+import {
+	AuthAccountProfileOperations,
+	type CoordinatorAuthAccountProfileInput,
+} from "./coordinator-auth-account-profile.js";
+import {
+	type CoordinatorAuthBrowserConfig,
+	type CoordinatorAuthBrowserTransactionConsumeInput,
+	type CoordinatorAuthBrowserTransactionMaintenanceOptions,
+	type CoordinatorAuthBrowserTransactionRetirementOptions,
+	type CoordinatorAuthBrowserTransactionScope,
+	type CoordinatorAuthBrowserTransactionStartInput,
+	CoordinatorAuthBrowserTransactions,
+	type CoordinatorAuthLinkBrowserTransactionResolveInput,
+	type CoordinatorAuthSigninBrowserTransactionCancelInput,
+} from "./coordinator-auth-browser-transaction.js";
+import {
+	AUTH_CONTROLLER_ACTIVE_SQL,
+	AUTH_CONTROLLER_CONFLICT_SQL,
+	AUTH_CONTROLLER_INSERT_SQL,
+	AUTH_CONTROLLER_RETRY_ACTIVE_SQL,
+	AUTH_CONTROLLER_REVOKE_SQL,
+	authControllerConflictValues,
+	authControllerInsertValues,
+	authControllerRetryActiveValues,
+	authControllerRetryResult,
+	type CoordinatorAuthControllerAttestation,
+	type CoordinatorAuthControllerCreateResult,
+	type CoordinatorAuthControllerReviewInput,
+	captureAuthControllerReview,
+	isAuthControllerId,
+	isAuthControllerUniqueError,
+} from "./coordinator-auth-controller.js";
+import {
+	type AuthLinkBackend,
+	AuthLinkOperations,
+	type AuthLinkStatement,
+} from "./coordinator-auth-link.js";
+import type {
+	CoordinatorAuthLinkClaimInput,
+	CoordinatorAuthLinkConfig,
+	CoordinatorAuthLinkConfirmInput,
+	CoordinatorAuthLinkCreateInput,
+	CoordinatorAuthLinkFailInput,
+	CoordinatorAuthLinkFinalizeInput,
+	CoordinatorAuthLinkMaintenanceOptions,
+	CoordinatorAuthLinkOidcInput,
+	CoordinatorAuthLinkOptions,
+	CoordinatorAuthLinkRequester,
+} from "./coordinator-auth-link-contract.js";
+import { AuthSessionOperations } from "./coordinator-auth-session.js";
+import type {
+	CoordinatorAuthAccountSignInInput,
+	CoordinatorAuthBoundLinkSessionRedeemInput,
+	CoordinatorAuthLinkSessionRedeemInput,
+	CoordinatorAuthSessionPurgeOptions,
+	CoordinatorAuthSessionScope,
+} from "./coordinator-auth-session-contract.js";
 import type {
 	CoordinatorLegacyTeamCompletionManifestV1,
 	CoordinatorLegacyTeamCompletionRecord,
@@ -359,13 +416,276 @@ async function runChanges(statement: D1PreparedStatementLike): Promise<number> {
 
 export class D1CoordinatorStore implements CoordinatorStore {
 	readonly db: D1DatabaseLike;
+	private readonly authLinks: AuthLinkOperations;
+	private readonly authSessions: AuthSessionOperations;
+	private readonly authAccountProfiles: AuthAccountProfileOperations;
+	private readonly authBrowserTransactions: CoordinatorAuthBrowserTransactions;
 
-	constructor(db: D1DatabaseLike) {
+	constructor(db: D1DatabaseLike, options: CoordinatorAuthLinkOptions = {}) {
 		this.db = db;
+		const authBackend: AuthLinkBackend = {
+			first: <T>(statement: AuthLinkStatement) =>
+				db
+					.prepare(statement.sql)
+					.bind(...statement.values)
+					.first<T>(),
+			run: (statement) => runChanges(db.prepare(statement.sql).bind(...statement.values)),
+			batch: async (statements) => {
+				if (!db.batch) throw new Error("auth_link_atomic_batch_required");
+				await db.batch(
+					statements.map((statement) => db.prepare(statement.sql).bind(...statement.values)),
+				);
+			},
+		};
+		this.authLinks = new AuthLinkOperations(authBackend, options.authClock);
+		this.authSessions = new AuthSessionOperations(authBackend, options.authClock);
+		this.authAccountProfiles = new AuthAccountProfileOperations(authBackend, options.authClock);
+		this.authBrowserTransactions = new CoordinatorAuthBrowserTransactions(
+			authBackend,
+			options.authClock,
+		);
+	}
+
+	async startAuthBrowserTransaction(
+		input: CoordinatorAuthBrowserTransactionStartInput,
+		config: CoordinatorAuthBrowserConfig,
+	) {
+		return this.authBrowserTransactions.startAuthBrowserTransaction(input, config);
+	}
+	async consumeAuthBrowserTransaction(
+		input: CoordinatorAuthBrowserTransactionConsumeInput,
+		config: CoordinatorAuthBrowserConfig,
+	) {
+		return this.authBrowserTransactions.consumeAuthBrowserTransaction(input, config);
+	}
+	async resolveAuthLinkBrowserTransaction(
+		input: CoordinatorAuthLinkBrowserTransactionResolveInput,
+		config: CoordinatorAuthBrowserConfig,
+	) {
+		return this.authBrowserTransactions.resolveAuthLinkBrowserTransaction(input, config);
+	}
+	async cancelAuthSigninBrowserTransaction(
+		input: CoordinatorAuthSigninBrowserTransactionCancelInput,
+		scope: CoordinatorAuthBrowserTransactionScope,
+	) {
+		return this.authBrowserTransactions.cancelAuthSigninBrowserTransaction(input, scope);
+	}
+	async retireAuthBrowserTransactions(
+		config: CoordinatorAuthBrowserConfig,
+		options?: CoordinatorAuthBrowserTransactionRetirementOptions,
+	) {
+		return this.authBrowserTransactions.retireAuthBrowserTransactions(config, options);
+	}
+	async purgeAuthSigninBrowserTransactions(
+		scope: CoordinatorAuthBrowserTransactionScope,
+		options?: CoordinatorAuthBrowserTransactionMaintenanceOptions,
+	) {
+		return this.authBrowserTransactions.purgeAuthSigninBrowserTransactions(scope, options);
+	}
+	async maintainAuthBrowserTransactions(
+		scope: CoordinatorAuthBrowserTransactionScope,
+		options?: CoordinatorAuthBrowserTransactionMaintenanceOptions,
+	) {
+		return this.authBrowserTransactions.maintainAuthBrowserTransactions(scope, options);
+	}
+
+	async redeemAuthLinkSession(
+		input: CoordinatorAuthLinkSessionRedeemInput,
+		config: CoordinatorAuthLinkConfig,
+	) {
+		return this.authSessions.redeemAuthLinkSession(input, config);
+	}
+	async redeemAuthLinkSessionWithBrowserTransaction(
+		input: CoordinatorAuthBoundLinkSessionRedeemInput,
+		config: CoordinatorAuthBrowserConfig,
+	) {
+		return this.authSessions.redeemAuthLinkSessionWithBrowserTransaction(input, config);
+	}
+	async preserveAuthLinkSessionCompletion(
+		input: CoordinatorAuthBoundLinkSessionRedeemInput,
+		config: CoordinatorAuthBrowserConfig,
+	) {
+		return this.authSessions.preserveAuthLinkSessionCompletion(input, config);
+	}
+	async purgeAuthGuardedSigninSessions(
+		scope: CoordinatorAuthSessionScope,
+		options?: CoordinatorAuthSessionPurgeOptions,
+	) {
+		return this.authSessions.purgeAuthGuardedSigninSessions(scope, options);
+	}
+	async purgeAuthGuardedSigninReceipts(
+		scope: CoordinatorAuthSessionScope,
+		options?: CoordinatorAuthSessionPurgeOptions,
+	) {
+		return this.authSessions.purgeAuthGuardedSigninReceipts(scope, options);
+	}
+	async signInWithAuthAccount(
+		input: CoordinatorAuthAccountSignInInput,
+		config: CoordinatorAuthLinkConfig,
+	) {
+		return this.authSessions.signInWithAuthAccount(input, config);
+	}
+	async signInWithConsumedBrowserTransaction(
+		input: CoordinatorAuthAccountSignInInput,
+		config: CoordinatorAuthBrowserConfig,
+	) {
+		return this.authSessions.signInWithConsumedBrowserTransaction(input, config);
+	}
+	async readAuthSession(credentialHash: string, config: CoordinatorAuthLinkConfig) {
+		return this.authSessions.readAuthSession(credentialHash, config);
+	}
+	async recordAuthAccountProfile(
+		input: CoordinatorAuthAccountProfileInput,
+		config: CoordinatorAuthLinkConfig,
+	) {
+		return this.authAccountProfiles.recordAuthAccountProfile(input, config);
+	}
+	async readAuthSessionAccount(credentialHash: string, config: CoordinatorAuthLinkConfig) {
+		return this.authAccountProfiles.readAuthSessionAccount(credentialHash, config);
+	}
+	async clearRevokedAuthAccountProfile(
+		input: { linkId: string },
+		scope: { coordinatorId: string },
+	) {
+		return this.authAccountProfiles.clearRevokedAuthAccountProfile(input, scope);
+	}
+	async signOutAuthSession(credentialHash: string, scope: CoordinatorAuthSessionScope) {
+		return this.authSessions.signOutAuthSession(credentialHash, scope);
+	}
+	async revokeAuthAccountLink(input: { linkId: string }, scope: CoordinatorAuthSessionScope) {
+		return this.authSessions.revokeAuthAccountLink(input, scope);
+	}
+
+	async maintainAuthLinkAttempts(
+		config: CoordinatorAuthLinkConfig,
+		options?: CoordinatorAuthLinkMaintenanceOptions,
+	) {
+		return this.authLinks.maintainAuthLinkAttempts(config, options);
+	}
+	async createAuthLinkAttempt(
+		input: CoordinatorAuthLinkCreateInput,
+		config: CoordinatorAuthLinkConfig,
+	) {
+		return this.authLinks.createAuthLinkAttempt(input, config);
+	}
+	async claimAuthLinkAttempt(
+		input: CoordinatorAuthLinkClaimInput,
+		config: CoordinatorAuthLinkConfig,
+	) {
+		return this.authLinks.claimAuthLinkAttempt(input, config);
+	}
+	async recordAuthLinkOidcVerified(
+		input: CoordinatorAuthLinkOidcInput,
+		config: CoordinatorAuthLinkConfig,
+	) {
+		return this.authLinks.recordAuthLinkOidcVerified(input, config);
+	}
+	async confirmAuthLinkAttempt(
+		input: CoordinatorAuthLinkConfirmInput,
+		config: CoordinatorAuthLinkConfig,
+	) {
+		return this.authLinks.confirmAuthLinkAttempt(input, config);
+	}
+	async readAuthLinkCompletionDestination(
+		input: CoordinatorAuthLinkClaimInput,
+		config: CoordinatorAuthLinkConfig,
+	) {
+		return this.authLinks.readAuthLinkCompletionDestination(input, config);
+	}
+	async finalizeAuthLinkAttempt(
+		input: CoordinatorAuthLinkFinalizeInput,
+		config: CoordinatorAuthLinkConfig,
+	) {
+		return this.authLinks.finalizeAuthLinkAttempt(input, config);
+	}
+	async failAuthLinkAttempt(
+		input: CoordinatorAuthLinkFailInput,
+		config: CoordinatorAuthLinkConfig,
+	) {
+		return this.authLinks.failAuthLinkAttempt(input, config);
+	}
+	async getAuthLinkAttemptStatus(
+		attemptId: string,
+		requester: CoordinatorAuthLinkRequester,
+		config: CoordinatorAuthLinkConfig,
+	) {
+		return this.authLinks.getAuthLinkAttemptStatus(attemptId, requester, config);
 	}
 
 	async close(): Promise<void> {
 		// No-op for D1 bindings.
+	}
+
+	async createAuthControllerAttestation(
+		input: CoordinatorAuthControllerReviewInput,
+	): Promise<CoordinatorAuthControllerCreateResult> {
+		const review = captureAuthControllerReview(input);
+		if (!review) return { kind: "rejected", error: "invalid_review_input" };
+		try {
+			const inserted = await runChanges(
+				this.db
+					.prepare(AUTH_CONTROLLER_INSERT_SQL)
+					.bind(...authControllerInsertValues(review, nowISO())),
+			);
+			if (inserted === 0)
+				return {
+					kind: "rejected",
+					error: review.verifiedSnapshot ? "review_stale" : "enrollment_mismatch",
+				};
+		} catch (error) {
+			if (!isAuthControllerUniqueError(error)) throw error;
+			return this.resolveAuthControllerRetry(review);
+		}
+		const attestation = await this.getActiveAuthControllerAttestation(
+			review.coordinatorId,
+			review.attestationId,
+		);
+		if (!attestation) throw new Error("auth_controller_persistence_incomplete");
+		return { kind: "created", attestation };
+	}
+
+	private async resolveAuthControllerRetry(
+		input: CoordinatorAuthControllerReviewInput,
+	): Promise<CoordinatorAuthControllerCreateResult> {
+		const row = await firstRow<CoordinatorAuthControllerAttestation>(
+			this.db.prepare(AUTH_CONTROLLER_CONFLICT_SQL).bind(...authControllerConflictValues(input)),
+		);
+		const result = authControllerRetryResult(input, row);
+		if (result.kind === "rejected") return result;
+		const active = await firstRow<CoordinatorAuthControllerAttestation>(
+			this.db
+				.prepare(AUTH_CONTROLLER_RETRY_ACTIVE_SQL)
+				.bind(...authControllerRetryActiveValues(input)),
+		);
+		// A change after the conflict read makes this review stale, including revocation.
+		if (!active)
+			return {
+				kind: "rejected",
+				error: input.verifiedSnapshot ? "review_stale" : "enrollment_mismatch",
+			};
+		return authControllerRetryResult(input, active);
+	}
+
+	async getActiveAuthControllerAttestation(
+		coordinatorId: string,
+		attestationId: string,
+	): Promise<CoordinatorAuthControllerAttestation | null> {
+		if (!isAuthControllerId(coordinatorId) || !isAuthControllerId(attestationId)) return null;
+		return firstRow<CoordinatorAuthControllerAttestation>(
+			this.db.prepare(AUTH_CONTROLLER_ACTIVE_SQL).bind(coordinatorId, attestationId),
+		);
+	}
+
+	async revokeAuthControllerAttestation(
+		coordinatorId: string,
+		attestationId: string,
+	): Promise<boolean> {
+		if (!isAuthControllerId(coordinatorId) || !isAuthControllerId(attestationId)) return false;
+		return (
+			(await runChanges(
+				this.db.prepare(AUTH_CONTROLLER_REVOKE_SQL).bind(nowISO(), coordinatorId, attestationId),
+			)) > 0
+		);
 	}
 
 	async createGroup(_groupId: string, _displayName?: string | null): Promise<void> {

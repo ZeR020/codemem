@@ -54,6 +54,43 @@ export interface RequestJsonOptions {
 	maxResponseBytes?: number;
 }
 
+function isolateDirectPeerConnection(headers: Record<string, string>): Record<string, string> {
+	const isDirectPeer = Object.keys(headers).some(
+		(name) => name.toLowerCase() === "x-codemem-recipient",
+	);
+	if (!isDirectPeer) return headers;
+
+	// Sync preparation can block expiry callbacks past a peer's idle deadline.
+	// Close reads too, so a later write cannot reuse their expired connection.
+	return {
+		...Object.fromEntries(
+			Object.entries(headers).filter(([name]) => name.toLowerCase() !== "connection"),
+		),
+		Connection: "close",
+	};
+}
+
+function requestRedirectPolicy(headers: Record<string, string>): "error" | "follow" {
+	const carriesAdminCredential = Object.keys(headers).some(
+		(name) => name.toLowerCase() === "x-codemem-coordinator-admin",
+	);
+	if (carriesAdminCredential) return "error";
+	return "follow";
+}
+
+function buildRequestHeaders(options: {
+	headers?: Record<string, string>;
+	bodyBytes?: Uint8Array;
+}): Record<string, string> {
+	const headers: Record<string, string> = { Accept: "application/json" };
+	if (options.bodyBytes != null) {
+		headers["Content-Type"] = "application/json";
+		headers["Content-Length"] = String(options.bodyBytes.byteLength);
+	}
+	if (options.headers) Object.assign(headers, options.headers);
+	return headers;
+}
+
 /**
  * Send an HTTP request and parse the JSON response.
  *
@@ -72,22 +109,14 @@ export async function requestJson(
 		bodyBytes = new TextEncoder().encode(JSON.stringify(body));
 	}
 
-	const requestHeaders: Record<string, string> = {
-		Accept: "application/json",
-	};
-	if (bodyBytes != null) {
-		requestHeaders["Content-Type"] = "application/json";
-		requestHeaders["Content-Length"] = String(bodyBytes.byteLength);
-	}
-	if (headers) {
-		Object.assign(requestHeaders, headers);
-	}
+	const requestHeaders = buildRequestHeaders({ headers, bodyBytes });
 	const requestBody = (bodyBytes ?? null) as RequestInit["body"] | null;
 
 	const response = await fetch(url, {
 		method,
-		headers: requestHeaders,
+		headers: isolateDirectPeerConnection(requestHeaders),
 		body: requestBody,
+		redirect: requestRedirectPolicy(requestHeaders),
 		signal: AbortSignal.timeout(Math.round(timeoutS * 1_000)),
 	});
 

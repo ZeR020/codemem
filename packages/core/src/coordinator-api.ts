@@ -7,6 +7,16 @@
 
 import type { Context } from "hono";
 import { Hono } from "hono";
+import { registerCoordinatorAuthControllerReviewRoutes } from "./coordinator-auth-controller-review-route.js";
+import type {
+	CoordinatorBrowserAuth,
+	CoordinatorBrowserAuthClientKey,
+} from "./coordinator-browser-auth-app.js";
+import {
+	type CoordinatorDeviceAuthLinkOptions,
+	type CoordinatorDeviceAuthLinkStore,
+	registerCoordinatorDeviceAuthLinkRoutes,
+} from "./coordinator-device-auth-link.js";
 import type { InvitePayload } from "./coordinator-invites.js";
 import { encodeInvitePayload, inviteLink } from "./coordinator-invites.js";
 import type { CoordinatorLegacyTeamCompletionManifestV1 } from "./coordinator-legacy-team-completion.js";
@@ -80,6 +90,64 @@ export interface CreateCoordinatorAppOptions {
 	runtime: CoordinatorRuntimeDeps;
 	requestVerifier: CoordinatorRequestVerifier;
 	requestRateLimit?: CoordinatorRequestRateLimitOptions;
+	authLink?: CoordinatorDeviceAuthLinkOptions;
+	browserAuth?: CoordinatorAppBrowserAuthOptions;
+}
+export type CoordinatorAppBrowserAuthOptions =
+	| {
+			kind: "ready";
+			auth: CoordinatorBrowserAuth;
+			storeFactory: () => CoordinatorDeviceAuthLinkStore;
+			clientKey: CoordinatorBrowserAuthClientKey;
+	  }
+	| { kind: "unavailable" };
+
+function registerOptionalCoordinatorAuth(
+	app: Hono,
+	opts: CreateCoordinatorAppOptions,
+	deps: Omit<
+		Parameters<typeof registerCoordinatorDeviceAuthLinkRoutes>[1],
+		"config" | "storeFactory"
+	>,
+): void {
+	if (opts.authLink && opts.browserAuth) throw new Error("coordinator_auth_configuration_conflict");
+	if (opts.browserAuth?.kind === "unavailable") {
+		for (const path of [
+			"/auth/*",
+			"/v1/auth/link-attempts",
+			"/v1/auth/link-attempts/*",
+			"/v1/admin/auth-controller-reviews",
+		]) {
+			app.all(
+				path,
+				() =>
+					new Response("Authentication unavailable. Try again.", {
+						status: 503,
+						headers: {
+							"Cache-Control": "no-store",
+							"Referrer-Policy": "no-referrer",
+							"X-Content-Type-Options": "nosniff",
+							"Content-Type": "text/plain;charset=utf-8",
+						},
+					}),
+			);
+		}
+		return;
+	}
+	const ready = opts.browserAuth;
+	const authLink =
+		ready?.kind === "ready"
+			? { config: ready.auth.storeConfig, storeFactory: ready.storeFactory }
+			: opts.authLink;
+	if (authLink?.config.enabled) {
+		registerCoordinatorDeviceAuthLinkRoutes(app, { ...deps, ...authLink });
+		registerCoordinatorAuthControllerReviewRoutes(app, {
+			...deps,
+			...authLink,
+			adminSecret: () => opts.runtime.adminSecret(),
+		});
+	}
+	if (ready?.kind === "ready") ready.auth.register(app, ready.clientKey);
 }
 
 export interface CoordinatorVerifyRequestInput {
@@ -225,6 +293,40 @@ function authErrorStatus(error: string): 401 | 403 | 409 {
 // App factory
 // ---------------------------------------------------------------------------
 
+async function readRequestBytes(c: Context, maxBytes = MAX_BODY_BYTES): Promise<Uint8Array | null> {
+	const contentLength = Number.parseInt(c.req.header("content-length") ?? "", 10);
+	if (Number.isFinite(contentLength) && contentLength > maxBytes) {
+		return null;
+	}
+	const stream = c.req.raw.body;
+	if (!stream) return new Uint8Array();
+	const reader = stream.getReader();
+	const chunks: Uint8Array[] = [];
+	let total = 0;
+	try {
+		while (true) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			if (!value) continue;
+			total += value.byteLength;
+			if (total > maxBytes) {
+				await reader.cancel();
+				return null;
+			}
+			chunks.push(value);
+		}
+	} finally {
+		reader.releaseLock();
+	}
+	const combined = new Uint8Array(total);
+	let offset = 0;
+	for (const chunk of chunks) {
+		combined.set(chunk, offset);
+		offset += chunk.byteLength;
+	}
+	return combined;
+}
+
 export function createCoordinatorApp(
 	opts?: CreateCoordinatorAppOptions,
 ): InstanceType<typeof Hono> {
@@ -272,43 +374,6 @@ export function createCoordinatorApp(
 		return c.json({ error: "rate_limited", retry_after_s: result.retryAfterS }, 429);
 	}
 
-	async function readRequestBytes(
-		c: Context,
-		maxBytes = MAX_BODY_BYTES,
-	): Promise<Uint8Array | null> {
-		const contentLength = Number.parseInt(c.req.header("content-length") ?? "", 10);
-		if (Number.isFinite(contentLength) && contentLength > maxBytes) {
-			return null;
-		}
-		const stream = c.req.raw.body;
-		if (!stream) return new Uint8Array();
-		const reader = stream.getReader();
-		const chunks: Uint8Array[] = [];
-		let total = 0;
-		try {
-			while (true) {
-				const { done, value } = await reader.read();
-				if (done) break;
-				if (!value) continue;
-				total += value.byteLength;
-				if (total > maxBytes) {
-					await reader.cancel();
-					return null;
-				}
-				chunks.push(value);
-			}
-		} finally {
-			reader.releaseLock();
-		}
-		const combined = new Uint8Array(total);
-		let offset = 0;
-		for (const chunk of chunks) {
-			combined.set(chunk, offset);
-			offset += chunk.byteLength;
-		}
-		return combined;
-	}
-
 	function parseJsonObject(raw: Uint8Array): Record<string, unknown> | null {
 		try {
 			const data: unknown = JSON.parse(textDecoder.decode(raw));
@@ -320,6 +385,15 @@ export function createCoordinatorApp(
 			return null;
 		}
 	}
+
+	registerOptionalCoordinatorAuth(app, opts, {
+		authorizeRequest: (store, request) =>
+			authorizeRequest(store, runtime, requestVerifier, request),
+		authErrorStatus,
+		readRequestBytes,
+		parseJsonObject,
+		rateLimitedResponse: (c, key, options) => rateLimitedResponse(c, key, options.authenticated),
+	});
 
 	function optionalString(data: Record<string, unknown>, key: string): string | null {
 		const value = data[key];

@@ -4,7 +4,7 @@ This page covers advanced plugin behavior, environment variables, and stream rel
 
 ## Observer and settings UI
 
-<img src="images/codemem-settings.png" alt="codemem observer settings" width="520" />
+See the [Settings guide](user-guide.md#settings-modal) for connection modes, model choices, and save/apply behavior.
 
 ## Running OpenCode with the plugin
 
@@ -45,6 +45,11 @@ Troubleshooting:
 - **No notifications on OpenCode 2.** OpenCode 2 loads `@codemem/opencode-plugin/tui` automatically beside the server plugin. The companion subscribes to the server plugin's location-scoped RPC notices and replays notices emitted during startup. Restart the TUI after installing or upgrading the plugin; notification delivery is best-effort and does not affect capture or recall.
 - **Duplicate registration warning.** `codemem duplicate plugin registration skipped` in `~/.codemem/plugin.log` means OpenCode loaded Codemem twice for one project, usually a configured npm entry plus a checkout-local copy. Remove one of them. The first server registration owns notifications as well as capture and recall.
 - **Capture looks stalled on either host.** Run `codemem db raw-events-status` and follow the [post-restart config sanity checklist](#post-restart-config-sanity-checklist); both hosts share the same raw-event pipeline and spool behavior.
+- **Raw-event POST returns `409 viewer_identity_mismatch`.** Check that the viewer and host use the same database, home, device, actor, runtime/workspace, and embedding settings. An older viewer may reject a host with no `CODEMEM_CONFIG` override when the viewer explicitly sets the same default config file.
+
+  Update the viewer receiver and restart only its owning service, keeping OpenCode running so memory-only events survive. After the viewer recovers, reach a normal session boundary to retry retained events and check backlog status; keep spool files until delivery is confirmed.
+
+  The receiver accepts an omitted override only when the explicit path matches the core config resolver's implicit read path, including workspace/runtime fallback and JSON/JSONC selection; it does not ignore different configs or other identity fields. The core global fallback is `~/.config/codemem/config.json` (or `config.jsonc` when JSON is absent), not `XDG_CONFIG_HOME`.
 
 Rollback:
 
@@ -675,9 +680,9 @@ Failure semantics:
 
 When ingesting plugin payloads, CodeMem stores a normalized project label instead of a full path.
 
-- Path-like labels are reduced to the basename (for example, `/Users/adam/workspace/codemem` -> `codemem`).
+- Path-like labels are reduced to the basename (for example, `/home/user/projects/example` -> `example`).
 - Windows-style paths are normalized with Windows path rules on every OS runtime.
-  - `C:\Users\adam\workspace\codemem` -> `codemem`
+  - `C:\Users\user\projects\example` -> `example`
   - `D:/dev/client-demo` -> `client-demo`
   - `\\server\share\team\project-x` -> `project-x`
 - `CODEMEM_PROJECT` still has highest precedence and is normalized the same way.

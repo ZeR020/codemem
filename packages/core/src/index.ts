@@ -35,11 +35,29 @@ export {
 	mapCodexHookPayload,
 } from "./codex-hooks.js";
 export type {
+	CoordinatorAccountLinkReceiver,
+	CoordinatorAccountLinkReceiverOptions,
+} from "./coordinator-account-link-receiver.js";
+export {
+	createCoordinatorAccountLinkReceiver,
+	normalizeCoordinatorAccountLinkOrigin,
+} from "./coordinator-account-link-receiver.js";
+export type {
+	LinkCoordinatorAccountOptions,
+	LinkCoordinatorAccountResult,
+} from "./coordinator-account-link-runtime.js";
+export {
+	CoordinatorAccountLinkError,
+	linkCoordinatorAccount,
+} from "./coordinator-account-link-runtime.js";
+export type {
+	CoordinatorAuthControllerReviewActionOptions,
 	CoordinatorConsumedTeamInvite,
 	CoordinatorReviewedRecipientInviteEvidence,
 } from "./coordinator-actions.js";
 export {
 	coordinatorArchiveGroupAction,
+	coordinatorAuthControllerReviewAction,
 	coordinatorCreateAddDeviceInviteAction,
 	coordinatorCreateGroupAction,
 	coordinatorCreateInviteAction,
@@ -78,6 +96,13 @@ export type {
 	CreateCoordinatorAppOptions,
 } from "./coordinator-api.js";
 export { createCoordinatorApp } from "./coordinator-api.js";
+export type {
+	CoordinatorControllerReviewDeps,
+	CoordinatorControllerReviewPreview,
+	CoordinatorControllerReviewReason,
+	CoordinatorControllerReviewStore,
+} from "./coordinator-auth-controller-review-route.js";
+export { registerCoordinatorAuthControllerReviewRoutes } from "./coordinator-auth-controller-review-route.js";
 export type {
 	CoordinatorEnrollmentReconcileIssue,
 	CoordinatorEnrollmentReconcileResult,
@@ -130,6 +155,11 @@ export {
 	normalizeCoordinatorLegacyTeamCompletionGroupIds,
 	normalizeCoordinatorLegacyTeamCompletionManifest,
 } from "./coordinator-legacy-team-completion.js";
+export type {
+	CoordinatorOwnerReviewLocalEvidence,
+	CoordinatorOwnerReviewLocalOptions,
+} from "./coordinator-owner-review-local.js";
+export { readCoordinatorOwnerReviewLocalEvidence } from "./coordinator-owner-review-local.js";
 export {
 	coordinatorEnabled,
 	coordinatorStatusSnapshot,

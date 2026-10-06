@@ -132,6 +132,8 @@ codemem status --db-path ./codemem.sqlite --config ./codemem.json
 - OpenAI tier routing defaults to `gpt-6-luna` for simple batches and `gpt-5.6-terra` for rich batches.
 - Rich routing defaults to 12,000 output tokens, while an explicit global `observer_max_output_tokens` setting or benchmark `--max-output-tokens` override applies to both tiers; `observer_rich_max_output_tokens` remains the highest-priority rich-only override.
 - Official OpenAI direct API tiers always use Responses and explicitly send reasoning effort `medium` unless you configure a different effort. OAuth `codex_consumer` requests also remain on Responses. `observer_openai_use_responses: false` is only a custom-gateway compatibility setting: it selects chat completions when `observer_base_url` explicitly points to an OpenAI-compatible gateway, and official OpenAI cannot opt out of Responses. Chat-completions requests do not report reasoning effort or summary because those controls are not transmitted.
+- When explicit tier routing keeps the same custom provider, both tiers preserve its `observer_openai_use_responses` setting. Set it to `true` for a Responses-only gateway; changing the tier provider does not carry the base provider's protocol choice to a different custom provider.
+- When tier routing uses a custom provider whose gateway rejects `temperature`, set `observer_temperature`, `observer_simple_temperature`, and `observer_rich_temperature` to JSON `null` in your config file to use model defaults without changing models, authentication, or protocol. Null tier temperatures inherit the global temperature; omitting the global setting still defaults to `0.2`, and numeric temperature environment overrides take precedence.
 - Observer output defaults to `legacy_xml` during the compatibility rollout. Set `observer_output_mode` or `CODEMEM_OBSERVER_OUTPUT_MODE` to `auto` to use a validated JSON envelope on official OpenAI Responses and direct Anthropic API-key paths while keeping sidecars, OAuth consumers, and unknown gateways on XML; use `json_schema` only when explicitly enabling a compatible custom gateway.
 - `json_schema` is an operator assertion that a custom OpenAI gateway configured through `observer_base_url`, or an Anthropic gateway configured through `CODEMEM_ANTHROPIC_ENDPOINT`, implements its provider's required JSON Schema contract. Codemem does not probe or infer this support from the gateway name. A refusal, truncation, missing response, invalid JSON, or locally invalid envelope fails closed and leaves existing raw-event retry behavior in control; Codemem does not reinterpret malformed constrained output as XML.
 - Codemem defines a provider-neutral forced `record_memories` tool using the same envelope and rejects anything other than one valid call. This transport is not enabled for any provider/runtime cell yet; sidecars, OAuth consumers, and other unproven paths stay on XML until executable contract tests exist.
@@ -306,6 +308,7 @@ The normal flow is **Projects → Sharing → Devices → Health**, not manual p
 - **Team onboarding** — create or join a Team when people will collaborate over time.
   - Accepting the Team invitation links the recipient's Identity and device and inherits every current and future Project assigned to that Team.
   - The invitation does not create Project-to-Team assignments. Manage those separately, and review the Team's Projects before sending or accepting the invitation.
+  - Team invitation previews group matching Project display names into one row, combine their memory counts, and show how many distinct Project identities the row covers. This summary does not merge Project identities or change access; matching names alone do not prove that repositories are the same.
 - **Direct Project sharing** — once Team sharing is configured, use **Share exact Projects** to invite one Identity to exact Projects without adding the recipient to the Team.
 - **Add device** — invite another device for an existing Identity and review the Projects it will inherit from that Identity's direct and Team access.
 
@@ -547,7 +550,7 @@ When selected history may already have replicated, all participating owner devic
 
 - codemem does not ship a `sync install` helper in the TS CLI.
 - Use an OS service manager to run `codemem serve start --foreground` at login/boot.
-- Example service templates live in `docs/autostart/launchd/` and `docs/autostart/systemd/`.
+- Follow the [autostart template guide](autostart/README.md) to customize executable paths, runtime environment, and logs before installing an OS service.
 
 ### Diagnostics
 
@@ -579,6 +582,47 @@ When selected history may already have replicated, all participating owner devic
 - See [docs/coordinator-discovery.md](coordinator-discovery.md) for setup, config, and current limitations.
 - See [docs/anchor-peer-deployment.md](anchor-peer-deployment.md) if you want an always-on peer as a sync backstop for personal or team Sharing domains.
 - Do **not** expose the viewer itself just because the coordinator or sync protocol needs cross-network reachability; those are separate surfaces.
+
+### Optional coordinator account linking
+
+This advanced operator flow is off by default. The commands do not configure Google or deploy a coordinator; an operator must first enable optional account linking on the coordinator. Local memory and direct sync do not require Google.
+
+Preview the existing device owner before linking. The group name is the coordinator administrative group, not a Team permission or an access grant:
+
+```fish
+codemem coordinator review-device-owner team-alpha --coordinator "https://coord.example.com" --json
+```
+
+The preview reads the existing local device database and current Identity, then asks the coordinator to preview the review. It does not run database maintenance, change configuration or credentials, rotate keys, adopt an Identity, move memories, or change ownership or grants. It uses the configured coordinator-admin credential; do not put that credential in the command or output.
+
+Without `--json`, the interactive prompt defaults to **No**. Only an operator confirmation writes a coordinator controller review; it does not write an actor, grant, or Identity/device ownership record. Noninteractive and JSON calls remain preview-only.
+
+Ambiguous ownership stops the review. If ownership records disappear or change during the prompt, the command stops and requires a fresh preview; it never migrates legacy records automatically.
+
+After a successful review, linking is a separate opt-in step. Reuse the exact `--coordinator`, `--config`, and `--db-path` selections (including `-d`) used for review, and choose the intended Google account in the browser:
+
+```fish
+codemem coordinator link-account team-alpha --coordinator "https://coord.example.com"
+```
+
+Add the same `--config` and `--db-path` options only if the review used them.
+Keep `CODEMEM_KEYS_DIR` unchanged when selecting existing device keys.
+Both commands also honor `CODEMEM_SYNC_COORDINATOR_URL`;
+keep that setting unchanged between review and linking.
+
+If linking says this device needs an active owner review, run the review on this
+device with the same group and settings, then retry linking.
+
+If review conflicts, is revoked, or stops, contact the coordinator operator. A
+rejected link does not replace an existing link; do not create another Identity,
+key, or credential to work around it.
+
+An account-link conflict can involve either the Google account or the coordinator
+Identity, including a revoked binding. If this account already belongs to the
+intended Identity, sign in at the configured coordinator's `/auth/sign-in`;
+otherwise ask the operator. These commands cannot replace or remove account links.
+
+See [Coordinator-backed discovery](coordinator-discovery.md#optional-account-linking) for the link-session limits and privacy rules.
 
 ### Keychain (optional)
 
