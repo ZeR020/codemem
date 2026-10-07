@@ -103,6 +103,7 @@ export type {
 	CoordinatorControllerReviewStore,
 } from "./coordinator-auth-controller-review-route.js";
 export { registerCoordinatorAuthControllerReviewRoutes } from "./coordinator-auth-controller-review-route.js";
+export { parseBootstrapExpiry } from "./coordinator-bootstrap-grant-authorization.js";
 export type {
 	CoordinatorEnrollmentReconcileIssue,
 	CoordinatorEnrollmentReconcileResult,
@@ -185,6 +186,9 @@ export {
 } from "./coordinator-runtime.js";
 export type {
 	CoordinatorAuthorizedNonceResult,
+	CoordinatorBootstrapGrantAuthorizationError,
+	CoordinatorBootstrapGrantAuthorizationInput,
+	CoordinatorBootstrapGrantAuthorizationResult,
 	CoordinatorBootstrapGrantVerification,
 	CoordinatorConsumeProjectInviteInput,
 	CoordinatorCreateDeviceRevocationInput,
@@ -772,6 +776,14 @@ export {
 	resolvePiAgentDir,
 	resolvePiObserverConfig,
 } from "./pi-observer-config.js";
+export type {
+	ImportPiSessionsOptions,
+	ParsedPiSession,
+	PiImportProgress,
+	PiImportSummary,
+	PiSessionMessage,
+} from "./pi-sessions-import.js";
+export { importPiSessions, parsePiSessionJsonl } from "./pi-sessions-import.js";
 export type {
 	BlockedPolicyTeamDeviceEligibilityResult,
 	DerivePolicyTeamDeviceEligibilityInput,

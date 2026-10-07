@@ -85,6 +85,24 @@ import {
 	type CoordinatorAuthSessionScope,
 } from "./coordinator-auth-session-contract.js";
 import {
+	BOOTSTRAP_AUTHORIZATION_SOURCE_SQL,
+	type BootstrapAuthorizationRow,
+	bootstrapAuthorizationDecision,
+	bootstrapAuthorizationResult,
+	bootstrapAuthorizationSourceError,
+	captureBootstrapAuthorizationInput,
+	rejectBootstrapAuthorization,
+} from "./coordinator-bootstrap-grant-authorization.js";
+import {
+	BOOTSTRAP_PARTICIPANT_SOURCE_SQL,
+	BOOTSTRAP_PARTICIPANTS_REVOKED_SQL,
+	BOOTSTRAP_RAW_INSERT_SQL,
+	type BootstrapParticipantSource,
+	bootstrapRawInsertValues,
+	captureBootstrapParticipantSource,
+} from "./coordinator-bootstrap-grant-issuance.js";
+import { COORDINATOR_DEVICE_OWNERSHIP_SCHEMA_SQL } from "./coordinator-device-ownership-schema.js";
+import {
 	type CoordinatorCreateDeviceRevocationInput,
 	type CoordinatorListDeviceRevocationsInput,
 	type CoordinatorRecordAuthorizedNonceInput,
@@ -108,6 +126,18 @@ import {
 	IDENTITY_GROUP_GRANT_SOURCE_SQL,
 } from "./coordinator-identity-group-grant.js";
 import { joinReviewGuardEvidence } from "./coordinator-join-review-guards.js";
+import {
+	assertLegacyDeviceScope,
+	captureLegacyEnrollment,
+	captureLegacyEnrollmentPublicKey,
+	DEVICE_OWNERSHIP_SUBJECT_EXISTS_SQL,
+	LEGACY_DEVICE_DENIAL_SQL,
+	LEGACY_ENROLLMENT_DENIAL_SQL,
+	LEGACY_ENROLLMENT_WRITE_SQL,
+	legacyDeviceAuthorizationFailure,
+	legacyDeviceDenial,
+	legacyDeviceWriteChanges,
+} from "./coordinator-legacy-device-ownership.js";
 import type {
 	CoordinatorLegacyTeamCompletionManifestV1,
 	CoordinatorLegacyTeamCompletionRecord,
@@ -135,9 +165,18 @@ import {
 	normalizeMembershipEffectId,
 	revokeMembershipEffectRequestJson,
 } from "./coordinator-membership-effects.js";
+import {
+	CAPTURE_PEER_ENROLLMENTS_SQL,
+	type CapturedPeerEnrollment,
+	capturePeerEnrollments,
+	READ_CURRENT_PEERS_SQL,
+	requirePeerDiscoveryRows,
+} from "./coordinator-peer-discovery.js";
 import { projectInviteGuardEvidence } from "./coordinator-project-invite-guards.js";
 import type {
 	CoordinatorBootstrapGrant,
+	CoordinatorBootstrapGrantAuthorizationInput,
+	CoordinatorBootstrapGrantAuthorizationResult,
 	CoordinatorConsumeProjectInviteInput,
 	CoordinatorConsumeRecipientInviteInput,
 	CoordinatorCreateBootstrapGrantInput,
@@ -361,21 +400,29 @@ function insertBootstrapGrantSync(
 	opts: CoordinatorCreateBootstrapGrantInput,
 	requestedGrantId?: string,
 	requestedCreatedAt?: string,
+	authorization?: { sql: string; values: (string | null)[]; assertAuthorized: () => void },
 ): CoordinatorBootstrapGrant {
 	const normalized = normalizeCoordinatorBootstrapGrantInput(opts);
 	const grantId = requestedGrantId ?? tokenUrlSafe(12);
 	const createdAt = requestedCreatedAt ?? nowISO();
-	db.prepare(`INSERT INTO coordinator_bootstrap_grants(
+	const result = db
+		.prepare(`INSERT INTO coordinator_bootstrap_grants(
 			grant_id, group_id, seed_device_id, worker_device_id, expires_at, created_at, created_by, revoked_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, NULL)`).run(
-		grantId,
-		normalized.groupId,
-		normalized.seedDeviceId,
-		normalized.workerDeviceId,
-		normalized.expiresAt,
-		createdAt,
-		normalized.createdBy,
-	);
+		) SELECT ?, ?, ?, ?, ?, ?, ?, NULL WHERE ${authorization?.sql ?? "1"}`)
+		.run(
+			grantId,
+			normalized.groupId,
+			normalized.seedDeviceId,
+			normalized.workerDeviceId,
+			normalized.expiresAt,
+			createdAt,
+			normalized.createdBy,
+			...(authorization?.values ?? []),
+		);
+	if (authorization && result.changes === 0) {
+		authorization.assertAuthorized();
+		throw new Error("invite_acceptance_incomplete");
+	}
 	const row = db
 		.prepare(`SELECT grant_id, group_id, seed_device_id, worker_device_id, expires_at, created_at, created_by, revoked_at
 			 FROM coordinator_bootstrap_grants WHERE grant_id = ?`)
@@ -420,9 +467,14 @@ function upgradeAuthLinkBrowserStartSchema(db: DatabaseType): void {
 	}).immediate();
 }
 
+function initializeDeviceLedgerSchemas(db: DatabaseType): void {
+	db.exec(COORDINATOR_DEVICE_OWNERSHIP_SCHEMA_SQL);
+	db.exec(DEVICE_REVOCATION_SCHEMA_SQL);
+}
+
 function initializeSchema(db: DatabaseType): void {
 	db.exec(IDENTITY_GROUP_GRANT_SCHEMA_SQL);
-	db.exec(DEVICE_REVOCATION_SCHEMA_SQL);
+	initializeDeviceLedgerSchemas(db);
 	db.exec(AUTH_CONTROLLER_SCHEMA_SQL);
 	upgradeAuthLinkBrowserStartSchema(db);
 	db.exec(AUTH_LINK_SCHEMA_SQL);
@@ -944,38 +996,51 @@ export class BetterSqliteCoordinatorStore implements CoordinatorStore {
 	}
 
 	private enrollDeviceSync(groupId: string, opts: CoordinatorEnrollDeviceInput): void {
-		const { deviceId, publicKey, fingerprint, identityId, displayName } = opts;
-		const keyId = enrollmentRevocationKeyId(publicKey);
-		const result = this.db
-			.prepare(`INSERT INTO enrolled_devices(
-					group_id, device_id, public_key, fingerprint, identity_id, display_name, enabled, created_at
-				) SELECT ?, ?, ?, ?, ?, ?, 1, ?
-				WHERE NOT ${DEVICE_REVOCATION_SUBJECT_EXISTS_SQL}
-				ON CONFLICT(group_id, device_id) DO UPDATE SET
-					public_key = excluded.public_key,
-					fingerprint = excluded.fingerprint,
-					identity_id = COALESCE(enrolled_devices.identity_id, excluded.identity_id),
-					display_name = excluded.display_name,
-					enabled = 1
-				WHERE excluded.identity_id IS NULL
-					OR enrolled_devices.identity_id IS NULL
-					OR enrolled_devices.identity_id = excluded.identity_id`)
-			.run(
-				groupId,
-				deviceId,
-				publicKey,
-				fingerprint,
-				identityId ?? null,
-				displayName ?? null,
-				nowISO(),
-				deviceId,
-				keyId,
+		const { deviceId, publicKey, fingerprint, identityId, displayName } = captureLegacyEnrollment(
+			groupId,
+			opts,
+		);
+		try {
+			const currentPublicKey = captureLegacyEnrollmentPublicKey(
+				this.db
+					.prepare("SELECT public_key FROM enrolled_devices WHERE group_id = ? AND device_id = ?")
+					.get(groupId, deviceId) ?? null,
 			);
-		if (result.changes !== 0) return;
-		const revoked = this.db
-			.prepare(`SELECT 1 WHERE ${DEVICE_REVOCATION_SUBJECT_EXISTS_SQL}`)
-			.get(deviceId, keyId);
-		throw new Error(revoked ? "device_revoked" : "invite_identity_conflict");
+			const keyId = enrollmentRevocationKeyId(publicKey);
+			const currentKeyId =
+				currentPublicKey === null ? null : enrollmentRevocationKeyId(currentPublicKey);
+			const source = [currentPublicKey, groupId, deviceId, groupId, deviceId, currentPublicKey];
+			const result = this.db
+				.prepare(LEGACY_ENROLLMENT_WRITE_SQL)
+				.run(
+					groupId,
+					deviceId,
+					publicKey,
+					fingerprint,
+					identityId ?? null,
+					displayName ?? null,
+					nowISO(),
+					deviceId,
+					keyId,
+					deviceId,
+					keyId,
+					deviceId,
+					currentKeyId,
+					...source,
+					deviceId,
+					keyId,
+					deviceId,
+					currentKeyId,
+					currentPublicKey,
+				);
+			if (legacyDeviceWriteChanges({ meta: result }) === 1) return;
+			const denial = this.db
+				.prepare(LEGACY_ENROLLMENT_DENIAL_SQL)
+				.get(deviceId, keyId, deviceId, keyId, deviceId, currentKeyId, ...source);
+			throw new Error(legacyDeviceDenial(denial));
+		} catch (error) {
+			legacyDeviceAuthorizationFailure(error);
+		}
 	}
 
 	async close(): Promise<void> {
@@ -1218,7 +1283,12 @@ export class BetterSqliteCoordinatorStore implements CoordinatorStore {
 	}
 
 	async enrollDevice(groupId: string, opts: CoordinatorEnrollDeviceInput): Promise<void> {
-		this.db.transaction(() => this.enrollDeviceSync(groupId, opts)).immediate();
+		const input = captureLegacyEnrollment(groupId, opts);
+		try {
+			this.db.transaction(() => this.enrollDeviceSync(groupId, input)).immediate();
+		} catch (error) {
+			legacyDeviceAuthorizationFailure(error);
+		}
 	}
 
 	async listEnrolledDevices(
@@ -1261,22 +1331,39 @@ export class BetterSqliteCoordinatorStore implements CoordinatorStore {
 	}
 
 	async setDeviceEnabled(groupId: string, deviceId: string, enabled: boolean): Promise<boolean> {
+		assertLegacyDeviceScope(groupId, deviceId);
+		if (typeof enabled !== "boolean") throw new Error("invalid_input");
 		if (enabled) {
-			return this.db
-				.transaction(() => {
-					const enrollment = this.db
-						.prepare("SELECT public_key FROM enrolled_devices WHERE group_id = ? AND device_id = ?")
-						.get(groupId, deviceId) as { public_key: string } | undefined;
-					if (!enrollment) return false;
-					const keyId = enrollmentRevocationKeyId(enrollment.public_key);
-					const result = this.db
-						.prepare(`UPDATE enrolled_devices SET enabled = 1
+			try {
+				return this.db
+					.transaction(() => {
+						const enrollment = this.db
+							.prepare(
+								"SELECT public_key FROM enrolled_devices WHERE group_id = ? AND device_id = ?",
+							)
+							.get(groupId, deviceId) as { public_key: string } | undefined;
+						if (!enrollment) return false;
+						const publicKey = enrollment.public_key;
+						if (typeof publicKey !== "string")
+							throw new Error("device_ownership_authorization_unavailable");
+						const keyId = enrollmentRevocationKeyId(publicKey);
+						const result = this.db
+							.prepare(`UPDATE enrolled_devices SET enabled = 1
 						WHERE group_id = ? AND device_id = ? AND public_key = ?
-						AND NOT ${DEVICE_REVOCATION_SUBJECT_EXISTS_SQL}`)
-						.run(groupId, deviceId, enrollment.public_key, deviceId, keyId);
-					return result.changes > 0;
-				})
-				.immediate();
+						AND NOT ${DEVICE_REVOCATION_SUBJECT_EXISTS_SQL}
+						AND NOT ${DEVICE_OWNERSHIP_SUBJECT_EXISTS_SQL}`)
+							.run(groupId, deviceId, publicKey, deviceId, keyId, deviceId, keyId);
+						if (legacyDeviceWriteChanges({ meta: result }) === 1) return true;
+						const denial = legacyDeviceDenial(
+							this.db.prepare(LEGACY_DEVICE_DENIAL_SQL).get(deviceId, keyId, deviceId, keyId),
+						);
+						if (denial === "device_ownership_requires_verified_identity") throw new Error(denial);
+						return false;
+					})
+					.immediate();
+			} catch (error) {
+				legacyDeviceAuthorizationFailure(error);
+			}
 		}
 		const result = this.db
 			.prepare(`UPDATE enrolled_devices SET enabled = ?
@@ -1537,6 +1624,61 @@ export class BetterSqliteCoordinatorStore implements CoordinatorStore {
 		return subjects;
 	}
 
+	private getRecipientInviteById(inviteId: string): CoordinatorInvite {
+		return this.db
+			.prepare(`SELECT ${INVITE_COLUMNS} FROM coordinator_invites WHERE invite_id = ?`)
+			.get(inviteId) as CoordinatorInvite;
+	}
+
+	private getRecipientInviteBootstrapGrant(grantId: string): CoordinatorBootstrapGrant | null {
+		const row = this.db
+			.prepare(`SELECT grant_id, group_id, seed_device_id, worker_device_id,
+			expires_at, created_at, created_by, revoked_at FROM coordinator_bootstrap_grants WHERE grant_id = ?`)
+			.get(grantId) as CoordinatorBootstrapGrant | undefined;
+		return row ?? null;
+	}
+
+	private assertRecipientInviteAuthorized(
+		invite: CoordinatorInvite,
+		opts: CoordinatorConsumeRecipientInviteInput,
+		subjects: (string | null)[],
+	): void {
+		this.validateRecipientInviteParticipants(invite, opts);
+		try {
+			const row = this.db
+				.prepare(`SELECT (${DEVICE_REVOCATION_SUBJECT_EXISTS_SQL}
+				OR ${DEVICE_REVOCATION_SUBJECT_EXISTS_SQL}) AS revoked,
+				(${DEVICE_OWNERSHIP_SUBJECT_EXISTS_SQL}) AS owned`)
+				.get(...subjects, ...subjects.slice(0, 2)) as
+				| { revoked: number; owned: number }
+				| undefined;
+			if (
+				!row ||
+				("success" in row && row.success === false) ||
+				[row.revoked, row.owned].some((value) => value !== 0 && value !== 1)
+			)
+				throw new Error("device_ownership_authorization_unavailable");
+			if (row.revoked === 1) throw new Error("device_revoked");
+			if (row.owned === 1) throw new Error("device_ownership_requires_verified_identity");
+		} catch (error) {
+			legacyDeviceAuthorizationFailure(error);
+		}
+	}
+
+	private recipientInviteAuthorization(
+		invite: CoordinatorInvite,
+		opts: CoordinatorConsumeRecipientInviteInput,
+		subjects: (string | null)[],
+	) {
+		return {
+			sql: `NOT (${DEVICE_REVOCATION_SUBJECT_EXISTS_SQL}
+				OR ${DEVICE_REVOCATION_SUBJECT_EXISTS_SQL}
+				OR ${DEVICE_OWNERSHIP_SUBJECT_EXISTS_SQL})`,
+			values: [...subjects, ...subjects.slice(0, 2)],
+			assertAuthorized: () => this.assertRecipientInviteAuthorized(invite, opts, subjects),
+		};
+	}
+
 	async consumeRecipientInvite(
 		input: CoordinatorConsumeRecipientInviteInput,
 	): Promise<CoordinatorRecipientInviteAcceptance> {
@@ -1605,6 +1747,9 @@ export class BetterSqliteCoordinatorStore implements CoordinatorStore {
 					throw new Error("invite_identity_conflict");
 				}
 				const participantSubjects = this.validateRecipientInviteParticipants(invite, opts);
+				const authorization = this.recipientInviteAuthorization(invite, opts, participantSubjects);
+				const { sql: authorizationSql, values: authorizationValues } = authorization;
+				this.assertRecipientInviteAuthorized(invite, opts, participantSubjects);
 				const changed = invite.consumed_at
 					? 0
 					: this.db
@@ -1614,7 +1759,7 @@ export class BetterSqliteCoordinatorStore implements CoordinatorStore {
 							WHERE invite_id = ? AND consumed_at IS NULL AND revoked_at IS NULL
 							AND expires_at > ? AND invite_kind = ?
 							AND EXISTS (SELECT 1 FROM groups g WHERE g.group_id = coordinator_invites.group_id
-								AND g.archived_at IS NULL)`)
+								AND g.archived_at IS NULL) AND ${authorizationSql}`)
 							.run(
 								`consumed:${invite.invite_id}`,
 								consumedAt,
@@ -1627,10 +1772,9 @@ export class BetterSqliteCoordinatorStore implements CoordinatorStore {
 								invite.invite_id,
 								consumedAt,
 								opts.inviteKind,
+								...authorizationValues,
 							).changes;
-				const saved = this.db
-					.prepare(`SELECT ${INVITE_COLUMNS} FROM coordinator_invites WHERE invite_id = ?`)
-					.get(invite.invite_id) as CoordinatorInvite;
+				const saved = this.getRecipientInviteById(invite.invite_id);
 				if (
 					saved.bound_device_id !== opts.deviceId ||
 					saved.bound_public_key !== opts.publicKey ||
@@ -1645,8 +1789,7 @@ export class BetterSqliteCoordinatorStore implements CoordinatorStore {
 						.prepare(`INSERT INTO enrolled_devices(
 						group_id, device_id, public_key, fingerprint, identity_id, display_name, enabled, created_at
 					) SELECT ?, ?, ?, ?, ?, ?, 1, ?
-					WHERE NOT (${DEVICE_REVOCATION_SUBJECT_EXISTS_SQL}
-						OR ${DEVICE_REVOCATION_SUBJECT_EXISTS_SQL})
+					WHERE ${authorizationSql}
 					ON CONFLICT(group_id, device_id) DO UPDATE SET
 						public_key = excluded.public_key,
 						fingerprint = excluded.fingerprint,
@@ -1663,25 +1806,24 @@ export class BetterSqliteCoordinatorStore implements CoordinatorStore {
 							authoritativeIdentityId,
 							deviceDisplayName,
 							consumedAt,
-							...participantSubjects,
+							...authorizationValues,
 						);
 				} else {
 					this.db
 						.prepare(`UPDATE enrolled_devices SET identity_id = ?
 						WHERE group_id = ? AND device_id = ? AND identity_id IS NULL
 							AND public_key = ? AND fingerprint = ?
-							AND NOT (${DEVICE_REVOCATION_SUBJECT_EXISTS_SQL}
-								OR ${DEVICE_REVOCATION_SUBJECT_EXISTS_SQL})`)
+							AND ${authorizationSql}`)
 						.run(
 							authoritativeIdentityId,
 							invite.group_id,
 							opts.deviceId,
 							opts.publicKey,
 							opts.fingerprint,
-							...participantSubjects,
+							...authorizationValues,
 						);
 				}
-				this.validateRecipientInviteParticipants(invite, opts);
+				this.assertRecipientInviteAuthorized(invite, opts, participantSubjects);
 				const enrollment = this.db
 					.prepare(`SELECT ${ENROLLMENT_COLUMNS}
 					FROM enrolled_devices WHERE group_id = ? AND device_id = ? AND enabled = 1`)
@@ -1710,8 +1852,8 @@ export class BetterSqliteCoordinatorStore implements CoordinatorStore {
 						const claimed = this.db
 							.prepare(`UPDATE coordinator_invites SET bootstrap_grant_id = ?,
 						 trust_state = 'bootstrap_grant_created'
-						 WHERE invite_id = ? AND bootstrap_grant_id IS NULL`)
-							.run(grantId, invite.invite_id);
+							 WHERE invite_id = ? AND bootstrap_grant_id IS NULL AND ${authorizationSql}`)
+							.run(grantId, invite.invite_id, ...authorizationValues);
 						if (claimed.changes === 1) {
 							bootstrapGrant = insertBootstrapGrantSync(
 								this.db,
@@ -1724,23 +1866,17 @@ export class BetterSqliteCoordinatorStore implements CoordinatorStore {
 								},
 								grantId,
 								consumedAt,
+								authorization,
 							);
 						}
 					}
 				}
-				const savedWithGrant = this.db
-					.prepare(`SELECT ${INVITE_COLUMNS} FROM coordinator_invites WHERE invite_id = ?`)
-					.get(invite.invite_id) as CoordinatorInvite;
+				const savedWithGrant = this.getRecipientInviteById(invite.invite_id);
 				if (!bootstrapGrant && savedWithGrant.bootstrap_grant_id) {
-					bootstrapGrant =
-						(this.db
-							.prepare(`SELECT grant_id, group_id, seed_device_id, worker_device_id, expires_at,
-						 created_at, created_by, revoked_at FROM coordinator_bootstrap_grants WHERE grant_id = ?`)
-							.get(savedWithGrant.bootstrap_grant_id) as CoordinatorBootstrapGrant | undefined) ??
-						null;
+					bootstrapGrant = this.getRecipientInviteBootstrapGrant(savedWithGrant.bootstrap_grant_id);
 				}
 				// Trigger effects belong to this transaction too; denial rolls back all acceptance writes.
-				this.validateRecipientInviteParticipants(savedWithGrant, opts);
+				this.assertRecipientInviteAuthorized(savedWithGrant, opts, participantSubjects);
 				return {
 					status: changed === 1 ? "accepted" : "existing",
 					invite: savedWithGrant,
@@ -2223,7 +2359,49 @@ export class BetterSqliteCoordinatorStore implements CoordinatorStore {
 	async createBootstrapGrant(
 		opts: CoordinatorCreateBootstrapGrantInput,
 	): Promise<CoordinatorBootstrapGrant> {
-		return insertBootstrapGrantSync(this.db, opts);
+		const input = normalizeCoordinatorBootstrapGrantInput(opts);
+		try {
+			return this.db
+				.transaction(() => {
+					const revoked = this.db.prepare(BOOTSTRAP_PARTICIPANTS_REVOKED_SQL);
+					if (revoked.get(input.seedDeviceId, null, input.workerDeviceId, null)) {
+						throw new Error("device_revoked");
+					}
+					const source = this.db.prepare(BOOTSTRAP_PARTICIPANT_SOURCE_SQL);
+					const seed = captureBootstrapParticipantSource(
+						(source.get(input.groupId, input.seedDeviceId) as
+							| BootstrapParticipantSource
+							| undefined) ?? null,
+					);
+					const worker = captureBootstrapParticipantSource(
+						(source.get(input.groupId, input.workerDeviceId) as
+							| BootstrapParticipantSource
+							| undefined) ?? null,
+					);
+					const subjects = [
+						input.seedDeviceId,
+						seed ? enrollmentRevocationKeyId(seed.public_key) : null,
+						input.workerDeviceId,
+						worker ? enrollmentRevocationKeyId(worker.public_key) : null,
+					];
+					if (revoked.get(...subjects)) throw new Error("device_revoked");
+					const values = bootstrapRawInsertValues(
+						input,
+						{ grantId: tokenUrlSafe(12), createdAt: nowISO() },
+						{ seed, worker },
+						subjects,
+					);
+					const row = this.db.prepare(BOOTSTRAP_RAW_INSERT_SQL).get(...values);
+					// A trigger may revoke a participant during insertion; abort the entire transaction.
+					if (revoked.get(...subjects)) throw new Error("device_revoked");
+					if (!row) throw new Error("bootstrap_grant_write_incomplete");
+					return rowToRecord<CoordinatorBootstrapGrant>(row);
+				})
+				.immediate();
+		} catch (error) {
+			if (error instanceof Error && error.message === "device_revoked") throw error;
+			throw new Error("bootstrap_grant_write_incomplete");
+		}
 	}
 
 	private getScopeSync(scopeId: string): CoordinatorScope | null {
@@ -2574,6 +2752,41 @@ export class BetterSqliteCoordinatorStore implements CoordinatorStore {
 		return row ? rowToRecord<CoordinatorBootstrapGrant>(row) : null;
 	}
 
+	async getBootstrapGrantAuthorization(
+		raw: CoordinatorBootstrapGrantAuthorizationInput,
+	): Promise<CoordinatorBootstrapGrantAuthorizationResult> {
+		try {
+			const input = captureBootstrapAuthorizationInput(raw);
+			return this.db
+				.transaction(() => {
+					const source = this.db.prepare(BOOTSTRAP_AUTHORIZATION_SOURCE_SQL).get(input.grantId) as
+						| BootstrapAuthorizationRow
+						| undefined;
+					const sourceError = bootstrapAuthorizationSourceError(input, source ?? null);
+					if (sourceError) return rejectBootstrapAuthorization(sourceError);
+					if (!source) return rejectBootstrapAuthorization("bootstrap_authorization_unavailable");
+					const captured = { ...source };
+					const decision = bootstrapAuthorizationDecision(input, captured, {
+						seed:
+							captured.seed_enrollment_public_key === null
+								? null
+								: enrollmentRevocationKeyId(captured.seed_enrollment_public_key),
+						worker:
+							captured.worker_enrollment_public_key === null
+								? null
+								: enrollmentRevocationKeyId(captured.worker_enrollment_public_key),
+					});
+					const current = this.db.prepare(decision.sql).get(...decision.values) as
+						| BootstrapAuthorizationRow
+						| undefined;
+					return bootstrapAuthorizationResult(current ?? null);
+				})
+				.immediate();
+		} catch {
+			return rejectBootstrapAuthorization("bootstrap_authorization_unavailable");
+		}
+	}
+
 	async listBootstrapGrants(groupId: string): Promise<CoordinatorBootstrapGrant[]> {
 		return this.db
 			.prepare(`SELECT grant_id, group_id, seed_device_id, worker_device_id, expires_at, created_at, created_by, revoked_at
@@ -2865,20 +3078,33 @@ export class BetterSqliteCoordinatorStore implements CoordinatorStore {
 		groupId: string,
 		requestingDeviceId: string,
 	): Promise<CoordinatorPeerRecord[]> {
+		try {
+			return this.readGroupPeers(groupId, requestingDeviceId);
+		} catch {
+			throw new Error("peer_discovery_unavailable");
+		}
+	}
+
+	private readGroupPeers(groupId: string, requestingDeviceId: string): CoordinatorPeerRecord[] {
 		const now = new Date();
 		const rows = this.db
-			.prepare(`SELECT enrolled_devices.device_id, enrolled_devices.public_key, enrolled_devices.fingerprint, enrolled_devices.display_name,
-					presence_records.addresses_json, presence_records.last_seen_at, presence_records.expires_at,
-					presence_records.capabilities_json
-				 FROM enrolled_devices
-				 LEFT JOIN presence_records
-				   ON presence_records.group_id = enrolled_devices.group_id
-				  AND presence_records.device_id = enrolled_devices.device_id
-				 WHERE enrolled_devices.group_id = ?
-				   AND enrolled_devices.enabled = 1
-				   AND enrolled_devices.device_id != ?
-				 ORDER BY enrolled_devices.device_id ASC`)
-			.all(groupId, requestingDeviceId) as Record<string, unknown>[];
+			.transaction(() => {
+				const captured = capturePeerEnrollments(
+					this.db
+						.prepare(CAPTURE_PEER_ENROLLMENTS_SQL)
+						.all(groupId, requestingDeviceId) as CapturedPeerEnrollment[],
+				);
+				const candidates = captured.map((row) => ({
+					...row,
+					keyId: enrollmentRevocationKeyId(row.public_key),
+				}));
+				return requirePeerDiscoveryRows(
+					this.db
+						.prepare(READ_CURRENT_PEERS_SQL)
+						.all(JSON.stringify(candidates), groupId, requestingDeviceId),
+				);
+			})
+			.immediate();
 		return rows.map((row) => {
 			const expiresRaw = String(row.expires_at ?? "").trim();
 			let stale = true;

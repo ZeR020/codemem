@@ -242,9 +242,106 @@ receipts are historical results, not proof of current device authority; stored
 links and browser sessions are not silently revoked or deleted. A write accepted
 before later revocation is not retroactively undone.
 
-Standalone bootstrap authority remains separate work. These writer slices do not
-enable public revocation management, new owner enrollment, or durable device
-ownership, and do not activate a live authentication configuration.
+## Standalone raw bootstrap issuance
+
+Standalone grant creation checks both participant device IDs and canonical keys
+from their current enrollments when available, including disabled enrollments.
+The INSERT pins each captured key/fingerprint/Identity tuple or the absence of an
+enrollment. D1 cannot silently use a participant that appeared or changed during
+hashing; SQLite performs capture, hashing, and insertion in an immediate transaction.
+
+Raw grant records are not authorization. Existing no-revocation creation behavior
+for unenrolled, disabled, or identical participant IDs remains unchanged. No
+historical key or ownership is inferred from a fingerprint, actor hint, or stored
+grant. Retained device-ID revocation still denies creation after enrollment removal.
+
+Subject denial uses `device_revoked`; stale evidence and unconfirmed failures use
+the fixed `bootstrap_grant_write_incomplete` error. D1 returns only its own guarded
+INSERT result, not success reconstructed from a later raw read. After a lost D1
+receipt, neither an incomplete response nor a subsequent `device_revoked` denial
+proves that no grant was committed; callers must reconcile current state.
+
+Existing raw reads, history, and explicit grant revocation remain unchanged.
+Current authorization of both participants is required in signed/admin lookup
+paths; raw issuance guards alone do not close bootstrap access.
+These writer slices do not enable public revocation management, new owner
+enrollment, durable ownership, or a live authentication configuration.
+
+## Current bootstrap authorization read
+
+`getBootstrapGrantAuthorization` is a required store capability, separate from raw
+inspection. It accepts a grant ID, server-trusted time, and optional seed constraints
+from verified request admission. Its authorized result carries version 1, the grant,
+and both current enrollments from the final SQL decision—not from earlier snapshots.
+
+The decision requires an unrevoked, unexpired grant, an unarchived group, both
+participants currently enrolled and enabled in that group, and no device-ID or
+canonical-key revocation. It derives both key IDs from actual enrollment keys and
+pins the captured grant fields and participant tuples across hashing. Changed
+evidence cannot silently authorize a replacement key. Invalid expiry dates fail
+closed. Authorization requires an ISO timestamp with seconds and an explicit `Z`
+or numeric timezone offset; timezone-less and free-form dates fail closed rather
+than expiring at different instants on different hosts. Backend or unconfirmed
+results use `bootstrap_authorization_unavailable`.
+Calendar dates, clock times, and timezone offsets must have valid components;
+overflow values such as February 30 or `24:00:00` are rejected before parsing
+can normalize them into a later expiry.
+
+Missing grants or mismatched seed expectations retain `grant_not_found`; missing
+or disabled participants use `seed_enrollment_not_found` or
+`worker_enrollment_not_found`. Other denials distinguish grant revocation, expiry,
+group archival, and participant device revocation without database diagnostics.
+Raw records, history, and explicit grant revocation remain independently readable.
+Incomplete enrollment metadata, including empty fingerprints or creation times,
+also fails closed as unavailable without changing raw inspection.
+
+Both single-grant API lookup routes authenticate before this read. The signed
+route constrains the decision to the actual key and fingerprint used during
+request verification; the admin route independently checks both participants.
+No optional raw-getter fallback can substitute for the authorization decision.
+
+Successful lookup responses require `authorization_version: 1`, `grant`,
+`seed_enrollment`, and `worker_enrollment`. The viewer checks the version, both
+enabled enrollment tuples and fingerprints, group/device bindings, strict expiry,
+and its freshly read local seed key before recording a nonce or trusting the peer.
+Malformed or unversioned responses fail closed with the existing generic peer 401.
+
+Older coordinators must be upgraded before a new viewer can admit a new bootstrap
+connection. Ordinary local use and already configured direct-peer authentication
+do not require this response version. Raw grant listing and explicit revocation
+remain separate from authorization.
+
+Lookup denial statuses are 404 for missing grants, missing/disabled participants,
+or mismatched seed constraints; 403 for grant revocation, expiry, or device
+revocation; 409 for group archival; and 503 for unavailable or unconfirmed
+authorization. Invalid signed requests retain their existing admission errors and
+never invoke the authorization read.
+
+## Revocation-aware peer discovery
+
+`listGroupPeers` omits candidates with a coordinator-wide device-ID or canonical-key
+revocation. Omission includes their key, fingerprint, addresses, and capabilities;
+raw enrollment inspection and retained grant/history records are unchanged.
+
+Discovery captures enabled candidate tuples and derives key IDs from their actual
+public keys. The final SQL read pins those tuples and checks current revocations,
+then joins current presence by both group and device ID. Changed or removed
+candidates are omitted rather than silently authorizing replacement keys. SQLite
+keeps capture, synchronous hashing, and the final read in one transaction; D1
+copies every tuple before hashing and uses a single guarded final read.
+
+Healthy enabled peers with missing or expired presence remain visible as stale,
+with empty addresses. Results retain device-ID ordering. Opaque legacy keys retain
+device-ID-only checks. One JSON parameter carries captured tuples without a new
+schema or a variable bind count for large groups. Backend per-value size limits
+still apply; oversized reads fail closed rather than silently truncating peers.
+
+The public route authenticates and rate-limits the requester before discovery.
+Unconfirmed backend responses or discovery failures return the fixed
+`peer_discovery_unavailable` error with HTTP 503, without database diagnostics.
+This is a fresh discovery snapshot, not a permanent permission or immediate
+revocation of already cached direct-peer trust. Project membership authority,
+removed-device ownership evidence, and public revocation management remain separate.
 
 ## Activation limits
 

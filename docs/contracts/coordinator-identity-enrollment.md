@@ -204,6 +204,99 @@ This ledger is a prerequisite for the new owner-enrollment and management paths.
 Existing Identity-group transport grants and revocation subjects are not device
 ownership records and must not be repurposed as that authority.
 
+#### Inert storage foundation
+
+`coordinator_device_ownership_bindings` retains immutable device ID, canonical key
+ID, Identity, coordinator metadata, binding ID, provenance/reference, and binding
+time. Device IDs and canonical keys are globally unique within the coordinator
+database; nominating different coordinator metadata cannot evade a collision.
+One Identity may own many devices with distinct keys. Reusing a bound key under a
+new device ID is denied even for the same Identity; it is not a new-device clone
+or ownership-transfer mechanism.
+All columns require text storage, preventing binary copies of identifiers from
+bypassing text uniqueness or collision comparisons.
+
+The table has no cascading reference to enrollment, groups, accounts, sessions,
+attempts, grants, or audit records. Its insert-only constraints reject updates,
+deletes, and replacement inserts that would release an existing binding. A future
+verified retry must compare the retained tuple and stage a conditional insert in
+the winning commit, never use replacement or an ownership-changing upsert.
+
+This first foundation only adds aligned schema and migration source. It does not
+issue bindings, backfill legacy rows, enforce enrollment ownership, or expose an
+owner-management route. Existing unbound legacy behavior remains unchanged.
+Schema constraints and provenance labels are not proof of verified ownership.
+Verified-source resolution, every enrollment/repair/reactivation writer guard,
+and atomic binding/enrollment/audit commitment must be implemented and validated
+before ledger issuance or an explicit legacy migration can activate. Applying
+the live migration remains a separate approval gate.
+
+#### Legacy enrollment and reactivation guards
+
+Direct enrollment, replacement, and reactivation now check retained device-ID
+and canonical-key bindings in the actual write. Existing legacy entrypoints
+carry no verified owner proof, so any retained identifier is denied—even when
+the supplied Identity hint matches the binding. Unbound legacy behavior remains
+unchanged; a fingerprint or caller-supplied Identity cannot substitute for proof.
+Enrollment replacement checks both the incoming key and the captured currently
+stored key. An unrelated incoming key cannot overwrite an existing alias whose
+stored key is retained under another device ID. The final write pins the current
+public key or row absence across hashing; changed evidence cannot refresh an
+unconfirmed attempt into success.
+
+Ownership denial uses `device_ownership_requires_verified_identity` (HTTP 403)
+after existing admission and rate limits. Revocation retains its earlier denial
+priority and reactivation behavior. Missing or unconfirmed ownership storage uses
+the fixed `device_ownership_authorization_unavailable` error (HTTP 503), without
+database diagnostics. An unavailable receipt is not proof that no write committed;
+callers must reconcile state rather than infer rollback or success from a later read.
+Unconfirmed storage/receipt failures intentionally share this code; this slice
+does not add operator logging or expose the original database cause.
+
+Disabling or removing enrollment still does not release ownership. SQLite's
+shared helper guards the enrollment write used by Project-invitation acceptance
+and join approval inside their existing transactions. Project retry Identity-label
+repairs are not covered by that helper. Project Identity repairs and D1's separate
+invitation/join writers remain separate adoption slices; this is not complete
+writer closure and cannot enable binding issuance.
+
+Worker deployments of these guards require migration `0028` first. An absent
+ledger is unavailable, not evidence that identifiers are unbound. Local SQLite
+initialization creates the empty ledger automatically. Verified-source resolution,
+all remaining writer guards, and the atomic enrollment/audit commit remain required
+before owner enrollment or an explicit legacy migration can activate.
+
+#### SQLite recipient invitation guards
+
+SQLite recipient acceptance checks retained ownership in consumption, enrollment,
+Identity-label repair, and dependent bootstrap grant writes, including retries and
+grant recovery. Server-assigned or target Identity labels are not owner proof.
+An owned recipient is denied without consuming an invitation or changing its
+enrollment; the existing immediate transaction rolls back a late guard failure.
+
+Ownership checks target the recipient being enrolled or repaired, not the inviter
+whose enrollment is only read. An already-owned inviter may still invite an
+unbound recipient. Inviter revocation checks and captured key evidence remain in
+force, and invalid invitation/key bindings retain their earlier private errors.
+Raw inspection and independently issued grants remain readable.
+
+The SQLite slice landed separately from the D1 adoption below. Remaining
+Project/join repairs must still pass before binding issuance can activate.
+
+#### D1 recipient invitation guards
+
+D1 checks the same recipient ownership boundary on acceptance, enrollment,
+Identity repair, retries, and bootstrap grant recovery. Every write pins the
+captured invitation and participant evidence. Enrollment follows the winning
+consume through `changes() = 1`, and a final SQL assertion aborts a batch if its
+authority guard drifts. Owned inviters remain usable; their revocation and
+current-tuple checks are retained.
+
+Unconfirmed or malformed receipts fail closed with the fixed unavailable error.
+A SQL assertion failure rolls back its batch, but a bad or lost receipt may arrive
+after commit; a later read cannot manufacture success or prove rollback.
+Binding issuance, verified owner proof, and live activation remain disabled.
+
 ### Trusted Identity-group grants
 
 Add a coordinator-owned, revisioned Identity/group grant independent of device
