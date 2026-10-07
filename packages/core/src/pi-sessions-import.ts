@@ -218,9 +218,59 @@ function piImportPayload(
 }
 
 /**
+ * True when this file can be appended without rewriting already-extracted
+ * event_seq. Missing ids are safe only as a suffix after the session high-water.
+ */
+function canAppendPiSession(
+	db: Database,
+	sessionId: string,
+	envelopes: PiHookRawEventEnvelope[],
+): boolean {
+	const stored = db
+		.prepare(
+			`SELECT event_id, event_seq FROM raw_events
+			 WHERE source = 'pi' AND stream_id = ?
+			 ORDER BY event_seq`,
+		)
+		.all(sessionId) as Array<{ event_id: string | null; event_seq: number }>;
+	const seqById = new Map<string, number>();
+	for (const row of stored) {
+		if (row.event_id != null) seqById.set(row.event_id, row.event_seq);
+	}
+	let lastMatched = -1;
+	let hasMissing = false;
+	for (const eventId of new Set(envelopes.map((envelope) => envelope.event_id))) {
+		const seq = seqById.get(eventId);
+		if (seq === undefined) {
+			hasMissing = true;
+			continue;
+		}
+		if (hasMissing || seq <= lastMatched) return false;
+		lastMatched = seq;
+	}
+	if (!hasMissing) return true;
+	const session = db
+		.prepare(
+			`SELECT last_received_event_seq, last_flushed_event_seq FROM raw_event_sessions
+			 WHERE source = 'pi' AND stream_id = ?`,
+		)
+		.get(sessionId) as
+		| { last_received_event_seq: number; last_flushed_event_seq: number }
+		| undefined;
+	const highwater = Math.max(
+		session?.last_received_event_seq ?? -1,
+		session?.last_flushed_event_seq ?? -1,
+		stored.at(-1)?.event_seq ?? -1,
+	);
+	return lastMatched === highwater;
+}
+
+/**
  * Ingest one parsed session through the standard pipeline: envelopes built
  * by buildRawEventEnvelopeFromPiEvent (identical ids/attribution to live),
  * batched into a single ingestRawEvents transaction for the file.
+ * Already-extracted history keeps its event_seq; the order check and ingest
+ * share one immediate transaction so a live append cannot land between them.
  */
 function ingestPiSessionFile(
 	db: Database,
@@ -235,26 +285,36 @@ function ingestPiSessionFile(
 		first = first ?? envelope;
 	}
 	if (!first) return { inserted: 0, skipped: 0, count: 0 };
-	const result = ingestRawEvents(
-		{ db },
-		{
-			source: "pi",
-			session_stream_id: parsed.sessionId,
-			session_id: parsed.sessionId,
-			opencode_session_id: parsed.sessionId,
-			cwd: first.cwd,
-			project: first.project,
-			events: envelopes.map((envelope) => ({
-				event_type: envelope.event_type,
-				event_id: envelope.event_id,
-				payload: envelope.payload,
-				ts_wall_ms: envelope.ts_wall_ms,
-				cwd: envelope.cwd,
-				project: envelope.project,
-			})),
-		},
-	);
-	return { inserted: result.inserted, skipped: result.skipped, count: envelopes.length };
+	const head = first;
+	return db
+		.transaction(() => {
+			if (!canAppendPiSession(db, parsed.sessionId, envelopes)) {
+				throw new Error(
+					"partial_import: cannot preserve transcript order; import this session into a separate destination database",
+				);
+			}
+			const result = ingestRawEvents(
+				{ db },
+				{
+					source: "pi",
+					session_stream_id: parsed.sessionId,
+					session_id: parsed.sessionId,
+					opencode_session_id: parsed.sessionId,
+					cwd: head.cwd,
+					project: head.project,
+					events: envelopes.map((envelope) => ({
+						event_type: envelope.event_type,
+						event_id: envelope.event_id,
+						payload: envelope.payload,
+						ts_wall_ms: envelope.ts_wall_ms,
+						cwd: envelope.cwd,
+						project: envelope.project,
+					})),
+				},
+			);
+			return { inserted: result.inserted, skipped: result.skipped, count: envelopes.length };
+		})
+		.immediate();
 }
 
 /** Recursively list *.jsonl files under the sessions dir (project subdirs included). */
