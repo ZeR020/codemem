@@ -1,3 +1,19 @@
+CREATE TABLE IF NOT EXISTS coordinator_device_revocations (
+  subject_kind TEXT NOT NULL CHECK(subject_kind IN ('device_id', 'ed25519_key')),
+  subject_value TEXT NOT NULL CHECK(
+    (subject_kind = 'device_id' AND length(subject_value) BETWEEN 1 AND 256) OR
+    (subject_kind = 'ed25519_key' AND length(subject_value) = 64
+      AND subject_value NOT GLOB '*[^a-f0-9]*')),
+  revocation_id TEXT NOT NULL,
+  evidence_group_id TEXT NOT NULL,
+  evidence_device_id TEXT NOT NULL,
+  evidence_public_key TEXT NOT NULL,
+  evidence_fingerprint TEXT NOT NULL,
+  actor_id TEXT,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (subject_kind, subject_value)
+);
+
 CREATE TABLE IF NOT EXISTS groups (
   group_id TEXT PRIMARY KEY,
   display_name TEXT,
@@ -408,6 +424,19 @@ CREATE INDEX IF NOT EXISTS idx_auth_browser_txn_state_expiry
 CREATE TABLE IF NOT EXISTS coordinator_auth_signin_purge_floors (
  coordinator_id TEXT NOT NULL PRIMARY KEY CHECK (length(coordinator_id) BETWEEN 1 AND 256),
  purged_through_created_at_ms INTEGER NOT NULL CHECK (typeof(purged_through_created_at_ms) = 'integer' AND purged_through_created_at_ms BETWEEN 0 AND 9007199254140991)
+);
+CREATE TABLE IF NOT EXISTS coordinator_identity_group_grants (
+ coordinator_id TEXT NOT NULL,
+ identity_id TEXT NOT NULL,
+ group_id TEXT NOT NULL,
+ status TEXT NOT NULL CHECK (status IN ('active', 'revoked')),
+ revision INTEGER NOT NULL CHECK (typeof(revision) = 'integer' AND revision BETWEEN 1 AND 9007199254740991),
+ source_kind TEXT NOT NULL CHECK (source_kind = 'controller_attestation'),
+ source_receipt_id TEXT NOT NULL,
+ created_at TEXT NOT NULL,
+ revoked_at TEXT,
+ PRIMARY KEY (coordinator_id, identity_id, group_id),
+ CHECK ((status = 'active' AND revoked_at IS NULL) OR (status = 'revoked' AND revoked_at IS NOT NULL))
 );
 CREATE TABLE IF NOT EXISTS coordinator_auth_account_profiles (
  coordinator_id TEXT NOT NULL,

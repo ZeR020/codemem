@@ -33,6 +33,8 @@ import {
 	SCOPE_MEMBERSHIP_EFFECT_CONFLICT,
 } from "./coordinator-membership-effects.js";
 import type {
+	CoordinatorBootstrapGrantAuthorizationError,
+	CoordinatorBootstrapGrantAuthorizationInput,
 	CoordinatorBootstrapGrantVerification,
 	CoordinatorEnrollment,
 	CoordinatorInviteKind,
@@ -101,6 +103,13 @@ export type CoordinatorAppBrowserAuthOptions =
 			clientKey: CoordinatorBrowserAuthClientKey;
 	  }
 	| { kind: "unavailable" };
+
+function recipientInviteErrorStatus(code: string): 403 | 404 | 409 | 410 {
+	if (code === "device_revoked") return 403;
+	if (code === "invite_expired") return 410;
+	if (code === "invite_invalid") return 404;
+	return 409;
+}
 
 function registerOptionalCoordinatorAuth(
 	app: Hono,
@@ -187,15 +196,6 @@ function pathWithQuery(url: string): string {
 	return parsed.search ? `${parsed.pathname}${parsed.search}` : parsed.pathname;
 }
 
-async function recordNonce(
-	store: CoordinatorStore,
-	deviceId: string,
-	nonce: string,
-	createdAt: string,
-): Promise<boolean> {
-	return await store.recordNonce(deviceId, nonce, createdAt);
-}
-
 async function cleanupNonces(store: CoordinatorStore, cutoff: string): Promise<void> {
 	await store.cleanupNonces(cutoff);
 }
@@ -226,10 +226,11 @@ async function authorizeRequest(
 		return { ok: false, error: "missing_headers", enrollment: null };
 	}
 
-	const enrollment = await store.getEnrollment(opts.groupId, deviceId, true);
-	if (!enrollment) {
+	const sourceEnrollment = await store.getEnrollment(opts.groupId, deviceId, true);
+	if (!sourceEnrollment) {
 		return { ok: false, error: "unknown_device", enrollment: null };
 	}
+	const enrollment = { ...sourceEnrollment };
 	if (enrollment.enabled !== 1) {
 		return { ok: false, error: "device_disabled", enrollment: null };
 	}
@@ -241,6 +242,9 @@ async function authorizeRequest(
 		return { ok: false, error: "group_archived", enrollment: null };
 	}
 
+	const publicKey = enrollment.public_key;
+	if (typeof publicKey !== "string")
+		return { ok: false, error: "unknown_device", enrollment: null };
 	let valid: boolean;
 	try {
 		valid = await requestVerifier({
@@ -250,7 +254,7 @@ async function authorizeRequest(
 			timestamp,
 			nonce,
 			signature,
-			publicKey: String(enrollment.public_key),
+			publicKey: String(publicKey),
 			deviceId,
 		});
 	} catch {
@@ -262,8 +266,15 @@ async function authorizeRequest(
 	}
 
 	const createdAt = runtime.now();
-	if (!(await recordNonce(store, deviceId, nonce, createdAt))) {
-		return { ok: false, error: "nonce_replay", enrollment: null };
+	const admission = await store.recordAuthorizedNonce({
+		groupId: opts.groupId,
+		deviceId,
+		publicKey,
+		nonce,
+		createdAt,
+	});
+	if (admission !== "recorded") {
+		return { ok: false, error: admission, enrollment: null };
 	}
 
 	// Clock-source note: the nonce timestamp/cutoff below is driven by the
@@ -284,9 +295,50 @@ async function authorizeRequest(
 }
 
 function authErrorStatus(error: string): 401 | 403 | 409 {
-	if (error === "device_disabled") return 403;
+	if (error === "device_disabled" || error === "device_revoked") return 403;
 	if (error === "group_archived") return 409;
 	return 401;
+}
+
+function bootstrapAuthorizationErrorStatus(
+	error: CoordinatorBootstrapGrantAuthorizationError,
+): 403 | 404 | 409 | 503 {
+	switch (error) {
+		case "grant_not_found":
+		case "seed_enrollment_not_found":
+		case "worker_enrollment_not_found":
+			return 404;
+		case "grant_revoked":
+		case "grant_expired":
+		case "device_revoked":
+			return 403;
+		case "group_archived":
+			return 409;
+		default:
+			return 503;
+	}
+}
+
+async function bootstrapAuthorizationResponse(
+	c: Context,
+	store: CoordinatorStore,
+	input: CoordinatorBootstrapGrantAuthorizationInput,
+) {
+	try {
+		const result = await store.getBootstrapGrantAuthorization(input);
+		if (result.kind === "rejected") {
+			return c.json({ error: result.error }, bootstrapAuthorizationErrorStatus(result.error));
+		}
+		const payload: CoordinatorBootstrapGrantVerification = {
+			authorization_version: result.authorizationVersion,
+			grant: result.grant,
+			seed_enrollment: result.seedEnrollment,
+			worker_enrollment: result.workerEnrollment,
+		};
+		return c.json(payload);
+	} catch {
+		return c.json({ error: "bootstrap_authorization_unavailable" }, 503);
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -325,6 +377,68 @@ async function readRequestBytes(c: Context, maxBytes = MAX_BODY_BYTES): Promise<
 		offset += chunk.byteLength;
 	}
 	return combined;
+}
+
+function deviceRevokedResponse(c: Context, error: unknown): Response {
+	if (error instanceof Error && error.message === "device_revoked") {
+		return c.json({ error: "device_revoked" }, 403);
+	}
+	throw error;
+}
+
+function projectInviteAcceptanceErrorResponse(c: Context, error: unknown): Response {
+	const code = error instanceof Error ? error.message : "invite_invalid";
+	if (code === "device_revoked") return c.json({ error: "device_revoked" }, 403);
+	if (code === "invite_expired") return c.json({ error: code }, 410);
+	if (code === "invite_invalid") return c.json({ error: code }, 404);
+	return c.json({ error: code }, 409);
+}
+
+async function enrollAdminDevice(
+	c: Context,
+	store: CoordinatorStore,
+	groupId: string,
+	input: Parameters<CoordinatorStore["enrollDevice"]>[1],
+): Promise<Response> {
+	try {
+		await store.createGroup(groupId);
+		await store.enrollDevice(groupId, input);
+		return c.json({ ok: true });
+	} catch (error) {
+		return deviceRevokedResponse(c, error);
+	} finally {
+		await store.close();
+	}
+}
+
+async function reviewJoinRequestWithRevocationDenial(
+	...args: Parameters<typeof handleJoinRequestReview>
+): Promise<Response> {
+	try {
+		return await handleJoinRequestReview(...args);
+	} catch (error) {
+		if (
+			error instanceof Error &&
+			(error.message === "join_review_unavailable" || error.message === "join_review_incomplete")
+		) {
+			return args[0].json({ error: error.message }, 503);
+		}
+		return deviceRevokedResponse(args[0], error);
+	}
+}
+
+async function peerDiscoveryResponse(
+	c: Context,
+	store: CoordinatorStore,
+	groupId: string,
+	requestingDeviceId: string,
+): Promise<Response> {
+	try {
+		const items = await store.listGroupPeers(groupId, requestingDeviceId);
+		return c.json({ items });
+	} catch {
+		return c.json({ error: "peer_discovery_unavailable" }, 503);
+	}
 }
 
 export function createCoordinatorApp(
@@ -631,8 +745,7 @@ export function createCoordinatorApp(
 			const limited = rateLimitedResponse(c, String(auth.enrollment.device_id), true);
 			if (limited) return limited;
 
-			const items = await store.listGroupPeers(groupId, String(auth.enrollment.device_id));
-			return c.json({ items });
+			return await peerDiscoveryResponse(c, store, groupId, String(auth.enrollment.device_id));
 		} finally {
 			await store.close();
 		}
@@ -975,20 +1088,12 @@ export function createCoordinatorApp(
 			return c.json({ error: "fingerprint_mismatch" }, 400);
 		}
 
-		const store = createStore();
-		try {
-			await store.createGroup(groupId);
-			await store.enrollDevice(groupId, {
-				deviceId,
-				fingerprint,
-				publicKey,
-				displayName,
-			});
-		} finally {
-			await store.close();
-		}
-
-		return c.json({ ok: true });
+		return enrollAdminDevice(c, createStore(), groupId, {
+			deviceId,
+			fingerprint,
+			publicKey,
+			displayName,
+		});
 	});
 
 	// GET /v1/admin/groups — list coordinator groups
@@ -2089,15 +2194,10 @@ export function createCoordinatorApp(
 
 		const store = createStore();
 		try {
-			const grant = await store.getBootstrapGrant(grantId);
-			if (!grant) return c.json({ error: "grant_not_found" }, 404);
-			const workerEnrollment = await store.getEnrollment(grant.group_id, grant.worker_device_id);
-			if (!workerEnrollment) return c.json({ error: "worker_enrollment_not_found" }, 404);
-			const payload: CoordinatorBootstrapGrantVerification = {
-				grant,
-				worker_enrollment: workerEnrollment,
-			};
-			return c.json(payload);
+			return await bootstrapAuthorizationResponse(c, store, {
+				grantId,
+				nowMs: Date.parse(runtime.now()),
+			});
 		} finally {
 			await store.close();
 		}
@@ -2127,17 +2227,16 @@ export function createCoordinatorApp(
 			}
 			const limited = rateLimitedResponse(c, String(auth.enrollment.device_id), true);
 			if (limited) return limited;
-			const grant = await store.getBootstrapGrant(grantId);
-			if (
-				!grant ||
-				grant.group_id !== groupId ||
-				grant.seed_device_id !== String(auth.enrollment.device_id)
-			) {
-				return c.json({ error: "grant_not_found" }, 404);
-			}
-			const workerEnrollment = await store.getEnrollment(groupId, grant.worker_device_id);
-			if (!workerEnrollment) return c.json({ error: "worker_enrollment_not_found" }, 404);
-			return c.json({ grant, worker_enrollment: workerEnrollment });
+			return await bootstrapAuthorizationResponse(c, store, {
+				grantId,
+				nowMs: Date.parse(runtime.now()),
+				expectedSeed: {
+					groupId: auth.enrollment.group_id,
+					deviceId: auth.enrollment.device_id,
+					publicKey: auth.enrollment.public_key,
+					fingerprint: auth.enrollment.fingerprint,
+				},
+			});
 		} finally {
 			await store.close();
 		}
@@ -2188,12 +2287,20 @@ export function createCoordinatorApp(
 
 	// POST /v1/admin/join-requests/approve
 	app.post("/v1/admin/join-requests/approve", async (c) => {
-		return handleJoinRequestReview(c, true, { createStore, runtime, rateLimitedResponse });
+		return reviewJoinRequestWithRevocationDenial(c, true, {
+			createStore,
+			runtime,
+			rateLimitedResponse,
+		});
 	});
 
 	// POST /v1/admin/join-requests/deny
 	app.post("/v1/admin/join-requests/deny", async (c) => {
-		return handleJoinRequestReview(c, false, { createStore, runtime, rateLimitedResponse });
+		return reviewJoinRequestWithRevocationDenial(c, false, {
+			createStore,
+			runtime,
+			rateLimitedResponse,
+		});
 	});
 
 	// GET /v1/admin/join-requests — list join requests
@@ -2355,8 +2462,7 @@ export function createCoordinatorApp(
 					});
 				} catch (error) {
 					const code = error instanceof Error ? error.message : "invite_invalid";
-					const status = code === "invite_expired" ? 410 : code === "invite_invalid" ? 404 : 409;
-					return c.json({ error: code }, status);
+					return c.json({ error: code }, recipientInviteErrorStatus(code));
 				}
 			}
 			if (invite.operation_id || invite.reviewed_project_set_digest) {
@@ -2436,9 +2542,7 @@ export function createCoordinatorApp(
 						accepted_project_intent: acceptedIntent,
 					});
 				} catch (error) {
-					const code = error instanceof Error ? error.message : "invite_invalid";
-					const status = code === "invite_expired" ? 410 : code === "invite_invalid" ? 404 : 409;
-					return c.json({ error: code }, status);
+					return projectInviteAcceptanceErrorResponse(c, error);
 				}
 			}
 			const projectAcceptanceFields = [
@@ -2501,6 +2605,8 @@ export function createCoordinatorApp(
 				group_id: invite.group_id,
 				policy: invite.policy,
 			});
+		} catch (error) {
+			return deviceRevokedResponse(c, error);
 		} finally {
 			await store.close();
 		}

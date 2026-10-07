@@ -103,6 +103,7 @@ export type {
 	CoordinatorControllerReviewStore,
 } from "./coordinator-auth-controller-review-route.js";
 export { registerCoordinatorAuthControllerReviewRoutes } from "./coordinator-auth-controller-review-route.js";
+export { parseBootstrapExpiry } from "./coordinator-bootstrap-grant-authorization.js";
 export type {
 	CoordinatorEnrollmentReconcileIssue,
 	CoordinatorEnrollmentReconcileResult,
@@ -125,6 +126,15 @@ export {
 	listCoordinatorGroupPreferences,
 	upsertCoordinatorGroupPreference,
 } from "./coordinator-group-preferences.js";
+export type {
+	CoordinatorIdentityGroupGrant,
+	CoordinatorIdentityGroupGrantIssueInput,
+	CoordinatorIdentityGroupGrantIssueResult,
+	CoordinatorIdentityGroupGrantRevokeInput,
+	CoordinatorIdentityGroupGrantScope,
+	CoordinatorIdentityGroupGrantStore,
+} from "./coordinator-identity-group-grant.js";
+export { compareIdentityGroupGrantRevisions } from "./coordinator-identity-group-grant.js";
 export type { InvitePayload } from "./coordinator-invites.js";
 export {
 	decodeInvitePayload,
@@ -175,12 +185,20 @@ export {
 	trustCoordinatorPeersWithSharedManagedScopes,
 } from "./coordinator-runtime.js";
 export type {
+	CoordinatorAuthorizedNonceResult,
+	CoordinatorBootstrapGrantAuthorizationError,
+	CoordinatorBootstrapGrantAuthorizationInput,
+	CoordinatorBootstrapGrantAuthorizationResult,
 	CoordinatorBootstrapGrantVerification,
 	CoordinatorConsumeProjectInviteInput,
+	CoordinatorCreateDeviceRevocationInput,
+	CoordinatorCreateDeviceRevocationResult,
 	CoordinatorCreateInviteInput,
 	CoordinatorCreateJoinRequestInput,
 	CoordinatorCreateReciprocalApprovalInput,
 	CoordinatorCreateScopeInput,
+	CoordinatorDeviceRevocationRecord,
+	CoordinatorDeviceRevocationStore,
 	CoordinatorEnrollDeviceInput,
 	CoordinatorEnrollment,
 	CoordinatorGrantScopeMembershipInput,
@@ -188,6 +206,7 @@ export type {
 	CoordinatorInvite,
 	CoordinatorJoinRequest,
 	CoordinatorJoinRequestReviewResult,
+	CoordinatorListDeviceRevocationsInput,
 	CoordinatorListReciprocalApprovalsInput,
 	CoordinatorListScopeMembershipAuditInput,
 	CoordinatorListScopesInput,
@@ -196,6 +215,7 @@ export type {
 	CoordinatorProjectInviteAcceptance,
 	CoordinatorProjectInviteSummary,
 	CoordinatorReciprocalApproval,
+	CoordinatorRecordAuthorizedNonceInput,
 	CoordinatorReviewJoinRequestInput,
 	CoordinatorRevokeScopeMembershipInput,
 	CoordinatorScope,

@@ -1,3 +1,4 @@
+import type { CoordinatorDeviceRevocationStore } from "./coordinator-device-revocation.js";
 import type {
 	CoordinatorLegacyTeamCompletionManifestV1,
 	CoordinatorLegacyTeamCompletionRecord,
@@ -223,6 +224,34 @@ export interface CoordinatorBootstrapGrant {
 	created_by: string | null;
 	revoked_at: string | null;
 }
+
+export interface CoordinatorBootstrapGrantAuthorizationInput {
+	grantId: string;
+	/** Server-trusted time, not a caller-supplied expiry or clock. */
+	nowMs: number;
+	expectedSeed?: { groupId: string; deviceId: string; publicKey: string; fingerprint: string };
+}
+
+export type CoordinatorBootstrapGrantAuthorizationError =
+	| "grant_not_found"
+	| "seed_enrollment_not_found"
+	| "worker_enrollment_not_found"
+	| "grant_revoked"
+	| "grant_expired"
+	| "group_archived"
+	| "device_revoked"
+	| "bootstrap_authorization_unavailable";
+
+/** A current read snapshot, not a permanent authorization capability. */
+export type CoordinatorBootstrapGrantAuthorizationResult =
+	| {
+			kind: "authorized";
+			authorizationVersion: 1;
+			grant: CoordinatorBootstrapGrant;
+			seedEnrollment: CoordinatorEnrollment;
+			workerEnrollment: CoordinatorEnrollment;
+	  }
+	| { kind: "rejected"; error: CoordinatorBootstrapGrantAuthorizationError };
 
 export interface CoordinatorScope {
 	scope_id: string;
@@ -464,7 +493,7 @@ export interface CoordinatorListReciprocalApprovalsInput {
 	status?: string;
 }
 
-export interface CoordinatorStore {
+export interface CoordinatorStore extends CoordinatorDeviceRevocationStore {
 	close(): Promise<void>;
 	createGroup(groupId: string, displayName?: string | null): Promise<void>;
 	getGroup(groupId: string): Promise<CoordinatorGroup | null>;
@@ -533,6 +562,9 @@ export interface CoordinatorStore {
 		opts: CoordinatorListScopeMembershipAuditInput,
 	): Promise<CoordinatorScopeMembershipAuditEvent[]>;
 	getBootstrapGrant(grantId: string): Promise<CoordinatorBootstrapGrant | null>;
+	getBootstrapGrantAuthorization(
+		input: CoordinatorBootstrapGrantAuthorizationInput,
+	): Promise<CoordinatorBootstrapGrantAuthorizationResult>;
 	listBootstrapGrants(groupId: string): Promise<CoordinatorBootstrapGrant[]>;
 	revokeBootstrapGrant(grantId: string, revokedAt?: string): Promise<boolean>;
 	listReciprocalApprovals(
@@ -552,6 +584,8 @@ export interface CoordinatorStore {
 }
 
 export interface CoordinatorBootstrapGrantVerification {
+	authorization_version: 1;
 	grant: CoordinatorBootstrapGrant;
+	seed_enrollment: CoordinatorEnrollment;
 	worker_enrollment: CoordinatorEnrollment;
 }
