@@ -376,6 +376,19 @@ before pi discards context. The preferred HTTP pack path — prove `GET /api/pro
 targeted `POST /api/pack` — is unledgered (no opencode retrieval-ledger row). The queue/sweeper
 behavior is shared with the other adapters.
 
+A history-import primitive rounds out the pi flow. The core `importPiSessions`/
+`parsePiSessionJsonl` import walks `~/.pi/agent/sessions/**/*.jsonl` (honoring
+`PI_CODING_AGENT_DIR`) and inserts the same `source: "pi"` raw events with deterministic ids, so
+re-imports dedupe against live-captured sessions. Imports are append-only: existing message ids must
+remain in transcript order, and new messages must follow the last stored event. Unsafe partial overlap
+(including already-flushed history or an unrepresented live tail) returns per-file `status: "error"`
+with a `partial_import:` reason, increments `filesErrored`, and leaves events, flush state, and file
+skip state untouched. The importer does not resequence events or rewrite extracted memories; use a
+separate destination database for a complete historical import. Validation and insertion share an
+immediate transaction so concurrent live capture cannot invalidate the ordering check. Idempotency
+is per destination database: unchanged files (size/mtime) are skipped via a `pi_import_state` table
+inside that database, and deterministic event ids dedupe reprocessing.
+
 ### OpenCode session finalization triggers
 - `session.idle` — finalizes current local buffer
 - `session.created` — finalizes before switching to a new session
