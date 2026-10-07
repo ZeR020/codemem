@@ -389,6 +389,16 @@ immediate transaction so concurrent live capture cannot invalidate the ordering 
 is per destination database: unchanged files (size/mtime) are skipped via a `pi_import_state` table
 inside that database, and deterministic event ids dedupe reprocessing.
 
+A lexical search primitive complements the import: core `searchPiSessions`/`extractPiSessionText`
+query the existing `raw_events` store (`source: "pi"`) directly — no new tables, indexes, or
+migrations. Stored payload envelopes are scanned most-recent-first with a bounded recency window
+(no FTS index by design), tokens reuse the memory-search lexical primitives, and results carry
+bounded content snippets with truncation markers and counts. Snippet windows retain matching
+text even at short caps. Serialized responses are capped at 50,000 characters, including JSON
+escaping in query echoes; oversized echoes become a prefix with `truncated: true`, while matching
+still uses the full query. The response shape is the shared contract later consumed by the viewer
+REST route, the pi-extension native tool, and the CLI.
+
 ### OpenCode session finalization triggers
 - `session.idle` — finalizes current local buffer
 - `session.created` — finalizes before switching to a new session
