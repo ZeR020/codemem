@@ -480,7 +480,7 @@ describe("searchPiSessions query echo bounds", () => {
 
 	it("preserves an escaped query echo that fits the response budget", () => {
 		const db = makeDb();
-		const query = "\u0000".repeat(8300);
+		const query = "\u0000".repeat(8000);
 		const response = searchPiSessions(db, query);
 		expect(response.query).toBe(query);
 		expect(response.truncated).toBe(false);

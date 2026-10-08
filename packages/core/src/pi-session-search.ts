@@ -54,6 +54,8 @@ const MAX_SEARCH_LIMIT = 20;
 const DEFAULT_SNIPPET_CHARS = 1200;
 const MIN_SNIPPET_CHARS = 100;
 const MAX_SNIPPET_CHARS = 4000;
+const MAX_QUERY_CHARS = 8192;
+const MAX_QUERY_TOKENS = 64;
 /** ~50KB serialized-response ceiling for one search call (D6). */
 const TOTAL_OUTPUT_CAP_CHARS = 50_000;
 /** Recency-window ceiling for one LIKE pass over raw_events. */
@@ -87,11 +89,13 @@ export interface PiSessionSearchMatch {
 export interface PiSessionSearchResponse {
 	/** Original query, or a bounded prefix when its serialized echo exceeds the output cap. */
 	query: string;
+	/** True when matching uses only the first 8192 input chars or 64 effective tokens; not echo clipping. */
+	query_truncated: boolean;
 	results: PiSessionSearchMatch[];
 	returned: number;
 	/** Matching text events found inside the recency scan window. */
 	total_matches: number;
-	/** True when query echo or matches were truncated by output or scan limits. */
+	/** True when matching input, query echo, or matches were truncated by input, output, or scan limits. */
 	truncated: boolean;
 }
 
@@ -236,7 +240,7 @@ function collectMatches(
 	return matches;
 }
 
-// Keep the full query for matching; bound only its echo, counting JSON escape costs.
+// Bound the display echo independently of the effective query, counting JSON escape costs.
 function capQueryEcho(response: PiSessionSearchResponse): PiSessionSearchResponse {
 	if (JSON.stringify(response).length <= TOTAL_OUTPUT_CAP_CHARS) return response;
 	const capped = { ...response, query: "", truncated: true };
@@ -256,7 +260,8 @@ function capQueryEcho(response: PiSessionSearchResponse): PiSessionSearchRespons
  * Matches are ordered most-recent-first; no matches yield an explicit empty
  * response (never an error). Tokens reuse the memory-search lexical
  * primitives (expandQuery: alphanumeric tokens minus FTS operators and stop
- * words, OR semantics for broad matching).
+ * words, OR semantics for broad matching), using the first 8192 input chars
+ * and at most 64 effective tokens before constructing SQL.
  */
 export function searchPiSessions(
 	db: Database,
@@ -268,15 +273,18 @@ export function searchPiSessions(
 	// Same tokenization as memory search: expandQuery returns the effective
 	// tokens OR-joined, so splitting on " OR " recovers them without
 	// duplicating the stop-word/operator lists.
-	const expanded = expandQuery(query);
-	const tokens = expanded ? expanded.split(" OR ") : [];
+	const expanded = expandQuery(query.slice(0, MAX_QUERY_CHARS));
+	const allTokens = expanded ? expanded.split(" OR ") : [];
+	const queryTruncated = query.length > MAX_QUERY_CHARS || allTokens.length > MAX_QUERY_TOKENS;
+	const tokens = allTokens.slice(0, MAX_QUERY_TOKENS);
 
 	const empty: PiSessionSearchResponse = {
 		query,
+		query_truncated: queryTruncated,
 		results: [],
 		returned: 0,
 		total_matches: 0,
-		truncated: false,
+		truncated: queryTruncated,
 	};
 	if (tokens.length === 0) return capQueryEcho(empty);
 
@@ -287,10 +295,11 @@ export function searchPiSessions(
 
 	const buildResponse = (results: PiSessionSearchMatch[]): PiSessionSearchResponse => ({
 		query,
+		query_truncated: queryTruncated,
 		results,
 		returned: results.length,
 		total_matches: matches.length,
-		truncated: windowSaturated || matches.length > results.length,
+		truncated: queryTruncated || windowSaturated || matches.length > results.length,
 	});
 
 	let capped = matches.slice(0, parsed.limit);
