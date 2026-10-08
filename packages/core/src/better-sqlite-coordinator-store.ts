@@ -21,6 +21,7 @@ import {
 	AuthAccountProfileOperations,
 	type CoordinatorAuthAccountProfileInput,
 } from "./coordinator-auth-account-profile.js";
+import { upgradeAuthBrowserOwnerPurposeSchema } from "./coordinator-auth-browser-schema-upgrade.js";
 import {
 	AUTH_BROWSER_TXN_SCHEMA_SQL,
 	type CoordinatorAuthBrowserConfig,
@@ -488,6 +489,11 @@ function initializeDeviceLedgerSchemas(db: DatabaseType): void {
 	db.exec(DEVICE_REVOCATION_SCHEMA_SQL);
 }
 
+function initializeAuthBrowserSchema(db: DatabaseType): void {
+	upgradeAuthBrowserOwnerPurposeSchema(db);
+	db.exec(AUTH_BROWSER_TXN_SCHEMA_SQL);
+}
+
 function initializeSchema(db: DatabaseType): void {
 	db.exec(IDENTITY_GROUP_GRANT_SCHEMA_SQL);
 	initializeDeviceLedgerSchemas(db);
@@ -497,7 +503,7 @@ function initializeSchema(db: DatabaseType): void {
 	upgradeAuthSessionRetentionSchema(db);
 	db.exec(AUTH_SESSION_SCHEMA_SQL);
 	db.exec(AUTH_ACCOUNT_PROFILE_SCHEMA_SQL);
-	db.exec(AUTH_BROWSER_TXN_SCHEMA_SQL);
+	initializeAuthBrowserSchema(db);
 	db.exec(`
 		CREATE TABLE IF NOT EXISTS groups (
 			group_id TEXT PRIMARY KEY,

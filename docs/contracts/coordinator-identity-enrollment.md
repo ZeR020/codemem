@@ -344,16 +344,32 @@ or automatic backfill.
 | --- | --- | --- |
 | [`coordinator-auth-link.ts`](../../packages/core/src/coordinator-auth-link.ts) | Legacy first-link finalization writes link and audit rows together after its attempt and authority checks pass, recording controller evidence, the creation configuration revision, and the resolved account subject. | `recordAuthLinkOidcVerified` accepts claims from an already trusted caller and does not verify a JWT; its controller-attestation evidence is for first linking, not owner enrollment. |
 | [`coordinator-oidc.ts`](../../packages/core/src/coordinator-oidc.ts) | The maintained OIDC client performs authorization-code verification with expected state, nonce, PKCE, required ID token, exact issuer and subject parsing. | It returns a transient verified account result; it does not resolve or persist the future owner attempt. |
-| [`coordinator-auth-browser-transaction.ts`](../../packages/core/src/coordinator-auth-browser-transaction.ts) | A one-use browser transaction stores a `state_hash` commitment plus nonce and PKCE verifier material for `signin` or `link`; consumption burns the secret material. | `state_hash` is not raw state, and the schema has no owner-enrollment purpose, verified subject, resolved Identity, or owner-proof record. Consumption alone is not verification. |
+| [`coordinator-auth-browser-transaction.ts`](../../packages/core/src/coordinator-auth-browser-transaction.ts) | A one-use browser transaction stores a `state_hash` commitment plus nonce and PKCE verifier material for `signin` or `link`; consumption burns the secret material. | The schema now reserves `owner_enroll`, but legacy start/consume/resolve reject it. No owner ceremony is implemented; consumption alone is not verification. |
 | [`coordinator-auth-session.ts`](../../packages/core/src/coordinator-auth-session.ts) | Sign-in joins a verified subject to an active account link and writes a purgeable, attempt-less session receipt. | A management session is insufficient for owner enrollment; the callback can retain an already-live session while verifying a different account. |
 | [`coordinator-identity-group-grant.ts`](../../packages/core/src/coordinator-identity-group-grant.ts) | Revisioned active grants can provide a transport-enrollment snapshot. | A grant is device/transport control authority, not proof of account ownership or a Team/Project permission. |
 
-**Pending approval boundary:** the owner-specific browser-transaction purpose,
-owner-attempt and receipt schema (including separate current-verifier and
-historical link revisions, retention, and collision evidence), error vocabulary,
-endpoint paths, quotas, and reviewed legacy-evidence process. Reuse the existing
+The user approved local/fake-provider schema work: one owner-attempt table with
+finalized rows serving as the retained outcome receipt, and an `owner_enroll`
+browser-transaction purpose. That does not approve live migration or activation.
+
+**Pending approval boundary:** collision evidence, error vocabulary, endpoint
+paths, quotas, and the reviewed legacy-evidence process. Reuse the existing
 OIDC and browser flow by default, keep the owner path off, and do not add a
 signing framework or provider OAuth server.
+
+#### Reserved browser purpose
+
+This change reserves only the `owner_enroll` browser-transaction purpose.
+Owner-attempt storage and retained outcome receipts follow in a separate change;
+neither is implemented here.
+
+Migration `0029` and the atomic local SQLite upgrade preserve existing sign-in
+and link browser rows, uniqueness, indexes, and purge counters. Legacy handlers
+reject the reserved owner purpose without consuming its nonce or PKCE material.
+
+This is an inert browser reservation: no attempt creation, binding issuance, owner route,
+or verified enrollment commit is implemented. Applying the live migration,
+deploying, and testing real Google sign-in remain separate approval gates.
 
 #### Legacy enrollment and reactivation guards
 
