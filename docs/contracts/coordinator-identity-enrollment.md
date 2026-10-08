@@ -204,6 +204,291 @@ This ledger is a prerequisite for the new owner-enrollment and management paths.
 Existing Identity-group transport grants and revocation subjects are not device
 ownership records and must not be repurposed as that authority.
 
+#### Inert storage foundation
+
+`coordinator_device_ownership_bindings` retains immutable device ID, canonical key
+ID, Identity, coordinator metadata, binding ID, provenance/reference, and binding
+time. Device IDs and canonical keys are globally unique within the coordinator
+database; nominating different coordinator metadata cannot evade a collision.
+One Identity may own many devices with distinct keys. Reusing a bound key under a
+new device ID is denied even for the same Identity; it is not a new-device clone
+or ownership-transfer mechanism.
+All columns require text storage, preventing binary copies of identifiers from
+bypassing text uniqueness or collision comparisons.
+
+The table has no cascading reference to enrollment, groups, accounts, sessions,
+attempts, grants, or audit records. Its insert-only constraints reject updates,
+deletes, and replacement inserts that would release an existing binding. A future
+verified retry must compare the retained tuple and stage a conditional insert in
+the winning commit, never use replacement or an ownership-changing upsert.
+
+This first foundation only adds aligned schema and migration source. It does not
+issue bindings, backfill legacy rows, enforce enrollment ownership, or expose an
+owner-management route. Existing unbound legacy behavior remains unchanged.
+Schema constraints and provenance labels are not proof of verified ownership.
+Verified-source resolution, every enrollment/repair/reactivation writer guard,
+and atomic binding/enrollment/audit commitment must be implemented and validated
+before ledger issuance or an explicit legacy migration can activate. Applying
+the live migration remains a separate approval gate.
+
+#### Verified owner evidence and final commit (pending approval)
+
+This is the required evidence shape for the future owner-enrollment attempt. It
+is not a new route, schema migration, or activation approval. The attempt must
+persist the independently verified `issuer` and `subject`, the resolved
+Identity, and the exact active account-link tuple (`coordinator_id`, `link_id`,
+`issuer`, `subject`, `identity_id`, `attempt_id`,
+`controller_attestation_id`, `auth_config_revision`).
+
+That link revision is historical creation provenance. Separately pin the current
+verifier configuration revision for the owner attempt and the active Identity-group-grant
+revision set.
+
+In that tuple, `attempt_id` is the **link-creation** attempt, not the future
+owner-enrollment attempt. The link-creation attempt, controller attestation,
+and link-creation configuration revision are historical equality pins against
+the active link row only. Finalization must not require the old controller,
+device, or signer to remain active, enrolled, reachable, or unrevoked.
+
+Revoking an old signing device does not erase an account link, its sessions, or issued
+grants.
+
+Build that record only from the trusted provider-verification result followed by
+the server lookup of the active exact account link. A public
+`verifiedIdentityId`, server-actor hint, browser session row, profile field, or
+stored link provenance is not a substitute. Link provenance records how a link
+was created; it is not cryptographic proof recovered from the database.
+
+The ceremony additionally retains these facts, immutable once recorded:
+
+- the exact pending public key, its server-derived canonical key ID, legacy
+  text fingerprint, device ID, coordinator, origin, literal loopback URI, and
+  browser capability;
+- purpose, deadline, browser-start commitment and original browser binding;
+- the confirmation commitment, one-use completion-secret commitment created by
+  confirmation, and the pending key's final signature proof; and
+- trusted Identity-group-grant revisions needed for the groups that may receive
+  enrollment.
+
+The final SQLite transaction or D1 batch must recheck all pinned facts
+at commit time. In particular, it must require an unexpired confirmed attempt,
+the current active exact link, and the current verifier configuration revision
+that the owner attempt captured. It must not require an active link's historical
+creation revision to equal the current verifier revision.
+
+It must require the same verified `issuer`/`subject`/Identity, an active grant for
+each target group at its pinned revision, and each group to remain unarchived. It must also
+deny a coordinator-wide revocation. Group and coordinator scope checks must
+prevent a grant from one coordinator or group from authorizing another.
+
+For a fresh owner enrollment, any existing ownership binding **or**
+`enrolled_devices` row for the device ID or server-derived canonical key ID
+denies before enrollment, even when it names the same verified Identity. An
+exact retry of its own prior committed binding is handled by the prior-commit
+rule below before this fresh collision check.
+
+Same-Identity attachment must meet the separate writer rules; it is not a
+positive proof for the fresh owner path. The commit must derive canonical-key
+collision evidence from actual stored public keys, not raw fingerprint equality. The required predicate
+and its evidence representation remain pending schema approval where current
+storage cannot express them.
+
+Only the winning transition whose checks all pass may write these together:
+
+1. transition the attempt to its terminal committed state;
+2. insert the immutable ownership binding;
+3. add the permitted group enrollments;
+4. insert exactly one durable redacted `owner_device_enrolled` audit event; and
+5. insert the compact outcome receipt used for exact reconciliation.
+
+The receipt insertion must succeed in that same transaction or batch; a SQL
+insertion failure aborts and rolls back all five effects. A later standalone
+receipt write is not permitted.
+
+The terminal committed state is `finalized`. No dependent write may follow a
+zero-row transition or a separate ownership-binding write.
+
+There is no standalone ownership bind, replacement upsert, or ownership
+transfer. One Identity may add many devices with distinct keys. Existing local
+use and direct-peer sync remain available without Google authentication.
+
+An exact retry may reconcile only a retained ownership binding and compact
+outcome receipt that match the original owner-attempt ID, device ID, exact public
+key and canonical key ID, verified `issuer`/`subject`/Identity, and account-link
+reference. It compares the attempt, enrollment, and audit rows only while those
+rows still exist. After cleanup, a matching receipt returns a read-only
+prior-commit result; missing cleaned rows never authorize a new commit, restore
+an enrollment, re-enable a device, or add grants.
+
+The receipt must retain the original completion and key commitments, or protected
+proof references, needed for that match. Its proposed schema and public output
+remain privacy-redacted. The wire status and error vocabulary are pending
+approval.
+
+An unknown or lost response remains **unknown until reconciled**.
+Do not claim rollback or start a replacement attempt merely because the caller
+did not receive a response.
+
+An exact receipt proves a prior commit, not current group permission. It cannot
+create authority from fresh state or turn revoked grants into authority.
+
+The ownership ledger and its outcome receipt outlive group enrollment, browser
+session, attempt, and audit-retention cleanup. Identity-group grants remain
+transport authority only; they are not Team or Project permissions. A legacy
+migration may write a binding only after review of actual retained evidence.
+
+Missing, ambiguous, or different-owner evidence denies without a hint, guess,
+or automatic backfill.
+
+| Current source | What it can support | Why it is not an owner-attempt proof |
+| --- | --- | --- |
+| [`coordinator-auth-link.ts`](../../packages/core/src/coordinator-auth-link.ts) | Legacy first-link finalization writes link and audit rows together after its attempt and authority checks pass, recording controller evidence, the creation configuration revision, and the resolved account subject. | `recordAuthLinkOidcVerified` accepts claims from an already trusted caller and does not verify a JWT; its controller-attestation evidence is for first linking, not owner enrollment. |
+| [`coordinator-oidc.ts`](../../packages/core/src/coordinator-oidc.ts) | The maintained OIDC client performs authorization-code verification with expected state, nonce, PKCE, required ID token, exact issuer and subject parsing. | It returns a transient verified account result; it does not resolve or persist the future owner attempt. |
+| [`coordinator-auth-browser-transaction.ts`](../../packages/core/src/coordinator-auth-browser-transaction.ts) | A one-use browser transaction stores a `state_hash` commitment plus nonce and PKCE verifier material for `signin` or `link`; consumption burns the secret material. | `state_hash` is not raw state, and the schema has no owner-enrollment purpose, verified subject, resolved Identity, or owner-proof record. Consumption alone is not verification. |
+| [`coordinator-auth-session.ts`](../../packages/core/src/coordinator-auth-session.ts) | Sign-in joins a verified subject to an active account link and writes a purgeable, attempt-less session receipt. | A management session is insufficient for owner enrollment; the callback can retain an already-live session while verifying a different account. |
+| [`coordinator-identity-group-grant.ts`](../../packages/core/src/coordinator-identity-group-grant.ts) | Revisioned active grants can provide a transport-enrollment snapshot. | A grant is device/transport control authority, not proof of account ownership or a Team/Project permission. |
+
+**Pending approval boundary:** the owner-specific browser-transaction purpose,
+owner-attempt and receipt schema (including separate current-verifier and
+historical link revisions, retention, and collision evidence), error vocabulary,
+endpoint paths, quotas, and reviewed legacy-evidence process. Reuse the existing
+OIDC and browser flow by default, keep the owner path off, and do not add a
+signing framework or provider OAuth server.
+
+#### Legacy enrollment and reactivation guards
+
+Direct enrollment, replacement, and reactivation now check retained device-ID
+and canonical-key bindings in the actual write. Existing legacy entrypoints
+carry no verified owner proof, so any retained identifier is denied—even when
+the supplied Identity hint matches the binding. Unbound legacy behavior remains
+unchanged; a fingerprint or caller-supplied Identity cannot substitute for proof.
+Enrollment replacement checks both the incoming key and the captured currently
+stored key. An unrelated incoming key cannot overwrite an existing alias whose
+stored key is retained under another device ID. The final write pins the current
+public key or row absence across hashing; changed evidence cannot refresh an
+unconfirmed attempt into success.
+
+Ownership denial uses `device_ownership_requires_verified_identity` (HTTP 403)
+after existing admission and rate limits. Revocation retains its earlier denial
+priority and reactivation behavior. Missing or unconfirmed ownership storage uses
+the fixed `device_ownership_authorization_unavailable` error (HTTP 503), without
+database diagnostics. An unavailable receipt is not proof that no write committed;
+callers must reconcile state rather than infer rollback or success from a later read.
+Unconfirmed storage/receipt failures intentionally share this code; this slice
+does not add operator logging or expose the original database cause.
+
+Disabling or removing enrollment still does not release ownership. SQLite's
+shared helper guards the enrollment write used by Project-invitation acceptance
+and join approval inside their existing transactions. Project acceptance, retry
+repairs, and join approval now have the separate guards described below.
+Cross-writer retention checks and verified commitment remain required before issuance.
+
+Worker deployments of these guards require migration `0028` first. An absent
+ledger is unavailable, not evidence that identifiers are unbound. Local SQLite
+initialization creates the empty ledger automatically. Verified-source resolution,
+all remaining writer guards, and the atomic enrollment/audit commit remain required
+before owner enrollment or an explicit legacy migration can activate.
+
+#### SQLite recipient invitation guards
+
+SQLite recipient acceptance checks retained ownership in consumption, enrollment,
+Identity-label repair, and dependent bootstrap grant writes, including retries and
+grant recovery. Server-assigned or target Identity labels are not owner proof.
+An owned recipient is denied without consuming an invitation or changing its
+enrollment; the existing immediate transaction rolls back a late guard failure.
+
+Ownership checks target the recipient being enrolled or repaired, not the inviter
+whose enrollment is only read. An already-owned inviter may still invite an
+unbound recipient. Inviter revocation checks and captured key evidence remain in
+force, and invalid invitation/key bindings retain their earlier private errors.
+Raw inspection and independently issued grants remain readable.
+
+The SQLite slice landed separately from the D1 adoption below. Cross-writer
+retention checks must still pass before binding issuance can activate.
+
+#### D1 recipient invitation guards
+
+D1 checks the same recipient ownership boundary on acceptance, enrollment,
+Identity repair, retries, and bootstrap grant recovery. Every write pins the
+captured invitation and participant evidence. Enrollment follows the winning
+consume through `changes() = 1`, and a final SQL assertion aborts a batch if its
+authority guard drifts. Owned inviters remain usable; their revocation and
+current-tuple checks are retained.
+
+Unconfirmed or malformed receipts fail closed with the fixed unavailable error.
+A SQL assertion failure rolls back its batch, but a bad or lost receipt may arrive
+after commit; a later read cannot manufacture success or prove rollback.
+Binding issuance, verified owner proof, and live activation remain disabled.
+
+#### Project invitation guards
+
+Both stores check retained recipient device-ID and incoming/current canonical-key
+ownership on Project acceptance, enrollment, retry Identity repair, and dependent
+bootstrap effects. A matching recipient actor label is not owner proof. Owned
+inviters remain usable, with their revocation and captured-key checks unchanged.
+The reviewed Project intent remains pinned; these checks do not grant new access.
+
+SQLite keeps these effects inside its immediate transaction and rolls back late
+ownership denial. D1 chains fresh enrollment to the winning consume and performs
+retry repair in the guarded batch, ending with an SQL assertion. Invalid receipts
+remain unavailable outcomes, not proof of rollback. Fresh grant insertion requires
+the winning claim; D1 retry recovery can restore only the exact captured grant
+pointer. SQLite retains its existing behavior of not recreating a missing grant
+row whose pointer already exists.
+
+These guards close Project invitation writes, not join approval or verified-owner
+enrollment. Binding issuance and live activation remain disabled until the
+remaining writer checks and atomic verified ownership commitment pass.
+
+#### Join approval guards
+
+Both stores deny approval for retained recipient device IDs and incoming/current
+canonical keys. Reviewer labels and seed ownership are not recipient owner proof;
+an owned seed may still help enroll an unbound recipient. Rejection remains usable,
+and a completed review can still be read as a no-transition history result.
+
+Approval pins the pending request, seed tuple, and current recipient key or row
+absence. SQLite checks these inside its immediate transaction. D1 chains dependent
+enrollment and bootstrap writes to the winning compare-and-set, not merely a shared
+timestamp; its final SQL assertion checks ownership and revocation even when the
+change-count chain becomes zero. A failed SQL assertion rolls back that batch.
+
+Ownership decisions require confirmed numeric values and fail privately when
+storage is unavailable. Lost or malformed batch receipts remain incomplete outcomes
+and do not prove rollback. These join guards do not issue bindings or implement
+verified-owner enrollment. Cross-writer retention checks, verified proof resolution,
+and atomic binding/enrollment/audit commitment remain activation prerequisites.
+
+#### Cross-writer retention verification
+
+The production enrollment writers are confined to the two coordinator stores:
+direct enrollment, reactivation, recipient acceptance and Identity repair,
+Project acceptance and Identity repair, and join approval. SQLite shares its
+legacy upsert across direct, Project, and join paths. Rename, disable, and removal
+change labels or lifecycle state; they do not create owner authority.
+
+The shared test matrix connects different writers across disable/removal,
+fixture-only last-group deletion/recreation, and transient-history cleanup.
+Retained device IDs, incoming canonical aliases, and captured current keys deny
+the next writer without changing application rows. Clean controls normalize
+fixture Identity labels to avoid unrelated tuple conflicts; this is not a claim
+that production cleanup clears those labels.
+
+Existing writer-specific contracts cover hashing/write races, private admission
+errors, and unknown receipts.
+
+Core tests close and reopen real SQLite files; their SQLite-backed D1 adapter is
+not native restart evidence. The Worker pool separately runs the shared matrix
+against native D1. Cold HTTP tests dispose and recreate Miniflare on persistent
+D1 storage, check the unchanged snapshot before any new write, and execute
+compiled Core guards in the new Worker's request context without reseeding.
+
+Representative cleanup retains separately issued Identity grants, account links,
+controller records, and raw history. None becomes a positive owner credential.
+These checks verify negative legacy-writer retention only: verified proof,
+atomic owner commitment, scope-authority filtering, device exclusions, and
+onboarding integration remain separate activation gates, and no bindings are issued.
+
 ### Trusted Identity-group grants
 
 Add a coordinator-owned, revisioned Identity/group grant independent of device
@@ -315,11 +600,17 @@ pattern, not a separate audit service or event framework. Internal tombstone row
 already retain durable effect evidence; public management additionally needs
 verified authority and idempotent action attribution in that same transaction.
 
-Per-Team exclusions do not block the Identity binding. They filter only that
-Team's derived eligibility and must survive enrollment/upsert. A Team cannot veto
-the device's unrelated memberships or direct grants. Today's `person_all_devices`
-eligibility treats any decision row as a whole-Team conflict; scoped exclusion
-support must be corrected and tested before the pilot claims this behavior.
+Per-Team exclusions do not block the Identity binding. In `person_all_devices`,
+a valid `excluded` decision removes only that device ID from the Team's derived
+eligibility. Other active devices and member Identities remain eligible.
+
+The exclusion persists across assignment-version changes; enrollment or upsert
+cannot clear it. `included` and `unresolved` remain incompatible with this mode,
+and malformed, duplicate, or conflicting decisions still block the policy.
+
+`reviewed_allowlist` still requires an `included` decision matching the device's
+current assignment version, with no automatic mode conversion. Exclusion from
+one Team does not remove direct grants or access supplied by another Team.
 
 The normal authenticated-Team default must accept owner-enrolled devices. An existing `reviewed_allowlist` is not widened silently; retaining it or converting it to the default needs an explicit policy choice. Coordinator-wide device/key tombstones block re-enrollment; Team exclusions block only access through that Team. The approved 24-hour permission ceiling does not make permissions implemented: issuer, wire format, bindings, and enforcement remain separate gates.
 
