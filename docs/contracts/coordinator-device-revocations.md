@@ -390,9 +390,114 @@ A missing or malformed roster receipt is unavailable, not an empty authorized
 roster. Final results must match the captured scope and contain only exact captured
 member tuples; validated members sort by device ID in both stores.
 
-Neither backend falls back to raw membership getters. Public routes and caches
-do not use this method yet; versioned wire responses, all refresh branches, and
-managed local readers remain separate implementation slices.
+Neither backend falls back to raw membership getters.
+
+### Signed scope responses
+
+`GET /v1/scopes` returns `{ version: 1, items: scope[] }` as a discovery catalogue.
+Its metadata is not member or key permission; consumers must fetch the current
+authorization snapshot for each scope before using it as cache authority.
+
+`GET /v1/scopes/:scope_id/members` requires signed admission and rate limiting
+before calling `getScopeAuthorization` once. It returns
+`{ authorization_version: 1, scope, items: [{ membership, enrollment, key_id }] }`.
+
+The requester must appear in the current snapshot with the exact group, device,
+public key, fingerprint, and Identity captured before signature verification.
+Removal, disablement, revocation, or a principal change cannot grant access through
+a newly read enrollment. Failure returns `403 scope_membership_required`.
+
+Missing, inactive, foreign-source, or archived scope decisions return the masked
+`404 scope_not_found`. Unconfirmed snapshots and storage failures return fixed
+`503 scope_authorization_unavailable`, without database diagnostics.
+
+Raw admin listings remain inspection-only, and bootstrap responses are unchanged.
+Older cache clients that expect raw membership rows cannot consume this format;
+deploy the wire and cache changes together.
+
+### Current-authority cache refresh
+
+Remote refresh always uses the runtime device's signed requests, including when
+an admin secret is configured. An admin secret alone cannot populate access
+caches: a runtime without an enrolled signing device keeps its cache stale.
+Raw admin APIs still support inspection and management.
+
+Local refresh reads `getScopeAuthorization` directly from coordinator storage.
+`coordinatorDbPath` selects that database separately from the memory/signing
+database selected by `dbPath`. This local read uses the store's current decision;
+it does not add a new browser, account-owner, or signed-request ceremony.
+
+Both paths require numeric version 1 and complete current scope/member/key
+evidence. Malformed, unversioned, duplicate, foreign-source, or superseded
+snapshots fail rather than falling back to raw history or an empty roster.
+The cache validates each enrollment's usable key, device/group tuple, fingerprint
+field shape, and canonical key ID. Legacy stored fingerprints remain unchanged
+tuple evidence; the decoder does not require them to equal a newly computed hash.
+Validated key evidence is retained with the cache as described below; it is not
+a new signed permission or account-owner proof.
+
+The current snapshot's scope metadata replaces catalogue metadata. The configured
+cache authority can be a URL rather than the server's coordinator ID; source
+tuples are checked before mapping them into that cache namespace.
+
+Refresh gathers and validates every scope in a group before committing scope
+rows, members, omissions, and successful freshness together. Malformed snapshots
+and source or epoch conflicts preserve that group's prior cache and success time
+and record it as stale. Other groups can still refresh independently.
+
+Member epochs are compared only when the current snapshot includes that member.
+A validated omission revokes its cached row even when the member epoch is newer
+than the unchanged scope epoch, without lowering the cached epoch.
+
+If a snapshot re-adds a cached revoked device at the same epoch, refresh grants
+nothing but still applies validated omissions and scope archiving in one
+transaction. The group stays stale and keeps its last success time, while other
+members' removal still takes effect. The coordinator must advance the re-added
+device's membership epoch before that group can become fresh again.
+
+The cache keeps its existing freshness lifetime and monotonic revocation rules.
+Version 1 is a format, not a new lease. Coordinator-managed reader adoption,
+including direct-SQL consumers, remains a separate slice; ordinary local and
+direct-peer authentication is unchanged.
+
+### Retained managed-key evidence
+
+Successful refresh retains version-1 scope, membership, enrollment, and canonical
+key evidence in `scope_membership_authorization_evidence`. Evidence replacement,
+cache rows, omissions, and freshness commit in the same group transaction.
+Only known public DTO fields are stored, not unknown fields or provider secrets.
+
+Refresh captures the group's local `refresh_revision` before fetching snapshots.
+The transaction compares it before writing and advances it with committed state.
+A superseded response cannot restore an older key or archived scope, or move the
+latest success time backward. The revision is write ordering, not a lease or
+membership epoch; cold schema upgrades preserve legacy history without proof
+backfill, and effective reads still perform no schema writes.
+
+A delayed failure also leaves newer committed state unchanged. If the revision
+cannot be read or failure state cannot be written, the refresh returns a stale
+result for that group without changing its stored state; other groups continue.
+Raw compatibility reads also perform no schema writes, including on legacy
+read-only databases that lack the revision column.
+
+`getEffectiveCachedScopeAuthorization` requires matching retained evidence for
+coordinator-managed scopes. Old or unproven rows cannot grant access through this
+helper until a successful current refresh; timestamps and pinned keys do not
+backfill proof or infer a historical server-ID-to-URL alias.
+
+The helper compares authority-relevant fields, not presentation labels or dates.
+Missing, malformed, or mismatched evidence denies without creating tables or
+writing during the read. Its optional `expectedPublicKey` checks the canonical
+key blob, accepting text aliases of the same key while rejecting another key.
+
+Previously verified evidence keeps the existing offline behavior; this helper
+adds no expiry or freshness requirement. Unmanaged/manual scopes keep their
+existing behavior. Removal-only refreshes can prune evidence but cannot mint
+proof or grant access.
+
+The raw cached helper remains available for history and compatibility. Network
+and local direct-SQL consumers still require separate adoption of the effective
+decision; retaining evidence alone does not complete reader enforcement.
 
 ## Activation limits
 
