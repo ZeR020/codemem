@@ -499,6 +499,18 @@ The raw cached helper remains available for history and compatibility. Network
 and local direct-SQL consumers still require separate adoption of the effective
 decision; retaining evidence alone does not complete reader enforcement.
 
+Scoped request admission and scope advertisement require retained evidence for
+both devices and compare the local signing key and the authenticated peer key.
+Manual and direct-peer scopes retain their existing rules. Coordinator-derived
+peer trust, replication, snapshot selection, and remaining local consumers still
+need adoption before end-to-end enforcement is complete.
+
+Pushed batches also check every declared operation scope, reassignment source
+and destination, and the stored scope of any targeted memory mutation. Omitting
+the envelope scope or changing the entity label cannot bypass managed proof.
+Failure rejects the entire batch before applying operations; existing input-error
+precedence and origin-bound cleanup after revocation remain unchanged.
+
 ## Activation limits
 
 Existing group disable/removal does not create global subjects automatically.

@@ -34,6 +34,7 @@ import type {
 	ShareOperationPlan,
 	SharePersonIntent,
 	ShareProjectIntent,
+	SyncScopeResetReason,
 } from "@codemem/core";
 import {
 	ACCESS_CLEANUP_OP_TYPE,
@@ -95,6 +96,7 @@ import {
 	formatHostPort,
 	friendlyDeviceName,
 	getCoordinatorGroupPreference,
+	getEffectiveCachedScopeAuthorization,
 	getRecipientPolicyAuthorityState,
 	getSyncResetState,
 	type InboundScopeRejectionPeerSummary,
@@ -172,6 +174,7 @@ import {
 	SYNC_FEATURES_HEADER,
 	SYNC_SCOPE_QUERY_PARAM,
 	schema,
+	scopeAuthorizationFailureReason,
 	serializeRecipientPolicyTeamMutation,
 	summarizeInboundScopeRejections,
 	supportsSyncFeature,
@@ -2459,7 +2462,17 @@ function unauthorizedPayload(): Record<string, string> {
 
 const SYNC_AUTH_STORE_BUSY_REASON = "sync_auth_store_busy";
 
-type SyncAuthResult = { ok: boolean; reason: string; deviceId: string };
+type AuthenticatedSyncPeer = {
+	ok: true;
+	reason: "ok";
+	deviceId: string;
+	authenticatedPeerSigningKey: string;
+};
+type SyncAuthResult = AuthenticatedSyncPeer | { ok: false; reason: string; deviceId: string };
+
+function authenticatedSyncPeer(deviceId: string, publicKey: string): AuthenticatedSyncPeer {
+	return { ok: true, reason: "ok", deviceId, authenticatedPeerSigningKey: publicKey };
+}
 type VerifiedDirectPeerSignature = { ok: true; version: 2 | 3 } | { ok: false; reason: string };
 
 const DIRECT_PEER_SIGNATURE_VERSION_NUMBER = 3;
@@ -2664,7 +2677,7 @@ function authorizeSyncRequest(
 		const versionResult = recordDirectPeerSignatureVersion(store, deviceId, verification.version);
 		if (versionResult) return versionResult;
 	}
-	return { ok: true, reason: "ok", deviceId };
+	return authenticatedSyncPeer(deviceId, publicKey);
 }
 
 function bootstrapPayloadRecord(value: unknown): value is Record<string, unknown> {
@@ -2872,7 +2885,7 @@ async function authorizeBootstrapGrantRequest(
 		);
 		if (versionResult) return versionResult;
 	}
-	return { ok: true, reason: "ok", deviceId };
+	return authenticatedSyncPeer(deviceId, workerPublicKey);
 }
 
 function parseJsonList(value: unknown): string[] {
@@ -3520,6 +3533,7 @@ function mapPeerRow(
 	const perScopeSync = listPerPeerScopeSyncState(store.db, {
 		localDeviceId: localDeviceId ?? null,
 		peerDeviceId: peerId,
+		...peerScopeDiagnosticKeys(store, row, localDeviceId),
 	});
 	return {
 		peer_device_id: row.peer_device_id,
@@ -4403,7 +4417,7 @@ function readViewerBinding(dbPath: string): { host: string; port: number } | nul
 }
 
 const PEERS_QUERY = `
-	SELECT p.peer_device_id, p.name, p.pinned_fingerprint, p.addresses_json,
+	SELECT p.peer_device_id, p.name, p.pinned_fingerprint, p.public_key, p.addresses_json,
 	       p.last_seen_at, p.last_sync_at, p.last_error,
 	       p.runtime_version, p.runtime_version_observed_at,
 	       p.projects_include_json, p.projects_exclude_json, p.claimed_local_actor,
@@ -4446,15 +4460,127 @@ function negotiatedSyncCapability(c: Context) {
  * network-accessible. All requests are auth-gated via signature
  * verification so unauthenticated callers are rejected.
  */
-function serveAuthorizedSnapshot(c: Context, store: MemoryStore, peerDeviceId: string) {
+function syncScopeAuthorizationContext(
+	store: MemoryStore,
+	auth: AuthenticatedSyncPeer,
+	localDeviceId: string,
+) {
+	return {
+		db: store.db,
+		localDeviceId,
+		peerDeviceId: auth.deviceId,
+		localSigningPublicKey: loadPublicKey(syncKeysDir()),
+		authenticatedPeerSigningKey: auth.authenticatedPeerSigningKey,
+	};
+}
+
+function peerScopeDiagnosticKeys(
+	store: MemoryStore,
+	row: Record<string, unknown>,
+	localDeviceId?: string | null,
+) {
+	return {
+		localSigningPublicKey: store.db
+			.prepare("SELECT public_key FROM sync_device WHERE device_id = ?")
+			.pluck()
+			.get(localDeviceId ?? "") as string | undefined,
+		authenticatedPeerSigningKey: typeof row.public_key === "string" ? row.public_key : null,
+	};
+}
+
+// Default-lane batches omit body.scope_id; validate all signed operation scopes,
+// including filtered-out rows, before applying any batch, regardless of capability.
+function validateManagedScopes(
+	scopeIds: ReadonlySet<string>,
+	context: ReturnType<typeof syncScopeAuthorizationContext>,
+): { scopeId: string; reason: SyncScopeResetReason } | null {
+	for (const scopeId of scopeIds) {
+		if (!scopeId || scopeId === LOCAL_DEFAULT_SCOPE_ID) continue;
+		const localAuthorization = getEffectiveCachedScopeAuthorization(context.db, {
+			deviceId: context.localDeviceId,
+			scopeId,
+			expectedPublicKey: context.localSigningPublicKey?.trim() ?? "",
+		});
+		// Only known unmanaged authorities bypass managed proof; unknown scopes fail closed.
+		const authority = localAuthorization.scope?.authority_type;
+		if (authority === "manual" || authority === "invite" || authority === "local") continue;
+		if (authority !== "coordinator") return { scopeId, reason: "missing_scope" };
+		const localReason = scopeAuthorizationFailureReason(localAuthorization);
+		if (localReason) return { scopeId, reason: localReason };
+		const peerAuthorization = getEffectiveCachedScopeAuthorization(context.db, {
+			deviceId: context.peerDeviceId,
+			scopeId,
+			expectedPublicKey: context.authenticatedPeerSigningKey.trim(),
+		});
+		const peerReason = scopeAuthorizationFailureReason(peerAuthorization);
+		if (peerReason) return { scopeId, reason: peerReason };
+	}
+	return null;
+}
+
+function addExistingMutationScopes(
+	db: MemoryStore["db"],
+	ops: readonly ReplicationOp[],
+	scopeIds: Set<string>,
+): void {
+	const existingScopes = db.prepare(
+		"SELECT DISTINCT scope_id FROM memory_items WHERE import_key = ?",
+	);
+	for (const op of ops) {
+		if (!["upsert", "delete", "reassign_scope"].includes(op.op_type)) continue;
+		const rows = existingScopes.all(op.entity_id) as Array<{ scope_id: unknown }>;
+		for (const { scope_id: scope } of rows) {
+			if (typeof scope === "string" && scope.trim()) scopeIds.add(scope.trim());
+		}
+	}
+}
+
+function rejectUnauthorizedInboundBatch(
+	c: Context,
+	ops: ReplicationOp[],
+	context: ReturnType<typeof syncScopeAuthorizationContext>,
+	options: { enabled: boolean; scopeId: string | null; managedScopeIds: ReadonlySet<string> },
+): Response | null {
+	const rejected = rejectInboundScopeFailures(context.db, ops, context.localDeviceId, {
+		enabled: options.enabled,
+		peerDeviceId: context.peerDeviceId,
+	});
+	if (rejected) {
+		return c.json(
+			{
+				error: "scope_rejected",
+				reason: rejected.rejections[0]?.reason ?? "scope_mismatch",
+				rejections: rejected.rejections,
+				sync_capability: LOCAL_SYNC_CAPABILITY,
+				scope_id: options.scopeId,
+			},
+			403,
+		);
+	}
+	// Raw membership can reject a batch, but cannot authorize managed content by itself.
+	const scopeIds = new Set(options.managedScopeIds);
+	addExistingMutationScopes(context.db, ops, scopeIds);
+	const failure = validateManagedScopes(scopeIds, context);
+	if (!failure) return null;
+	return c.json(
+		syncScopeResetRequiredPayload(
+			getSyncResetState(context.db),
+			failure.reason,
+			LOCAL_SYNC_CAPABILITY,
+			failure.scopeId,
+		),
+		409,
+	);
+}
+
+function serveAuthorizedSnapshot(c: Context, store: MemoryStore, auth: AuthenticatedSyncPeer) {
+	const peerDeviceId = auth.deviceId;
 	try {
 		const rawScopeId = c.req.query(SYNC_SCOPE_QUERY_PARAM);
 		const [localDeviceId] = ensureDeviceIdentity(store.db, { keysDir: syncKeysDir() });
 		const scopeRequest = parseSyncScopeRequest(rawScopeId, rawScopeId !== undefined, {
-			db: store.db,
-			localDeviceId,
+			...syncScopeAuthorizationContext(store, auth, localDeviceId),
 			negotiatedCapability: negotiatedSyncCapability(c),
-			peerDeviceId,
 		});
 		if (!scopeRequest.ok)
 			return c.json(
@@ -4584,8 +4710,7 @@ export function syncProtocolRoutes(getStore: StoreFactory, opts: SyncProtocolRou
 				const negotiated = negotiatedSyncCapability(c);
 				const authorizedScopes = isScopedSyncCapability(negotiated)
 					? listAuthorizedScopesForPeer(store.db, {
-							localDeviceId: deviceId,
-							peerDeviceId: auth.deviceId,
+							...syncScopeAuthorizationContext(store, auth, deviceId),
 						})
 					: null;
 				const response: Record<string, unknown> = {
@@ -4625,10 +4750,8 @@ export function syncProtocolRoutes(getStore: StoreFactory, opts: SyncProtocolRou
 			const negotiated = negotiatedSyncCapability(c);
 			const [localDeviceId] = ensureDeviceIdentity(store.db, { keysDir: syncKeysDir() });
 			const scopeRequest = parseSyncScopeRequest(rawScopeId, rawScopeId !== undefined, {
-				db: store.db,
-				localDeviceId,
+				...syncScopeAuthorizationContext(store, auth, localDeviceId),
 				negotiatedCapability: negotiated,
-				peerDeviceId,
 			});
 			if (!scopeRequest.ok) {
 				return c.json(
@@ -4744,7 +4867,7 @@ export function syncProtocolRoutes(getStore: StoreFactory, opts: SyncProtocolRou
 			}
 			const limited = rateLimitedResponse(c, auth.deviceId, true);
 			if (limited) return limited;
-			return serveAuthorizedSnapshot(c, store, auth.deviceId);
+			return serveAuthorizedSnapshot(c, store, auth);
 		})();
 	});
 
@@ -4782,11 +4905,10 @@ export function syncProtocolRoutes(getStore: StoreFactory, opts: SyncProtocolRou
 			normalizeSyncCapability(body.sync_capability),
 		);
 		const [localDeviceId] = ensureDeviceIdentity(store.db, { keysDir: syncKeysDir() });
+		const scopeContext = syncScopeAuthorizationContext(store, auth, localDeviceId);
 		const scopeRequest = parseSyncScopeRequest(body.scope_id, Object.hasOwn(body, "scope_id"), {
-			db: store.db,
-			localDeviceId,
+			...scopeContext,
 			negotiatedCapability: negotiated,
-			peerDeviceId,
 		});
 		if (!scopeRequest.ok) {
 			return c.json(
@@ -4807,13 +4929,20 @@ export function syncProtocolRoutes(getStore: StoreFactory, opts: SyncProtocolRou
 		}
 
 		const normalizedOps = extractReplicationOps(body);
+		const scopeIds = new Set(
+			normalizedOps.map((op) => (typeof op.scope_id === "string" ? op.scope_id.trim() : "")),
+		);
 		const peerFeatures = normalizeSyncFeatures(body.sync_features);
 		const reassignOps = normalizedOps.filter((op) => op.op_type === "reassign_scope");
 		if (reassignOps.length > 0 && !peerFeatures.includes("reassign_scope")) {
 			return c.json({ error: "reassign_capability_required" }, 409);
 		}
 		try {
-			for (const op of reassignOps) parseReassignScopePayload(op);
+			for (const op of reassignOps) {
+				const reassignment = parseReassignScopePayload(op);
+				scopeIds.add(reassignment.old_scope_id);
+				scopeIds.add(reassignment.new_scope_id);
+			}
 		} catch {
 			return c.json({ error: "reassign_payload_invalid" }, 400);
 		}
@@ -4829,31 +4958,17 @@ export function syncProtocolRoutes(getStore: StoreFactory, opts: SyncProtocolRou
 				);
 			}
 		}
-		// Inbound POSTs still use legacy visibility/project filters, but must not run
-		// the outbound scope gate. Unsupported peers deliberately bypass strict inbound
-		// scope rejection during rollout, so outbound filtering would silently drop data.
+		// Preserve legacy visibility/project filtering without the outbound scope gate.
 		const filtered = filterOpsForPeer(store, peerDeviceId, localDeviceId, normalizedOps, {
 			applyScopeFilter: false,
 			supportsReassignScope: peerFeatures.includes("reassign_scope"),
 		});
-		// Scope validation runs against the full signed batch so bad scoped ops cannot
-		// evade fail-closed rejection by also tripping peer project filters.
-		const rejected = rejectInboundScopeFailures(store.db, normalizedOps, localDeviceId, {
+		const rejected = rejectUnauthorizedInboundBatch(c, normalizedOps, scopeContext, {
 			enabled: negotiated !== "unsupported",
-			peerDeviceId,
+			scopeId: scopeRequest.scope_id,
+			managedScopeIds: scopeIds,
 		});
-		if (rejected) {
-			return c.json(
-				{
-					error: "scope_rejected",
-					reason: rejected.rejections[0]?.reason ?? "scope_mismatch",
-					rejections: rejected.rejections,
-					sync_capability: LOCAL_SYNC_CAPABILITY,
-					scope_id: scopeRequest.scope_id,
-				},
-				403,
-			);
-		}
+		if (rejected) return rejected;
 
 		const result = applyReplicationOps(store.db, filtered.allowed, localDeviceId, store.scanner);
 		const skipped = result.skipped + filtered.skipped;
