@@ -1,8 +1,19 @@
-import { createHash } from "node:crypto";
 import { resolve } from "node:path";
 import type { Database } from "better-sqlite3";
-import { cleanProjectIdentity, isMalformedProjectIdentity } from "./project-identity.js";
+import { cleanProjectIdentity } from "./project-identity.js";
 import { matchesWildcard } from "./wildcard-match.js";
+import {
+	type CanonicalWorkspaceIdentity,
+	canonicalWorkspaceIdentity,
+	type WorkspaceIdentityInput,
+} from "./workspace-identity.js";
+
+export {
+	type CanonicalWorkspaceIdentity,
+	canonicalWorkspaceIdentity,
+	type WorkspaceIdentityInput,
+	type WorkspaceIdentitySource,
+} from "./workspace-identity.js";
 
 export const LOCAL_DEFAULT_SCOPE_ID = "local-default";
 
@@ -22,31 +33,6 @@ export const LEGACY_SHARED_REVIEW_SCOPE_ID = "legacy-shared-review";
  * predicate instead of throwing "too many SQL variables" at prepare time.
  */
 export const MAX_SCOPE_IN_PARAMS = 500;
-
-export type WorkspaceIdentitySource =
-	| "git_remote"
-	| "git_remote_branch"
-	| "git_repository"
-	| "cwd"
-	| "workspace_id"
-	| "unmapped";
-
-export interface WorkspaceIdentityInput {
-	gitRemote?: string | null;
-	gitBranch?: string | null;
-	repositoryIdentity?: string | null;
-	cwd?: string | null;
-	workspaceId?: string | null;
-	project?: string | null;
-	branchScoped?: boolean;
-	allowRepositoryCwdFallback?: boolean;
-}
-
-export interface CanonicalWorkspaceIdentity {
-	value: string;
-	source: WorkspaceIdentitySource;
-	displayProject: string | null;
-}
 
 export interface ScopeMapping {
 	id?: number | null;
@@ -104,74 +90,6 @@ function normalizeCwd(cwd: string): string {
 function normalizeMappingIdentity(value: string | null | undefined): string | null {
 	const cleaned = clean(value);
 	return cleaned ? normalizeSlash(cleaned) : null;
-}
-
-function unmappedIdentity(input: WorkspaceIdentityInput): string {
-	const validSeed = [input.cwd, input.project, input.workspaceId]
-		.map((value) => cleanProjectIdentity(value))
-		.find((value) => value !== null);
-	const identityTuple = [
-		input.gitRemote,
-		input.gitBranch,
-		input.cwd,
-		input.project,
-		input.workspaceId,
-	].map((value) => (typeof value === "string" ? value.trim() : null));
-	let seed = validSeed ?? "unknown";
-	if (!validSeed && identityTuple.some(isMalformedProjectIdentity)) {
-		seed = JSON.stringify(identityTuple);
-	}
-	const digest = createHash("sha256").update(seed, "utf8").digest("hex");
-	return `unmapped:${digest}`;
-}
-
-export function canonicalWorkspaceIdentity(
-	input: WorkspaceIdentityInput,
-): CanonicalWorkspaceIdentity {
-	const gitRemote = cleanProjectIdentity(input.gitRemote);
-	const gitBranch = cleanProjectIdentity(input.gitBranch);
-	const repositoryIdentity = cleanProjectIdentity(input.repositoryIdentity);
-	const cwd = cleanProjectIdentity(input.cwd);
-	const workspaceId = cleanProjectIdentity(input.workspaceId);
-	const project = cleanProjectIdentity(input.project);
-
-	if (repositoryIdentity && !input.branchScoped) {
-		return {
-			value: normalizeSlash(repositoryIdentity),
-			source: "git_repository",
-			displayProject: project,
-		};
-	}
-
-	if (gitRemote) {
-		const normalizedRemote = normalizeSlash(gitRemote);
-		if (input.branchScoped && gitBranch) {
-			return {
-				value: `${normalizedRemote}:${gitBranch}`,
-				source: "git_remote_branch",
-				displayProject: project,
-			};
-		}
-		return { value: normalizedRemote, source: "git_remote", displayProject: project };
-	}
-
-	if (repositoryIdentity) {
-		return {
-			value: normalizeSlash(repositoryIdentity),
-			source: "git_repository",
-			displayProject: project,
-		};
-	}
-
-	if (cwd) {
-		return { value: normalizeCwd(cwd), source: "cwd", displayProject: project };
-	}
-
-	if (workspaceId) {
-		return { value: normalizeSlash(workspaceId), source: "workspace_id", displayProject: project };
-	}
-
-	return { value: unmappedIdentity(input), source: "unmapped", displayProject: project };
 }
 
 function isBasenameOnlyPattern(pattern: string): boolean {
@@ -362,7 +280,7 @@ export function resolveProjectScope(input: ResolveProjectScopeInput): ScopeResol
 export interface ScopeVisibilityOptions {
 	/** Public key of the runtime's actual signing key, not an enrolled DB row. */
 	expectedPublicKey?: string;
-	/** Read-only key loader, called once only when coordinator candidates exist. */
+	/** Read-only key loader reserved for coordinator proof validation; not used by membership-only reads. */
 	loadExpectedPublicKey?: () => string | undefined;
 }
 
@@ -383,7 +301,11 @@ export interface ScopeVisibilityOptions {
  * NULL scope_ids are skipped here — a NULL scope_id is handled by the filter's
  * dedicated `IS NULL` branch, not by membership in this set.
  */
-export function resolveVisibleScopeIds(db: Database, deviceId: string): string[] {
+export function resolveVisibleScopeIds(
+	db: Database,
+	deviceId: string,
+	_options: ScopeVisibilityOptions = {},
+): string[] {
 	const visible = new Set<string>(["", LOCAL_DEFAULT_SCOPE_ID, LEGACY_SHARED_REVIEW_SCOPE_ID]);
 	const localScopes = db
 		.prepare(
