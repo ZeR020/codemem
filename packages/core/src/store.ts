@@ -91,6 +91,10 @@ import type {
 } from "./types.js";
 import { storeVectors } from "./vectors.js";
 
+// Recovery debits and per-batch call clocks are private accounting, not observer usage.
+const PUBLIC_USAGE_EVENT_PREDICATE =
+	"event != 'observer_recovery_scope_denial' AND event NOT GLOB 'observer_recovery_call_clock:*'";
+
 function classifiedUsageSql(sourceSql: string): string {
 	return `WITH classified_usage AS (
 		SELECT usage_events.*,
@@ -111,6 +115,7 @@ function classifiedUsageSql(sourceSql: string): string {
 		SUM(CASE WHEN event = 'observer_call' AND usage_source IS NULL THEN 1 ELSE 0 END) AS legacy_text_length_count,
 		SUM(CASE WHEN event != 'observer_call' AND event != 'pack' AND usage_source IS NULL THEN 1 ELSE 0 END) AS legacy_unclassified_count
 	FROM classified_usage
+	WHERE ${PUBLIC_USAGE_EVENT_PREDICATE}
 	GROUP BY event`;
 }
 
@@ -197,6 +202,12 @@ const SAME_PERSON_BINDING_PROVENANCE = new Set([
 
 /** ISO 8601 timestamp in UTC. */
 function observerAdmissionErrorDetails(code: string): { type: string; message: string } {
+	if (code === "scope_authority") {
+		return {
+			type: "ScopeWriteAuthorityError",
+			message: "Scope write authority is unavailable; refresh scope membership and retry.",
+		};
+	}
 	if (code === "model_unavailable") {
 		return {
 			type: "ObserverModelUnavailable",
@@ -1560,13 +1571,14 @@ export class MemoryStore {
 	// usageAggregate
 
 	/**
-	 * Neutral, unfiltered token/event aggregate over usage_events, grouped by
+	 * Public token/event aggregate over usage_events, grouped by
 	 * event kind. This is the shared SQL aggregate used by both stats() and the
 	 * viewer /api/usage route so neither has to scan the (potentially large)
 	 * usage_events table into JS to sum it. The COALESCE on tokens_saved matches
 	 * the historical stats() semantics (treat NULL saved as 0). When
 	 * projectFilter is a non-empty string, rows are restricted to the given
-	 * project via the sessions join; otherwise every row is aggregated.
+	 * project via the sessions join; otherwise every public row is aggregated.
+	 * Internal recovery budget debits are excluded in both cases.
 	 * Callers sort the returned rows as needed.
 	 */
 	usageAggregate(projectFilter?: string | null): UsageEventRow[] {
@@ -2628,7 +2640,7 @@ export class MemoryStore {
 		return row != null;
 	}
 
-	/** Keep auth failures visible and retryable without consuming an observer attempt. */
+	/** Keep admission failures retryable without consuming an observer attempt. */
 	releaseRawEventFlushBatchAfterAuthError(
 		batchId: number,
 		failure: {
@@ -2653,7 +2665,7 @@ export class MemoryStore {
 				observer_runtime: failure.runtime,
 				observer_auth_source: failure.authSource,
 				observer_auth_type: failure.authType,
-				observer_error_code: failure.code,
+				observer_error_code: failure.code === "scope_authority" ? null : failure.code,
 				observer_error_message: null,
 			})
 			.where(
