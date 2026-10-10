@@ -69,10 +69,14 @@ export function runPiSessionSearch(
 
 /** Human-readable output: "Found N results" header + attributed snippet lines. */
 export function formatPiSessionSearchHuman(response: PiSessionSearchResponse): string {
+	const warning = response.query_truncated
+		? "Warning: matching used only part of the query. Shorten it to at most 8,192 characters and 64 search terms, then retry."
+		: null;
 	if (response.results.length === 0) {
-		return `No results found for "${response.query}". ${EMPTY_INDEX_HINT}`;
+		return `No results found for "${response.query}". ${warning ?? EMPTY_INDEX_HINT}`;
 	}
 	const lines = [`Found ${response.returned} results for "${response.query}"`];
+	if (warning) lines.push(warning);
 	for (const [index, match] of response.results.entries()) {
 		const attribution = [
 			match.role,

@@ -421,10 +421,14 @@ Both primitives are exposed on the CLI. `codemem pi-import-sessions` walks
 `~/.pi/agent/sessions/**/*.jsonl` (honors `PI_CODING_AGENT_DIR`), streaming per-file progress;
 `--extract` (off by default, observer-model cost scales with backlog) drains pending Pi sessions
 through the standard `flushRawEvents` sweeper path so extracted memories carry Pi attribution.
+The command takes a source-filtered, uncapped snapshot and attempts each Pi stream once,
+so unrelated backlog or failed attempts cannot starve later sessions. Import JSON adds extraction
+counts and errors to the existing flat summary; incomplete extraction exits with code 1.
 Without it, the command stores searchable events without running extraction; a running viewer's
 sweeper can still pick them up like any other backlog. `codemem pi-session-search <query>` queries
 the same `searchPiSessions` primitive and prints a `Found N results` listing with attributed
 snippet lines, or the exact shared response object with `--json`.
+Human search output warns about a truncated matching query for both empty and nonempty results.
 
 ### OpenCode session finalization triggers
 - `session.idle` — finalizes current local buffer

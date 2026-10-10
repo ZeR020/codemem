@@ -14,6 +14,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as p from "@clack/prompts";
+import * as core from "@codemem/core";
 import { MemoryStore, type ObserverClient } from "@codemem/core";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
@@ -107,6 +108,14 @@ function fakeObserver(raw: string): ObserverClient {
 			auth: { source: "none", type: "none", hasToken: false },
 		}),
 	} as unknown as ObserverClient;
+}
+
+function mockObserverClient(observer: ObserverClient | Error): void {
+	function observerConstructor(): ObserverClient {
+		if (observer instanceof Error) throw observer;
+		return observer;
+	}
+	vi.spyOn(core, "ObserverClient").mockImplementation(observerConstructor);
 }
 
 const OBSERVATION_XML = `<observation>
@@ -219,7 +228,7 @@ describe("codemem pi-import-sessions", () => {
 		}
 	});
 
-	it("--json prints the import summary object only", async () => {
+	it("--json preserves the import summary and marks extraction as not requested", async () => {
 		const fixture = makeFixture();
 		useFixtureAgentDir(fixture);
 		const logs = await runCli(["--db-path", fixture.dbPath, "--json"]);
@@ -232,6 +241,13 @@ describe("codemem pi-import-sessions", () => {
 			filesErrored: 0,
 			inserted: 2,
 			skipped: 0,
+			extraction: {
+				requested: false,
+				flushedEvents: 0,
+				failedSessions: 0,
+				pendingSessions: null,
+				error: null,
+			},
 		});
 	});
 });
@@ -244,7 +260,13 @@ describe("codemem pi-import-sessions extraction wiring (6.1)", () => {
 			{ dbPath: fixture.dbPath },
 			{ observer: fakeObserver(OBSERVATION_XML) },
 		);
-		expect(result.extractedEvents).toBeNull();
+		expect(result.extraction).toEqual({
+			requested: false,
+			flushedEvents: 0,
+			failedSessions: 0,
+			pendingSessions: null,
+			error: null,
+		});
 		expect(result.summary.inserted).toBe(2);
 
 		const store = new MemoryStore(fixture.dbPath);
@@ -270,7 +292,7 @@ describe("codemem pi-import-sessions extraction wiring (6.1)", () => {
 			{ observer: fakeObserver(OBSERVATION_XML) },
 		);
 		expect(result.summary.inserted).toBe(2);
-		expect(result.extractedEvents).toBe(2);
+		expect(result.extraction.flushedEvents).toBe(2);
 
 		const store = new MemoryStore(fixture.dbPath);
 		try {
@@ -311,10 +333,239 @@ describe("codemem pi-import-sessions extraction wiring (6.1)", () => {
 				inserted: 2,
 				skipped: 0,
 			},
-			extractedEvents: 2,
+			extraction: {
+				requested: true,
+				flushedEvents: 2,
+				failedSessions: 0,
+				pendingSessions: 0,
+				error: null,
+			},
 		});
 		expect(human).toContain("Scanned 3 files: 1 imported, 1 unchanged, 1 empty, 0 errored");
 		expect(human).toContain("2 events inserted, 0 skipped");
 		expect(human).toContain("Extraction: observer flushed 2 events into memories.");
+	});
+});
+
+describe("Pi extraction mixed-source backlog", () => {
+	it("selects Pi sessions before the pending-page limit without flushing other sources", async () => {
+		const fixture = makeFixture();
+		useFixtureAgentDir(fixture);
+		const store = new MemoryStore(fixture.dbPath);
+		try {
+			for (let index = 0; index < 25; index++) {
+				const streamId = `opencode-backlog-${index}`;
+				store.recordRawEventsBatch(streamId, [
+					{ event_id: "pending", event_type: "assistant", payload: {} },
+				]);
+				store.updateRawEventSessionMeta({
+					opencodeSessionId: streamId,
+					lastSeenTsWallMs: index + 1,
+				});
+			}
+		} finally {
+			store.close();
+		}
+		await runPiImportSessions({ dbPath: fixture.dbPath });
+		const imported = new MemoryStore(fixture.dbPath);
+		try {
+			expect(imported.rawEventSessionsPendingFlush()).toHaveLength(25);
+			expect(imported.rawEventSessionsPendingFlush(25, "pi")).toEqual([
+				{ source: "pi", streamId: SESSION_ID },
+			]);
+		} finally {
+			imported.close();
+		}
+		const result = await runPiImportSessions(
+			{ dbPath: fixture.dbPath, extract: true },
+			{ observer: fakeObserver(OBSERVATION_XML) },
+		);
+		expect(result.extraction.flushedEvents).toBe(2);
+		const drained = new MemoryStore(fixture.dbPath);
+		try {
+			expect(drained.rawEventSessionsPendingFlush(100)).toHaveLength(25);
+			expect(
+				drained.rawEventSessionsPendingFlush(100).every((session) => session.source === "opencode"),
+			).toBe(true);
+		} finally {
+			drained.close();
+		}
+	});
+});
+
+describe("Pi extraction failed-page backlog", () => {
+	it("attempts the later Pi session even when the oldest 25 sessions fail", async () => {
+		const fixture = makeFixture();
+		useFixtureAgentDir(fixture);
+		const sessionsDir = join(fixture.agentDir, "sessions", "--tmp-repo--");
+		for (let index = 0; index < 25; index++) {
+			writeFileSync(
+				join(sessionsDir, `failed-${index}.jsonl`),
+				fixtureJsonl().replace(SESSION_ID, `failed-${index}`),
+			);
+		}
+		await runPiImportSessions({ dbPath: fixture.dbPath });
+		const store = new MemoryStore(fixture.dbPath);
+		try {
+			for (let index = 0; index < 25; index++) {
+				store.db
+					.prepare(
+						"UPDATE raw_event_sessions SET last_seen_ts_wall_ms = ? WHERE source = 'pi' AND stream_id = ?",
+					)
+					.run(index + 1, `failed-${index}`);
+			}
+		} finally {
+			store.close();
+		}
+		vi.spyOn(p.log, "warn").mockImplementation(() => {});
+		const observer = fakeObserver(OBSERVATION_XML);
+		const observe = vi.spyOn(observer, "observe");
+		for (let index = 0; index < 25; index++) {
+			observe.mockRejectedValueOnce(new Error("observer unavailable"));
+		}
+		const result = await runPiImportSessions(
+			{ dbPath: fixture.dbPath, extract: true },
+			{ observer },
+		);
+		expect(result.extraction.flushedEvents).toBe(2);
+		expect(result.extraction.failedSessions).toBe(25);
+		expect(result.extraction.pendingSessions).toBe(25);
+		const pending = new MemoryStore(fixture.dbPath);
+		try {
+			const sessions = pending.rawEventSessionsPendingFlush(100);
+			expect(sessions).toHaveLength(25);
+			expect(sessions.some((session) => session.streamId === SESSION_ID)).toBe(false);
+		} finally {
+			pending.close();
+		}
+	});
+});
+
+describe("Pi extraction JSON failures", () => {
+	it("reports observer initialization failure as JSON with pending sessions and a failure exit", async () => {
+		const fixture = makeFixture();
+		useFixtureAgentDir(fixture);
+		mockObserverClient(new Error("observer init unavailable"));
+		const logs = await runCli(["--db-path", fixture.dbPath, "--extract", "--json"]);
+		expect(() => JSON.parse(logs.join("\n"))).not.toThrow();
+		const output = JSON.parse(logs.join("\n"));
+		expect(output.inserted).toBe(2);
+		expect(output.extraction).toEqual({
+			requested: true,
+			flushedEvents: 0,
+			failedSessions: 0,
+			pendingSessions: 1,
+			error: expect.stringContaining("observer init unavailable"),
+		});
+		expect(output.error).toBe("pi_extraction_incomplete");
+		expect(process.exitCode).toBe(1);
+	});
+
+	it("reports a failed session without losing imported events or polluting JSON", async () => {
+		const fixture = makeFixture();
+		useFixtureAgentDir(fixture);
+		const observer = fakeObserver(OBSERVATION_XML);
+		vi.spyOn(observer, "observe").mockRejectedValue(new Error("observer flush unavailable"));
+		mockObserverClient(observer);
+		const logs = await runCli(["--db-path", fixture.dbPath, "--extract", "--json"]);
+		expect(() => JSON.parse(logs.join("\n"))).not.toThrow();
+		const output = JSON.parse(logs.join("\n"));
+		expect(output.inserted).toBe(2);
+		expect(output.extraction).toEqual({
+			requested: true,
+			flushedEvents: 0,
+			failedSessions: 1,
+			pendingSessions: 1,
+			error: expect.stringContaining("observer flush unavailable"),
+		});
+		expect(output.error).toBe("pi_extraction_incomplete");
+		expect(process.exitCode).toBe(1);
+		const store = new MemoryStore(fixture.dbPath);
+		try {
+			expect(store.rawEventSessionsPendingFlush()).toEqual([
+				{ source: "pi", streamId: SESSION_ID },
+			]);
+		} finally {
+			store.close();
+		}
+	});
+});
+
+describe("Pi extraction JSON outcomes", () => {
+	it("reports successful extraction counts while preserving the import summary", async () => {
+		const fixture = makeFixture();
+		useFixtureAgentDir(fixture);
+		mockObserverClient(fakeObserver(OBSERVATION_XML));
+		const logs = await runCli(["--db-path", fixture.dbPath, "--extract", "--json"]);
+		const output = JSON.parse(logs.join("\n"));
+		expect(output.inserted).toBe(2);
+		expect(output.extraction).toEqual({
+			requested: true,
+			flushedEvents: 2,
+			failedSessions: 0,
+			pendingSessions: 0,
+			error: null,
+		});
+		expect(output.error).toBeUndefined();
+		expect(process.exitCode ?? 0).toBe(0);
+	});
+
+	it("reports pending extraction when another worker has claimed the batch", async () => {
+		const fixture = makeFixture();
+		useFixtureAgentDir(fixture);
+		const failedObserver = fakeObserver(OBSERVATION_XML);
+		vi.spyOn(failedObserver, "observe").mockRejectedValue(new Error("retry later"));
+		vi.spyOn(p.log, "warn").mockImplementation(() => {});
+		await runPiImportSessions(
+			{ dbPath: fixture.dbPath, extract: true },
+			{ observer: failedObserver },
+		);
+		const store = new MemoryStore(fixture.dbPath);
+		try {
+			const batch = store.db.prepare("SELECT id FROM raw_event_flush_batches").get() as {
+				id: number;
+			};
+			expect(store.claimRawEventFlushBatch(batch.id)).toBe(true);
+		} finally {
+			store.close();
+		}
+		mockObserverClient(fakeObserver(OBSERVATION_XML));
+		const logs = await runCli(["--db-path", fixture.dbPath, "--extract", "--json"]);
+		const output = JSON.parse(logs.join("\n"));
+		expect(output.extraction).toEqual({
+			requested: true,
+			flushedEvents: 0,
+			failedSessions: 0,
+			pendingSessions: 1,
+			error: null,
+		});
+		expect(output.error).toBe("pi_extraction_incomplete");
+		expect(process.exitCode).toBe(1);
+	});
+});
+
+describe("Pi extraction human failures", () => {
+	it("shows failed and pending session counts plus the extraction error", () => {
+		const human = formatPiImportHuman({
+			summary: {
+				filesScanned: 1,
+				filesImported: 1,
+				filesUnchanged: 0,
+				filesEmpty: 0,
+				filesErrored: 0,
+				inserted: 2,
+				skipped: 0,
+			},
+			extraction: {
+				requested: true,
+				flushedEvents: 0,
+				failedSessions: 1,
+				pendingSessions: 2,
+				error: "observer unavailable",
+			},
+		});
+		expect(human).toContain("observer flushed 0 events");
+		expect(human).toContain("1 sessions failed; 2 remain pending");
+		expect(human).toContain("Extraction error: observer unavailable");
 	});
 });

@@ -237,3 +237,46 @@ describe("codemem pi-session-search JSON contract", () => {
 		}
 	});
 });
+
+describe("Pi session search partial-query warnings", () => {
+	it("warns on an empty partial-query result instead of suggesting backfill", () => {
+		const human = formatPiSessionSearchHuman({
+			query: "bounded query",
+			query_truncated: true,
+			results: [],
+			returned: 0,
+			total_matches: 0,
+			truncated: true,
+		});
+		expect(human).toContain("No results found");
+		expect(human).toContain("only part of the query");
+		expect(human).toContain("8,192 characters");
+		expect(human).toContain("64 search terms");
+		expect(human).not.toContain("codemem pi-import-sessions");
+	});
+
+	it("warns about partial matching while retaining nonempty results", () => {
+		const human = formatPiSessionSearchHuman({
+			query: "bounded query",
+			query_truncated: true,
+			results: [
+				{
+					source: "pi",
+					session_id: "partial-query-session",
+					project: null,
+					role: "assistant",
+					timestamp: null,
+					snippet: "bounded query match",
+					snippet_truncated: false,
+					full_length: 19,
+				},
+			],
+			returned: 1,
+			total_matches: 1,
+			truncated: true,
+		});
+		expect(human).toContain("Found 1 results");
+		expect(human).toContain("only part of the query");
+		expect(human).toContain("bounded query match");
+	});
+});

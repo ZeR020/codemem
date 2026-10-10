@@ -47,16 +47,24 @@ export interface PiImportDeps {
 	observer?: ObserverClient;
 }
 
+export interface PiImportExtractionResult {
+	requested: boolean;
+	flushedEvents: number;
+	failedSessions: number;
+	/** Null when extraction was not requested and the backlog was not checked. */
+	pendingSessions: number | null;
+	error: string | null;
+}
+
 export interface PiImportRunResult {
 	summary: PiImportSummary;
-	/** Events flushed through the observer when --extract was set; null otherwise. */
-	extractedEvents: number | null;
+	extraction: PiImportExtractionResult;
 }
 
 /**
  * Import sessions, then — when --extract is set — drain the imported pi
  * sessions through the standard flush path. Returns the import summary plus
- * the observer-flushed event count (null when extraction was not requested).
+ * extraction counts and failures.
  */
 export async function runPiImportSessions(
 	opts: PiImportOpts,
@@ -64,10 +72,10 @@ export async function runPiImportSessions(
 ): Promise<PiImportRunResult> {
 	const dbPath = resolveDbPath(resolveDbOpt(opts));
 	const summary = importPiSessions({ dbPath, onProgress: deps.onProgress });
-	const extractedEvents = opts.extract
+	const extraction = opts.extract
 		? await flushImportedPiSessions(dbPath, deps.observer)
-		: null;
-	return { summary, extractedEvents };
+		: { requested: false, flushedEvents: 0, failedSessions: 0, pendingSessions: null, error: null };
+	return { summary, extraction };
 }
 
 /**
@@ -79,70 +87,72 @@ export async function runPiImportSessions(
 export async function flushImportedPiSessions(
 	dbPath: string,
 	observer?: ObserverClient,
-): Promise<number> {
+): Promise<PiImportExtractionResult> {
 	const store: MemoryStore = new MemoryStore(dbPath);
+	const extraction: PiImportExtractionResult = {
+		requested: true,
+		flushedEvents: 0,
+		failedSessions: 0,
+		pendingSessions: 0,
+		error: null,
+	};
 	try {
 		let resolved: ObserverClient;
 		try {
 			resolved = observer ?? new ObserverClient();
 		} catch (err) {
-			p.log.warn(
-				`extraction unavailable (observer init failed): ${err instanceof Error ? err.message : String(err)}`,
-			);
-			return 0;
+			extraction.error = `observer init failed: ${err instanceof Error ? err.message : String(err)}`;
+			extraction.pendingSessions = piPendingSessions(store).length;
+			return extraction;
 		}
-		let flushed = 0;
-		const attempted = new Set<string>();
-		let pending = piPendingSessions(store, attempted);
-		while (pending.length > 0) {
-			for (const streamId of pending) {
-				attempted.add(streamId);
-				try {
-					const result = await flushRawEvents(
-						store,
-						{ observer: resolved },
-						{
-							opencodeSessionId: streamId,
-							source: "pi",
-							cwd: null,
-							project: null,
-							startedAt: null,
-							// One-shot full drain, mirroring the boundary flush pattern.
-							maxEvents: null,
-						},
-					);
-					flushed += result.flushed;
-				} catch (err) {
-					p.log.warn(
-						`extraction failed for session ${streamId}: ${err instanceof Error ? err.message : String(err)}`,
-					);
-				}
+		// Snapshot the Pi backlog so failed attempts cannot hide later sessions.
+		for (const streamId of piPendingSessions(store)) {
+			try {
+				const result = await flushRawEvents(
+					store,
+					{ observer: resolved },
+					{
+						opencodeSessionId: streamId,
+						source: "pi",
+						cwd: null,
+						project: null,
+						startedAt: null,
+						// One-shot full drain, mirroring the boundary flush pattern.
+						maxEvents: null,
+					},
+				);
+				extraction.flushedEvents += result.flushed;
+			} catch (err) {
+				extraction.failedSessions++;
+				extraction.error ??= `session ${streamId}: ${err instanceof Error ? err.message : String(err)}`;
 			}
-			pending = piPendingSessions(store, attempted);
 		}
-		return flushed;
+		extraction.pendingSessions = piPendingSessions(store).length;
+		return extraction;
 	} finally {
 		store.close();
 	}
 }
 
-/** Pending-flush sessions attributed to source "pi" that were not attempted yet. */
-function piPendingSessions(store: MemoryStore, attempted: Set<string>): string[] {
-	return store
-		.rawEventSessionsPendingFlush()
-		.filter((session) => session.source === "pi" && session.streamId)
-		.map((session) => session.streamId)
-		.filter((streamId) => !attempted.has(streamId));
+/** Pending-flush sessions attributed to source "pi", without a page cap. */
+function piPendingSessions(store: MemoryStore): string[] {
+	return store.rawEventSessionsPendingFlush(null, "pi").map((session) => session.streamId);
 }
 
 /** Human-readable summary line; per-file progress is streamed by the caller. */
 export function formatPiImportHuman(result: PiImportRunResult): string {
-	const summary = result.summary;
+	const { summary, extraction } = result;
 	const lines = [
 		`Scanned ${summary.filesScanned} files: ${summary.filesImported} imported, ${summary.filesUnchanged} unchanged, ${summary.filesEmpty} empty, ${summary.filesErrored} errored — ${summary.inserted} events inserted, ${summary.skipped} skipped.`,
 	];
-	if (result.extractedEvents !== null) {
-		lines.push(`Extraction: observer flushed ${result.extractedEvents} events into memories.`);
+	if (extraction.requested) {
+		lines.push(`Extraction: observer flushed ${extraction.flushedEvents} events into memories.`);
+		if (extraction.failedSessions > 0 || (extraction.pendingSessions ?? 0) > 0) {
+			lines.push(
+				`${extraction.failedSessions} sessions failed; ${extraction.pendingSessions} remain pending.`,
+			);
+		}
+		if (extraction.error) lines.push(`Extraction error: ${extraction.error}`);
 	}
 	return lines.join("\n");
 }
@@ -172,8 +182,31 @@ export const piImportSessionsCommand = cmd.action(async (opts: PiImportOpts) => 
 	try {
 		const deps: PiImportDeps = opts.json ? {} : { onProgress: logProgress };
 		const result = await runPiImportSessions(opts, deps);
+		const { extraction } = result;
+		let extractionFailure: string | undefined;
+		if (
+			extraction.error ||
+			extraction.failedSessions > 0 ||
+			(extraction.pendingSessions ?? 0) > 0
+		) {
+			extractionFailure =
+				extraction.error ??
+				`${extraction.failedSessions} sessions failed; ${extraction.pendingSessions} remain pending.`;
+			process.exitCode = 1;
+		}
 		if (opts.json) {
-			console.log(JSON.stringify(result.summary, null, 2));
+			console.log(
+				JSON.stringify(
+					{
+						...result.summary,
+						extraction,
+						error: extractionFailure ? "pi_extraction_incomplete" : undefined,
+						message: extractionFailure,
+					},
+					null,
+					2,
+				),
+			);
 			return;
 		}
 		p.log.message(formatPiImportHuman(result));
