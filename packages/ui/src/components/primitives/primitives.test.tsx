@@ -1,9 +1,10 @@
-import { type ComponentChild, render } from "preact";
+import { type ComponentChild, isValidElement, render, toChildArray } from "preact";
 import { useState } from "preact/hooks";
 import { act } from "preact/test-utils";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 let selectOnValueChange: ((value: string) => void) | undefined;
+let selectItemKeys: string[] = [];
 let tabsOnValueChange: ((value: string) => void) | undefined;
 let radioOnValueChange: ((value: string) => void) | undefined;
 let switchOnCheckedChange: ((checked: boolean) => void) | undefined;
@@ -17,21 +18,37 @@ vi.mock("@radix-ui/react-select", () => ({
 	Root: ({
 		children,
 		onValueChange,
+		value,
 	}: {
 		children: ComponentChild;
 		onValueChange: (value: string) => void;
+		value?: string;
 	}) => {
 		selectOnValueChange = onValueChange;
-		return <div data-testid="select-root">{children}</div>;
+		return (
+			<div data-testid="select-root" data-state-value={value}>
+				{children}
+			</div>
+		);
 	},
 	Trigger: ({ children, ...props }: MockChildrenProps) => <button {...props}>{children}</button>,
 	Value: ({ placeholder }: { placeholder?: string }) => <span>{placeholder}</span>,
 	Icon: ({ children, ...props }: MockChildrenProps) => <span {...props}>{children}</span>,
 	Portal: ({ children }: { children: ComponentChild }) => <>{children}</>,
 	Content: ({ children, ...props }: MockChildrenProps) => <div {...props}>{children}</div>,
-	Viewport: ({ children, ...props }: MockChildrenProps) => <div {...props}>{children}</div>,
+	Viewport: ({ children, ...props }: MockChildrenProps) => {
+		selectItemKeys = toChildArray(children)
+			.filter(isValidElement)
+			.map((child) => String(child.key));
+		return <div {...props}>{children}</div>;
+	},
 	Item: ({ children, value, ...props }: MockChildrenProps) => (
-		<button {...props} onClick={() => selectOnValueChange?.(String(value))} type="button">
+		<button
+			{...props}
+			data-option-value={value}
+			onClick={() => selectOnValueChange?.(String(value))}
+			type="button"
+		>
 			{children}
 		</button>
 	),
@@ -137,6 +154,7 @@ afterEach(() => {
 		mount = null;
 	}
 	selectOnValueChange = undefined;
+	selectItemKeys = [];
 	tabsOnValueChange = undefined;
 	radioOnValueChange = undefined;
 	switchOnCheckedChange = undefined;
@@ -255,7 +273,238 @@ describe("RadixTabs", () => {
 	});
 });
 
-describe("RadixSelect", () => {
+describe("RadixSelect shared styling", () => {
+	it.each(["default", "compact"] as const)(
+		"supplies shared styling for the %s size without caller classes",
+		(size) => {
+			// Objective: callers need not opt in to trigger, popup, item, or icon styling.
+			// Arrange
+			const props = {
+				options: [{ label: "All Projects", value: "" }],
+				value: "",
+				onValueChange: vi.fn(),
+			};
+
+			// Act
+			const root = renderIntoDocument(
+				<RadixSelect {...props} {...(size === "compact" ? { size } : {})} />,
+			);
+			const trigger = root.querySelector("button");
+
+			// Assert
+			expect(trigger?.getAttribute("class")).toBe("radix-select-trigger");
+			expect(root.querySelector(".radix-select-content")?.getAttribute("class")).toBe(
+				"radix-select-content",
+			);
+			expect(trigger?.dataset.size).toBe(size);
+			for (const part of ["content", "viewport", "item", "icon", "indicator"]) {
+				expect(root.querySelector(`.radix-select-${part}`)).not.toBeNull();
+			}
+			expect(root.querySelector(".sync-radix-select-icon")).toBeNull();
+			for (const part of ["icon", "indicator"]) {
+				const svg = root.querySelector(`.radix-select-${part} svg`);
+				expect(svg?.getAttribute("width")).toBe("14");
+				expect(svg?.getAttribute("height")).toBe("14");
+				expect(svg?.getAttribute("aria-hidden")).toBe("true");
+			}
+		},
+	);
+
+	it.each(["className", "triggerClassName"] as const)(
+		"keeps shared classes when a caller supplies %s and popup classes",
+		(prop) => {
+			// Objective: customization adds to the baseline instead of replacing it.
+			// Arrange
+			const classes = { [prop]: "caller-trigger", contentClassName: "caller-popup" };
+
+			// Act
+			const root = renderIntoDocument(
+				<RadixSelect {...classes} options={[]} value="" onValueChange={vi.fn()} />,
+			);
+
+			// Assert
+			expect(root.querySelector("button")?.getAttribute("class")).toBe(
+				"radix-select-trigger caller-trigger",
+			);
+			expect(root.querySelector(".caller-popup")?.getAttribute("class")).toBe(
+				"radix-select-content caller-popup",
+			);
+			expect(root.querySelector("button")?.classList.contains("caller-trigger")).toBe(true);
+			expect(root.querySelector("button")?.classList.contains("radix-select-trigger")).toBe(true);
+			expect(root.querySelector(".caller-popup")?.classList.contains("radix-select-content")).toBe(
+				true,
+			);
+		},
+	);
+});
+
+describe("RadixSelect collision-free values", () => {
+	const collisionValues = [
+		"",
+		"__codemem-empty-select__",
+		"__codemem-select-value__:",
+		"__codemem-select-value__:project",
+		"project",
+		'项目/é 🚀 : <arbitrary> & "quoted"',
+	];
+	const collisionOptions = collisionValues.map((value, index) => ({
+		label: `Project option ${index}`,
+		value,
+	}));
+
+	it.each(collisionValues)("keeps option %j distinct in Radix values and keys", (value) => {
+		// Objective: arbitrary project names cannot collide with All Projects or encoded names.
+		// Arrange
+		const onValueChange = vi.fn();
+
+		// Act
+		const root = renderIntoDocument(
+			<RadixSelect options={collisionOptions} value={value} onValueChange={onValueChange} />,
+		);
+		const itemValues = Array.from(
+			root.querySelectorAll<HTMLElement>("[data-option-value]"),
+			(item) => item.dataset.optionValue,
+		);
+		const selectedValue = root.querySelector<HTMLElement>('[data-testid="select-root"]')?.dataset
+			.stateValue;
+
+		// Assert
+		expect(new Set(itemValues).size).toBe(collisionOptions.length);
+		expect(itemValues).not.toContain("");
+		expect(selectItemKeys).toEqual(itemValues);
+		expect(new Set(selectItemKeys).size).toBe(collisionOptions.length);
+		expect(selectedValue).toBe(itemValues[collisionValues.indexOf(value)]);
+		expect(root.querySelector<HTMLElement>("button")?.dataset.value).toBe(value);
+		expect(onValueChange).not.toHaveBeenCalled();
+	});
+
+	it.each(collisionValues)("returns the exact original option %j after selection", (value) => {
+		// Objective: decoding removes only the wrapper's prefix, never a caller's prefix.
+		// Arrange
+		const onValueChange = vi.fn();
+		const root = renderIntoDocument(
+			<RadixSelect options={collisionOptions} value="project" onValueChange={onValueChange} />,
+		);
+		const item =
+			root.querySelectorAll<HTMLButtonElement>("[data-option-value]")[
+				collisionValues.indexOf(value)
+			];
+
+		// Act
+		act(() => item?.click());
+
+		// Assert
+		expect(onValueChange).toHaveBeenCalledExactlyOnceWith(value);
+	});
+
+	it.each(["", "project", "__codemem-empty-select__", "__codemem-select-value__:project"])(
+		"does not match option %j when an unknown selected value resembles its encoding",
+		(optionValue) => {
+			// Objective: unknown values stay unknown even when they look like a valid Radix value.
+			// Arrange
+			const value = `__codemem-select-value__:${optionValue}`;
+			const onValueChange = vi.fn();
+
+			// Act
+			const root = renderIntoDocument(
+				<RadixSelect
+					options={[{ label: "Known project", value: optionValue }]}
+					value={value}
+					onValueChange={onValueChange}
+				/>,
+			);
+			const selectedValue = root.querySelector<HTMLElement>('[data-testid="select-root"]')?.dataset
+				.stateValue;
+			const itemValue = root.querySelector<HTMLElement>("[data-option-value]")?.dataset.optionValue;
+
+			// Assert
+			expect(selectedValue).toBe(`__codemem-select-value__:${value}`);
+			expect(selectedValue).not.toBe(itemValue);
+			expect(onValueChange).not.toHaveBeenCalled();
+		},
+	);
+});
+
+describe("RadixSelect values", () => {
+	it.each([
+		"All Projects",
+		"A project label that is too long to fit inside the compact header control",
+	])("exposes the complete option label %j in its title", (label) => {
+		// Objective: truncation must not remove access to the full option name.
+		// Arrange
+		const options = [{ label, value: "project" }];
+
+		// Act
+		const root = renderIntoDocument(
+			<RadixSelect options={options} value="project" onValueChange={vi.fn()} />,
+		);
+		const option = root.querySelector(".radix-select-item");
+
+		// Assert
+		expect(option?.getAttribute("title")).toBe(label);
+		expect(option?.getAttribute("title")).not.toContain("…");
+	});
+
+	it.each([true, false])(
+		"controls an empty value with an explicit All Projects option: %s",
+		(hasEmptyOption) => {
+			// Objective: an explicit empty option is selected; an absent one can still show a placeholder.
+			// Arrange
+			const options = hasEmptyOption ? [{ label: "All Projects", value: "" }] : [];
+
+			// Act
+			const root = renderIntoDocument(
+				<RadixSelect
+					options={options}
+					value=""
+					placeholder="Pick a project"
+					onValueChange={vi.fn()}
+				/>,
+			);
+			const value = root.querySelector<HTMLElement>('[data-testid="select-root"]')?.dataset
+				.stateValue;
+
+			// Assert
+			if (hasEmptyOption) {
+				expect(value).toBe(
+					root.querySelector<HTMLElement>("[data-option-value]")?.dataset.optionValue,
+				);
+				expect(value).not.toBe("");
+			} else {
+				expect(value).toBe("");
+			}
+			expect(root.querySelector("button")?.dataset.value).toBe("");
+		},
+	);
+
+	it.each(["", "a-project-with-a-long-name"])(
+		"reports project option %j without exposing the empty-option sentinel",
+		(value) => {
+			// Objective: All Projects clears the filter while named projects retain their value.
+			// Arrange
+			const onValueChange = vi.fn();
+			const options = [
+				{ label: "All Projects", value: "" },
+				{ label: "A project with a long name", value: "a-project-with-a-long-name" },
+			];
+			const root = renderIntoDocument(
+				<RadixSelect
+					ariaLabel="Project"
+					options={options}
+					value="a-project-with-a-long-name"
+					onValueChange={onValueChange}
+				/>,
+			);
+			const optionIndex = options.findIndex((option) => option.value === value);
+
+			// Act
+			act(() => root.querySelectorAll<HTMLButtonElement>("button")[optionIndex + 1]?.click());
+
+			// Assert
+			expect(onValueChange).toHaveBeenCalledExactlyOnceWith(value);
+		},
+	);
+
 	it("keeps the explicit accessible name instead of falling back to placeholder text", () => {
 		const root = renderIntoDocument(
 			<RadixSelect
