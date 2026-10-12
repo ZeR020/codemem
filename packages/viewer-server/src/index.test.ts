@@ -32,6 +32,7 @@ import {
 	seedProvenMixedScopeFixture,
 } from "../../core/src/managed-scope-test-fixtures.js";
 import { refreshTestScopeRows } from "../../core/src/scope-membership-cache-test-fixtures.js";
+import * as syncApi from "../../ui/src/lib/api/sync.js";
 import { type AppOptions, createApp, createSyncApp } from "./index.js";
 import { __usageCacheTestHooks } from "./routes/stats.js";
 import { reconcileConfiguredCoordinatorEnrollment } from "./routes/sync.js";
@@ -56,6 +57,354 @@ const LEGACY_UNCLASSIFIED_PROVENANCE = {
 	estimated_count: 0,
 	legacy_unclassified_count: 1,
 };
+
+function syncRequestCase(method: string, path: string, invoke: () => Promise<unknown>) {
+	return { method, path, invoke };
+}
+
+function matchesConcreteApiRoute(
+	route: { method: string; path: string },
+	request: { method: string; path: string },
+): boolean {
+	if (route.method !== request.method || route.path.includes("*")) return false;
+	const pattern = route.path
+		.split("/")
+		.map((segment) => {
+			if (/^:\w+$/.test(segment)) return "[^/]+";
+			return segment.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+		})
+		.join("/");
+	return new RegExp(`^${pattern}$`).test(request.path);
+}
+
+function registerContractProbeRoutes(app: ReturnType<typeof createApp>) {
+	// Hono normalizes the real static fallback to /*; probe raw * independently too.
+	app.routes.push({ method: "GET", path: "*", handler: (context) => context.text("fallback") });
+	app.get("/api/sync/review.v1", (context) => context.json({}));
+}
+
+const syncRequestCases = {
+	loadSyncStatus: syncRequestCase("GET", "/api/sync/status", () => {
+		const includeDiagnostics = false;
+		return syncApi.loadSyncStatus(includeDiagnostics);
+	}),
+	loadPairing: syncRequestCase("GET", "/api/sync/pairing", () => syncApi.loadPairing()),
+	loadSyncActors: syncRequestCase("GET", "/api/sync/actors", () => syncApi.loadSyncActors()),
+	importCoordinatorInvite: syncRequestCase("POST", "/api/sync/invites/import", () =>
+		syncApi.importCoordinatorInvite("invite"),
+	),
+	inspectCoordinatorInvite: syncRequestCase("POST", "/api/sync/invites/inspect", () =>
+		syncApi.inspectCoordinatorInvite("invite"),
+	),
+	updatePeerScope: syncRequestCase("POST", "/api/sync/peers/scope", () =>
+		syncApi.updatePeerScope("peer", ["project"], null),
+	),
+	updatePeerIdentity: syncRequestCase("POST", "/api/sync/peers/identity", () => {
+		const claimedLocalActor = true;
+		return syncApi.updatePeerIdentity("peer", claimedLocalActor);
+	}),
+	assignPeerActor: syncRequestCase("POST", "/api/sync/peers/identity", () =>
+		syncApi.assignPeerActor("peer", "actor"),
+	),
+	deletePeer: syncRequestCase("DELETE", "/api/sync/peers/peer", () => syncApi.deletePeer("peer")),
+	renamePeer: syncRequestCase("POST", "/api/sync/peers/rename", () =>
+		syncApi.renamePeer("peer", "Renamed"),
+	),
+	renameKnownDevice: syncRequestCase(
+		"POST",
+		"/api/sync/recipient-policy/v1/devices/device/rename",
+		() => syncApi.renameKnownDevice("device", "Renamed"),
+	),
+	acceptDiscoveredPeer: syncRequestCase("POST", "/api/sync/peers/accept-discovered", () =>
+		syncApi.acceptDiscoveredPeer("peer"),
+	),
+	loadLegacyTeamSetupSummary: syncRequestCase("GET", "/api/sync/team-setup/v1", () =>
+		syncApi.loadLegacyTeamSetupSummary(),
+	),
+	loadLegacyTeamSetupDetail: syncRequestCase("GET", "/api/sync/team-setup/v1/candidate", () =>
+		syncApi.loadLegacyTeamSetupDetail("candidate"),
+	),
+	saveLegacyTeamSetupAssignment: syncRequestCase(
+		"PUT",
+		"/api/sync/team-setup/v1/candidate/devices/device/assignment",
+		() =>
+			syncApi.saveLegacyTeamSetupAssignment("candidate", "device", {
+				attemptId: "attempt",
+				targetIdentityRef: "identity",
+				expectation: { kind: "absent" },
+			}),
+	),
+	saveLegacyTeamSetupDecision: syncRequestCase(
+		"PUT",
+		"/api/sync/team-setup/v1/candidate/devices/device/decision",
+		() =>
+			syncApi.saveLegacyTeamSetupDecision("candidate", "device", {
+				attemptId: "attempt",
+				decision: "excluded",
+			}),
+	),
+	clearLegacyTeamSetupDecision: syncRequestCase(
+		"DELETE",
+		"/api/sync/team-setup/v1/candidate/devices/device/decision",
+		() => syncApi.clearLegacyTeamSetupDecision("candidate", "device", { attemptId: "attempt" }),
+	),
+	saveLegacyTeamSetupProjectMapping: syncRequestCase(
+		"PUT",
+		"/api/sync/team-setup/v1/candidate/projects/project/mapping",
+		() =>
+			syncApi.saveLegacyTeamSetupProjectMapping("candidate", "project", {
+				attemptId: "attempt",
+				resolvedProjectRef: "resolved",
+			}),
+	),
+	refreshLegacyTeamSetupCandidate: syncRequestCase(
+		"POST",
+		"/api/sync/team-setup/v1/candidate/refresh",
+		() => syncApi.refreshLegacyTeamSetupCandidate("candidate"),
+	),
+	finishLegacyTeamSetup: syncRequestCase("POST", "/api/sync/team-setup/v1/candidate/finish", () =>
+		syncApi.finishLegacyTeamSetup("candidate", {
+			attemptId: "attempt",
+			finishDigest: "finish",
+			confirmedAccessDeltaDigest: "delta",
+			confirmedViewerAccessDeltaDigest: "viewer-delta",
+		}),
+	),
+	renameRecipientPolicyTeam: syncRequestCase(
+		"PATCH",
+		"/api/sync/recipient-policy/v1/teams/team",
+		() =>
+			syncApi.renameRecipientPolicyTeam({
+				teamId: "team",
+				displayName: "Renamed",
+				expectedDisplayName: "Original",
+			}),
+	),
+	loadRecipientPolicyIntent: syncRequestCase("GET", "/api/sync/recipient-policy/v1/intent", () =>
+		syncApi.loadRecipientPolicyIntent(),
+	),
+	loadDeviceIdentityInventory: syncRequestCase(
+		"GET",
+		"/api/sync/recipient-policy/v1/device-inventory",
+		() => syncApi.loadDeviceIdentityInventory(),
+	),
+	previewDeviceIdentityBindings: syncRequestCase(
+		"POST",
+		"/api/sync/recipient-policy/v1/device-bindings/preview",
+		() =>
+			syncApi.previewDeviceIdentityBindings({
+				bindings: [{ deviceId: "device", targetIdentityId: "identity", confirmed: true }],
+			}),
+	),
+	commitDeviceIdentityBindings: syncRequestCase(
+		"POST",
+		"/api/sync/recipient-policy/v1/device-bindings/commit",
+		() =>
+			syncApi.commitDeviceIdentityBindings({
+				bindings: [{ deviceId: "device", targetIdentityId: "identity", confirmed: true }],
+				reviewedInventoryDigest: "inventory",
+			}),
+	),
+	loadRecipientPolicyReconciliationStatus: syncRequestCase(
+		"GET",
+		"/api/sync/recipient-policy/v1/reconciliation-status",
+		() => syncApi.loadRecipientPolicyReconciliationStatus(),
+	),
+	previewRecipientPolicyEdges: syncRequestCase(
+		"POST",
+		"/api/sync/recipient-policy/v1/edges/preview",
+		() =>
+			syncApi.previewRecipientPolicyEdges({
+				version: 1,
+				changes: [
+					{
+						canonicalProjectIdentity: "project",
+						recipient: { recipientKind: "identity", identityId: "identity" },
+						action: "add",
+					},
+				],
+			}),
+	),
+	commitRecipientPolicyEdges: syncRequestCase(
+		"POST",
+		"/api/sync/recipient-policy/v1/edges/commit",
+		() =>
+			syncApi.commitRecipientPolicyEdges({
+				version: 1,
+				changes: [
+					{
+						canonicalProjectIdentity: "project",
+						recipient: { recipientKind: "identity", identityId: "identity" },
+						action: "add",
+					},
+				],
+				reviewedPolicyDigest: "policy",
+			}),
+	),
+	previewRecipientInvite: syncRequestCase(
+		"POST",
+		"/api/sync/recipient-policy/v1/invites/preview",
+		() => syncApi.previewRecipientInvite({ kind: "team_member", policy_team_id: "team" }),
+	),
+	createRecipientInvite: syncRequestCase("POST", "/api/sync/recipient-policy/v1/invites", () =>
+		syncApi.createRecipientInvite({
+			kind: "team_member",
+			policy_team_id: "team",
+			reviewed_onboarding_digest: "onboarding",
+		}),
+	),
+	loadRecipientPolicyReview: syncRequestCase("GET", "/api/sync/recipient-policy/v1/review", () =>
+		syncApi.loadRecipientPolicyReview(),
+	),
+	resolveRecipientPolicyReview: syncRequestCase(
+		"POST",
+		"/api/sync/recipient-policy/v1/review/resolve",
+		() =>
+			syncApi.resolveRecipientPolicyReview({
+				reviewItemId: "review",
+				sourceFingerprint: "fingerprint",
+				decision: "keep_project_local",
+			}),
+	),
+	resolveRecipientPolicyReviewBulk: syncRequestCase(
+		"POST",
+		"/api/sync/recipient-policy/v1/review/resolve-bulk",
+		() =>
+			syncApi.resolveRecipientPolicyReviewBulk([
+				{
+					reviewItemId: "review",
+					sourceFingerprint: "fingerprint",
+					decision: "keep_project_local",
+				},
+			]),
+	),
+	loadSharingDomainSettings: syncRequestCase("GET", "/api/sync/sharing-domains/settings", () =>
+		syncApi.loadSharingDomainSettings(),
+	),
+	loadProjectScopeInventory: syncRequestCase("GET", "/api/sync/projects", () =>
+		syncApi.loadProjectScopeInventory({ q: "project", limit: 10 }),
+	),
+	previewProjectInvite: syncRequestCase("POST", "/api/sync/project-invites/preview", () =>
+		syncApi.previewProjectInvite({ teammate_name: "Teammate", project_ids: ["project"] }),
+	),
+	createProjectInvite: syncRequestCase("POST", "/api/sync/project-invites", () =>
+		syncApi.createProjectInvite({
+			teammate_name: "Teammate",
+			project_ids: ["project"],
+			reviewed_project_set_digest: "projects",
+		}),
+	),
+	loadShareOperations: syncRequestCase("GET", "/api/sync/share-operations", () =>
+		syncApi.loadShareOperations(),
+	),
+	loadShareOperation: syncRequestCase("GET", "/api/sync/share-operations/operation", () =>
+		syncApi.loadShareOperation("operation"),
+	),
+	advanceShareOperation: syncRequestCase(
+		"POST",
+		"/api/sync/share-operations/operation/advance",
+		() => syncApi.advanceShareOperation("operation"),
+	),
+	saveSharingDomainProjectMapping: syncRequestCase(
+		"PUT",
+		"/api/sync/sharing-domains/project-mappings",
+		() =>
+			syncApi.saveSharingDomainProjectMapping({ workspace_identity: "project", scope_id: "scope" }),
+	),
+	saveSharingDomainProjectMappings: syncRequestCase(
+		"PUT",
+		"/api/sync/sharing-domains/project-mappings/bulk",
+		() =>
+			syncApi.saveSharingDomainProjectMappings({
+				mappings: [{ workspace_identity: "project", scope_id: "scope" }],
+			}),
+	),
+	deleteSharingDomainProjectMapping: syncRequestCase(
+		"DELETE",
+		"/api/sync/sharing-domains/project-mappings/1",
+		() => syncApi.deleteSharingDomainProjectMapping(1),
+	),
+	reassignProjectInventoryProject: syncRequestCase(
+		"POST",
+		"/api/sync/projects/reassign-project",
+		() =>
+			syncApi.reassignProjectInventoryProject({
+				workspace_identity: "project",
+				project: "Renamed",
+			}),
+	),
+	forgetProjectInventoryMemories: syncRequestCase("POST", "/api/sync/projects/forget", () =>
+		syncApi.forgetProjectInventoryMemories({
+			workspace_identity: "project",
+			confirmed: true,
+			confirmation_token: "confirmation",
+		}),
+	),
+	reassignLegacySharedReviewGroup: syncRequestCase(
+		"POST",
+		"/api/sync/legacy-shared-review/reassign",
+		() =>
+			syncApi.reassignLegacySharedReviewGroup({
+				workspace_identity: "project",
+				scope_id: "scope",
+				confirmed_old_copies: true,
+				confirmation_token: "confirmation",
+			}),
+	),
+	loadCoordinatorGroupPreferences: syncRequestCase(
+		"GET",
+		"/api/coordinator/admin/groups/group/preferences",
+		() => syncApi.loadCoordinatorGroupPreferences("group"),
+	),
+	saveCoordinatorGroupPreferences: syncRequestCase(
+		"PUT",
+		"/api/coordinator/admin/groups/group/preferences",
+		() =>
+			syncApi.saveCoordinatorGroupPreferences("group", {
+				projects_include: ["project"],
+				projects_exclude: null,
+				auto_seed_scope: true,
+			}),
+	),
+	enrollPeer: syncRequestCase("POST", "/api/coordinator/admin/groups/group/enroll-peer", () =>
+		syncApi.enrollPeer("group", {
+			mode: "discovered",
+			peer_device_id: "peer",
+			fingerprint: "fingerprint",
+		}),
+	),
+	createActor: syncRequestCase("POST", "/api/sync/actors", () => syncApi.createActor("Actor")),
+	renameActor: syncRequestCase("POST", "/api/sync/actors/rename", () =>
+		syncApi.renameActor("actor", "Renamed"),
+	),
+	mergeActor: syncRequestCase("POST", "/api/sync/actors/merge", () =>
+		syncApi.mergeActor("primary", "secondary"),
+	),
+	deactivateActor: syncRequestCase("POST", "/api/sync/actors/deactivate", () =>
+		syncApi.deactivateActor("actor"),
+	),
+	claimLegacyDeviceIdentity: syncRequestCase("POST", "/api/sync/legacy-devices/claim", () =>
+		syncApi.claimLegacyDeviceIdentity("device"),
+	),
+	triggerSync: syncRequestCase("POST", "/api/sync/run", () =>
+		syncApi.triggerSync({ peerDeviceId: "peer" }),
+	),
+};
+
+function mockBrowserDeadlineTimers() {
+	const descriptor = Object.getOwnPropertyDescriptor(globalThis, "window");
+	const timers = { setTimeout: vi.fn(() => 1), clearTimeout: vi.fn() };
+	if (descriptor) {
+		const setTimer = vi.spyOn(window, "setTimeout").mockImplementation(timers.setTimeout);
+		const clearTimer = vi.spyOn(window, "clearTimeout").mockImplementation(timers.clearTimeout);
+		return () => {
+			setTimer.mockRestore();
+			clearTimer.mockRestore();
+		};
+	}
+	Object.defineProperty(globalThis, "window", { configurable: true, value: timers });
+	return () => Reflect.deleteProperty(globalThis, "window");
+}
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -1380,9 +1729,8 @@ describe("viewer-server", () => {
 		}
 	});
 
-	it("sync UI api routes all exist in the viewer sync router", () => {
+	it("keeps Team setup routes in their versioned router", () => {
 		const root = join(import.meta.dirname, "../../..");
-		const apiSource = readFileSync(join(root, "packages/ui/src/lib/api.ts"), "utf8");
 		const syncRouteSource = readFileSync(
 			join(root, "packages/viewer-server/src/routes/sync.ts"),
 			"utf8",
@@ -1392,22 +1740,13 @@ describe("viewer-server", () => {
 			"utf8",
 		);
 		const routeSource = `${syncRouteSource}\n${teamSetupRouteSource}`;
-		const uiRoutes = [
-			...apiSource.matchAll(/fetch\('(\/api\/sync\/[^']+)'/g),
-			...apiSource.matchAll(/fetchJson\('(\/api\/sync\/[^']+)'/g),
-		].map((match) => match[1]);
 		const concreteServerRoutes = [
 			...routeSource.matchAll(/app\.(?:get|post|put|patch|delete)\("(\/api\/sync\/[^"]+)"/g),
 		].map((match) => match[1]);
 		const normalizedServerRoutes = new Set(
 			concreteServerRoutes.map((route) => route.replace(/:\w+/g, "__param__")),
 		);
-		expect(
-			uiRoutes
-				.map((route) => route.replace(/\?.*$/, ""))
-				.map((route) => route.replace(/`\$\{[^}]+\}`/g, "__param__"))
-				.every((route) => normalizedServerRoutes.has(route)),
-		).toBe(true);
+		expect(normalizedServerRoutes.size).toBeGreaterThan(0);
 		expect(concreteServerRoutes).toContain("/api/sync/team-setup/v1");
 		expect(concreteServerRoutes).toContain("/api/sync/team-setup/v1/:candidateRef");
 		expect(syncRouteSource).toContain('app.patch("/api/sync/recipient-policy/v1/teams/:teamId"');
@@ -1426,6 +1765,55 @@ describe("viewer-server", () => {
 				.filter((route) => route.includes("/team-setup/"))
 				.every((route) => route.startsWith(TEAM_SETUP_ROUTE_PREFIX)),
 		).toBe(true);
+	});
+
+	it("matches real sync UI requests to viewer routes, including methods and template paths", async () => {
+		const { app, cleanup } = createTestApp();
+		registerContractProbeRoutes(app);
+		const restoreTimers = mockBrowserDeadlineTimers();
+		const requests: Array<{ method: string; path: string }> = [];
+		const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+			requests.push({
+				method: init?.method ?? "GET",
+				path: new URL(String(input), "http://localhost").pathname,
+			});
+			return new Response(JSON.stringify({ error: "contract_probe" }), { status: 500 });
+		});
+		const cases = Object.entries(syncRequestCases);
+		// isLegacyTeamSetupView validates JSON without making HTTP requests; Error subclasses
+		// are constructors, not request wrappers. All other exported callables need a case.
+		const exportedWrappers = Object.entries(syncApi)
+			.filter(
+				([name, value]) =>
+					typeof value === "function" &&
+					name !== "isLegacyTeamSetupView" &&
+					!(value.prototype instanceof Error),
+			)
+			.map(([name]) => name);
+		const hasRoute = (request: { method: string; path: string }) =>
+			app.routes.some((route) => matchesConcreteApiRoute(route, request));
+		try {
+			const outcomes = [];
+			for (const [, request] of cases)
+				outcomes.push(...(await Promise.allSettled([request.invoke()])));
+			expect(exportedWrappers.sort()).toEqual(Object.keys(syncRequestCases).sort());
+			expect(cases).toHaveLength(55);
+			expect(fetchMock).toHaveBeenCalledTimes(cases.length);
+			expect(outcomes.map((outcome) => outcome.status)).toEqual(cases.map(() => "rejected"));
+			expect(requests).toEqual(cases.map(([, { method, path }]) => ({ method, path })));
+			for (const [name, request] of cases) expect(hasRoute(request), name).toBe(true);
+			expect(hasRoute({ method: "GET", path: "/api/sync/review.v1" })).toBe(true);
+			expect(hasRoute({ method: "GET", path: "/api/sync/reviewXv1" })).toBe(false);
+			expect(hasRoute({ method: "GET", path: "/api/sync/not-a-route" })).toBe(false);
+			expect(hasRoute({ method: "GET", path: "/api/sync/team-setup/v1/candidate/finish" })).toBe(
+				false,
+			);
+			expect(hasRoute({ method: "POST", path: "/api/sync/not-a-route" })).toBe(false);
+		} finally {
+			fetchMock.mockRestore();
+			restoreTimers();
+			cleanup();
+		}
 	});
 
 	describe("Team setup API", () => {
@@ -10282,159 +10670,101 @@ describe("viewer-server", () => {
 		});
 
 		it("returns 400 for /v1/snapshot without required params", async () => {
-			const { syncApp, cleanup } = createTestApp();
+			// Arrange: authenticate so this tests parameter validation, not the auth gate.
+			const { syncApp, ensureStore, cleanup } = createTestApp();
+			let peer: ReturnType<typeof createAuthenticatedSyncPeer> | null = null;
 			try {
-				// Missing generation
-				const res = await syncApp.request("/v1/snapshot?snapshot_id=test");
-				// Will be 401 without auth, but let's verify the endpoint exists
-				expect([400, 401]).toContain(res.status);
+				const url = "http://localhost/v1/snapshot?snapshot_id=test";
+				peer = createAuthenticatedSyncPeer(ensureStore(), { url });
+				// Act
+				const res = await syncApp.request(url, { headers: peer.headers });
+				// Assert
+				expect(res.status).toBe(400);
+				expect(await res.json()).toEqual({ error: "missing_generation" });
 			} finally {
+				peer?.cleanup();
 				cleanup();
 			}
 		});
 
 		it("returns reset_required metadata for stale peer cursors", async () => {
+			// Arrange
 			const { syncApp, ensureStore, cleanup } = createTestApp();
-			const peerDir = mkdtempSync(join(tmpdir(), "codemem-sync-peer-test-"));
-			const peerDbPath = join(peerDir, "peer.sqlite");
-			const peerKeysDir = join(peerDir, "keys");
+			let peer: ReturnType<typeof createAuthenticatedSyncPeer> | null = null;
 			try {
 				const store = ensureStore();
 
-				const peerDb = connect(peerDbPath);
-				try {
-					initTestSchema(peerDb);
-					const [peerDeviceId] = ensureDeviceIdentity(peerDb, { keysDir: peerKeysDir });
-					const peerPublicKey = loadPublicKey(peerKeysDir);
-					if (!peerPublicKey) throw new Error("peer public key missing");
-					const peerFingerprint = peerDb
-						.prepare("SELECT fingerprint FROM sync_device LIMIT 1")
-						.get() as { fingerprint: string } | undefined;
-					if (!peerFingerprint?.fingerprint) throw new Error("peer fingerprint missing");
-
-					store.db
-						.prepare(
-							`INSERT INTO sync_peers(peer_device_id, pinned_fingerprint, public_key, created_at)
-							 VALUES (?, ?, ?, ?)`,
-						)
-						.run(
-							peerDeviceId,
-							peerFingerprint.fingerprint,
-							peerPublicKey,
-							new Date().toISOString(),
-						);
-
-					store.db
-						.prepare(
-							`INSERT OR REPLACE INTO sync_reset_state(id, generation, snapshot_id, baseline_cursor, retained_floor_cursor, updated_at)
+				store.db
+					.prepare(
+						`INSERT OR REPLACE INTO sync_reset_state(id, generation, snapshot_id, baseline_cursor, retained_floor_cursor, updated_at)
 							 VALUES (1, ?, ?, ?, ?, ?)`,
-						)
-						.run(
-							7,
-							"snapshot-7",
-							"2026-01-01T00:00:02Z|base-op",
-							"2026-01-01T00:00:03Z|floor-op",
-							new Date().toISOString(),
-						);
+					)
+					.run(
+						7,
+						"snapshot-7",
+						"2026-01-01T00:00:02Z|base-op",
+						"2026-01-01T00:00:03Z|floor-op",
+						new Date().toISOString(),
+					);
 
-					const url =
-						"http://localhost/v1/ops?since=2026-01-01T00:00:01Z%7Cold&limit=50&generation=7&snapshot_id=snapshot-7&baseline_cursor=2026-01-01T00:00:02Z%7Cbase-op";
-					const headers = buildAuthHeaders({
-						deviceId: peerDeviceId,
-						method: "GET",
-						url,
-						bodyBytes: Buffer.alloc(0),
-						keysDir: peerKeysDir,
-					});
-
-					const res = await syncApp.request(url, { headers });
-					expect(res.status).toBe(409);
-					const body = (await res.json()) as Record<string, unknown>;
-					expect(body.error).toBe("reset_required");
-					expect(body.reset_required).toBe(true);
-					expect(body.sync_capability).toBe("scoped");
-					expect(body.reason).toBe("stale_cursor");
-					expect(body.generation).toBe(7);
-					expect(body.snapshot_id).toBe("snapshot-7");
-					expect(body.retained_floor_cursor).toBe("2026-01-01T00:00:03Z|floor-op");
-				} finally {
-					peerDb.close();
-				}
+				const url =
+					"http://localhost/v1/ops?since=2026-01-01T00:00:01Z%7Cold&limit=50&generation=7&snapshot_id=snapshot-7&baseline_cursor=2026-01-01T00:00:02Z%7Cbase-op";
+				peer = createAuthenticatedSyncPeer(store, { url });
+				// Act
+				const res = await syncApp.request(url, { headers: peer.headers });
+				// Assert
+				expect(res.status).toBe(409);
+				const body = (await res.json()) as Record<string, unknown>;
+				expect(body.error).toBe("reset_required");
+				expect(body.reset_required).toBe(true);
+				expect(body.sync_capability).toBe("scoped");
+				expect(body.reason).toBe("stale_cursor");
+				expect(body.generation).toBe(7);
+				expect(body.snapshot_id).toBe("snapshot-7");
+				expect(body.retained_floor_cursor).toBe("2026-01-01T00:00:03Z|floor-op");
 			} finally {
+				peer?.cleanup();
 				cleanup();
-				rmSync(peerDir, { recursive: true, force: true });
 			}
 		});
 
 		it("requires explicit reset boundary metadata on incremental sync requests", async () => {
+			// Arrange
 			const { syncApp, ensureStore, cleanup } = createTestApp();
-			const peerDir = mkdtempSync(join(tmpdir(), "codemem-sync-peer-test-"));
-			const peerDbPath = join(peerDir, "peer.sqlite");
-			const peerKeysDir = join(peerDir, "keys");
+			let peer: ReturnType<typeof createAuthenticatedSyncPeer> | null = null;
 			try {
 				const store = ensureStore();
 
-				const peerDb = connect(peerDbPath);
-				try {
-					initTestSchema(peerDb);
-					const [peerDeviceId] = ensureDeviceIdentity(peerDb, { keysDir: peerKeysDir });
-					const peerPublicKey = loadPublicKey(peerKeysDir);
-					if (!peerPublicKey) throw new Error("peer public key missing");
-					const peerFingerprint = peerDb
-						.prepare("SELECT fingerprint FROM sync_device LIMIT 1")
-						.get() as { fingerprint: string } | undefined;
-					if (!peerFingerprint?.fingerprint) throw new Error("peer fingerprint missing");
-
-					store.db
-						.prepare(
-							`INSERT INTO sync_peers(peer_device_id, pinned_fingerprint, public_key, created_at)
-							 VALUES (?, ?, ?, ?)`,
-						)
-						.run(
-							peerDeviceId,
-							peerFingerprint.fingerprint,
-							peerPublicKey,
-							new Date().toISOString(),
-						);
-
-					store.db
-						.prepare(
-							`INSERT OR REPLACE INTO sync_reset_state(id, generation, snapshot_id, baseline_cursor, retained_floor_cursor, updated_at)
+				store.db
+					.prepare(
+						`INSERT OR REPLACE INTO sync_reset_state(id, generation, snapshot_id, baseline_cursor, retained_floor_cursor, updated_at)
 							 VALUES (1, ?, ?, ?, ?, ?)`,
-						)
-						.run(
-							9,
-							"snapshot-9",
-							"2026-01-01T00:00:02Z|base-op",
-							"2026-01-01T00:00:03Z|floor-op",
-							new Date().toISOString(),
-						);
+					)
+					.run(
+						9,
+						"snapshot-9",
+						"2026-01-01T00:00:02Z|base-op",
+						"2026-01-01T00:00:03Z|floor-op",
+						new Date().toISOString(),
+					);
 
-					const url = "http://localhost/v1/ops?since=2026-01-01T00:00:03Z%7Cfloor-op&limit=50";
-					const headers = buildAuthHeaders({
-						deviceId: peerDeviceId,
-						method: "GET",
-						url,
-						bodyBytes: Buffer.alloc(0),
-						keysDir: peerKeysDir,
-					});
-
-					const res = await syncApp.request(url, { headers });
-					expect(res.status).toBe(409);
-					const body = (await res.json()) as Record<string, unknown>;
-					expect(body.error).toBe("reset_required");
-					expect(body.reset_required).toBe(true);
-					expect(body.sync_capability).toBe("scoped");
-					expect(body.reason).toBe("boundary_mismatch");
-					expect(body.generation).toBe(9);
-					expect(body.snapshot_id).toBe("snapshot-9");
-					expect(body.baseline_cursor).toBe("2026-01-01T00:00:02Z|base-op");
-				} finally {
-					peerDb.close();
-				}
+				const url = "http://localhost/v1/ops?since=2026-01-01T00:00:03Z%7Cfloor-op&limit=50";
+				peer = createAuthenticatedSyncPeer(store, { url });
+				// Act
+				const res = await syncApp.request(url, { headers: peer.headers });
+				// Assert
+				expect(res.status).toBe(409);
+				const body = (await res.json()) as Record<string, unknown>;
+				expect(body.error).toBe("reset_required");
+				expect(body.reset_required).toBe(true);
+				expect(body.sync_capability).toBe("scoped");
+				expect(body.reason).toBe("boundary_mismatch");
+				expect(body.generation).toBe(9);
+				expect(body.snapshot_id).toBe("snapshot-9");
+				expect(body.baseline_cursor).toBe("2026-01-01T00:00:02Z|base-op");
 			} finally {
+				peer?.cleanup();
 				cleanup();
-				rmSync(peerDir, { recursive: true, force: true });
 			}
 		});
 
