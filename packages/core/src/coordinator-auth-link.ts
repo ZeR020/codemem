@@ -476,15 +476,33 @@ export class AuthLinkOperations implements CoordinatorAuthLinkStore {
 		const row = await this.read(i.attemptId, c);
 		if (result === 0) {
 			if (row) return this.createRetry(row, i, s, c, now, authority);
-			const active = await this.first({
-				sql: `SELECT 1 ${CREATE_SOURCE_SQL} ${AUTHORITY_GUARD}`,
-				values: [...createSourceValues(c, s), ...authority],
-			});
-			return rejected(active ? "attempt_limited" : "controller_not_active");
+			return this.diagnoseCreateAdmission(i.attemptId, c, s, authority);
 		}
 		if (typeof result !== "number") return this.createRetry(row, i, s, c, now, authority);
 		if (!row) throw new Error("auth_link_persistence_incomplete");
 		return { kind: "created", status: status(row, now), identityId: row.identity_id };
+	}
+	private async diagnoseCreateAdmission(
+		attemptId: string,
+		c: CoordinatorAuthLinkConfig,
+		s: CoordinatorAuthLinkSigner,
+		authority: (string | number | null)[],
+	): Promise<CoordinatorAuthLinkCreateResult> {
+		const active = await this.first({
+			sql: `SELECT 1 ${CREATE_SOURCE_SQL} ${AUTHORITY_GUARD}`,
+			values: [...createSourceValues(c, s), ...authority],
+		});
+		if (!active) return rejected("controller_not_active");
+		const reserved = await this.readOwnerReservation(attemptId, c);
+		return rejected(reserved ? "attempt_conflict" : "attempt_limited");
+	}
+	private readOwnerReservation(attemptId: string, c: CoordinatorAuthLinkConfig) {
+		return this.first({
+			sql: `SELECT 1 FROM coordinator_owner_enrollment_attempts WHERE coordinator_id = ? AND attempt_id = ?
+ UNION ALL SELECT 1 FROM coordinator_auth_browser_transactions WHERE coordinator_id = ? AND attempt_id = ?
+ AND purpose NOT IN ('signin','link') LIMIT 1`,
+			values: [c.coordinatorId, attemptId, c.coordinatorId, attemptId],
+		});
 	}
 	private async createRetry(
 		row: Attempt | null,
@@ -511,6 +529,7 @@ export class AuthLinkOperations implements CoordinatorAuthLinkStore {
 			values: [row.attempt_id, ...configValues(c), ...authority],
 		});
 		if (!active) return rejected("controller_not_active");
+		if (await this.readOwnerReservation(row.attempt_id, c)) return rejected("attempt_conflict");
 		return { kind: "existing", status: status(row, now), identityId: row.identity_id };
 	}
 	private async transition(

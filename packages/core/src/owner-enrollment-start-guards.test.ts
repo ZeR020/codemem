@@ -268,11 +268,106 @@ it.each(["pending", "failed"] as const)(
 			config,
 		);
 		// Assert
-		expect(result).toMatchObject({ kind: "rejected" });
+		expect(result).toEqual({ kind: "rejected", error: "attempt_conflict" });
 		expect(f.rows("coordinator_auth_link_attempts").map((r) => r.attempt_id)).toEqual([
 			"other-attempt",
 		]);
 		expect(f.rows(ATTEMPTS)).toHaveLength(1);
+	},
+);
+
+it.each(
+	(["pending", "expired"] as const).flatMap((state) =>
+		[false, true].map((retry) => ({ state, retry })),
+	),
+)(
+	"link creation reports a conflict for a $state owner browser-only attempt ID with retry=$retry",
+	async ({ state, retry }) => {
+		// Arrange: browser history reserves the ID even without an owner attempt row.
+		await enroll(f.store);
+		expect((await f.store.createAuthControllerAttestation(review())).kind).toBe("created");
+		const links = new AuthLinkOperations(f.backend, () => NOW);
+		const input = linkAttempt({ runtimeVerifierHash: "e".repeat(64) });
+		if (retry) {
+			// Act / Assert: an exact same-purpose retry succeeds before the legacy collision.
+			const original = await links.createAuthLinkAttempt(input, config);
+			expect(original.kind).toBe("created");
+			expect(await links.createAuthLinkAttempt(input, config)).toEqual({
+				...original,
+				kind: "existing",
+			});
+		}
+		// Arrange: seed retained legacy history after any successful link retry.
+		f.db
+			.prepare(`INSERT INTO ${TRANSACTIONS}
+		(coordinator_id,browser_transaction_hash,purpose,attempt_id,state_hash,binder_hash,
+		issuer,auth_config_revision,redirect_uri,state,nonce,pkce_verifier,created_at_ms,expires_at_ms)
+		VALUES (?,?,'owner_enroll','attempt-a',?,?,?,?,?,?,?,?,?,?)`)
+			.run(
+				config.coordinatorId,
+				"1".repeat(64),
+				"2".repeat(64),
+				"3".repeat(64),
+				config.issuer,
+				config.revision,
+				config.redirectUri,
+				state,
+				state === "pending" ? proof() : null,
+				state === "pending" ? proof() : null,
+				NOW - 300000,
+				state === "pending" ? NOW + 300000 : NOW - 1,
+			);
+		const before = f.rows(TRANSACTIONS);
+		// Act: a different ID succeeds; the reserved ID must not look rate-limited.
+		const created = await links.createAuthLinkAttempt(
+			linkAttempt({ attemptId: "other-attempt" }),
+			config,
+		);
+		const linkRows = f.rows("coordinator_auth_link_attempts");
+		const collision = await links.createAuthLinkAttempt(input, config);
+		// Assert: terminal history also retains the reservation without being mutated.
+		expect(created.kind).toBe("created");
+		expect(collision).toEqual({ kind: "rejected", error: "attempt_conflict" });
+		expect(f.rows(ATTEMPTS)).toEqual([]);
+		expect(f.rows(TRANSACTIONS)).toEqual(before);
+		expect(f.rows("coordinator_auth_link_attempts")).toEqual(linkRows);
+	},
+);
+
+it.each(["pending", "failed"] as const)(
+	"exact link retry rejects a retained legacy %s owner attempt collision",
+	async (state) => {
+		// Arrange: real controller authority and an unrelated signed owner start.
+		await enroll(f.store);
+		expect((await f.store.createAuthControllerAttestation(review())).kind).toBe("created");
+		const c = await compose();
+		expect((await c.start(c.signed("owner-source"), "transport-a")).kind).toBe("started");
+		const links = new AuthLinkOperations(f.backend, () => NOW);
+		const input = linkAttempt();
+		// Act / Assert: a matching link row normally permits an exact retry.
+		const original = await links.createAuthLinkAttempt(input, config);
+		expect(original.kind).toBe("created");
+		expect(await links.createAuthLinkAttempt(input, config)).toEqual({
+			...original,
+			kind: "existing",
+		});
+		// Arrange: insert legacy birth facts without changing any immutable pins.
+		f.db
+			.prepare(`INSERT INTO ${ATTEMPTS}
+		(coordinator_id,attempt_id,purpose,origin,device_id,public_key,key_id,fingerprint,
+		issuer,auth_config_revision,loopback_redirect,browser_start_hash,state,created_at_ms,expires_at_ms)
+		SELECT coordinator_id,'attempt-a',purpose,origin,device_id,public_key,key_id,fingerprint,
+		issuer,auth_config_revision,CASE WHEN ?='pending' THEN loopback_redirect ELSE NULL END,
+		?, ?,created_at_ms,expires_at_ms FROM ${ATTEMPTS} WHERE attempt_id='owner-source'`)
+			.run(state, "f".repeat(64), state);
+		const before = snapshot();
+		const linkRows = f.rows("coordinator_auth_link_attempts");
+		// Act
+		const collision = await links.createAuthLinkAttempt(input, config);
+		// Assert: neither retained owner history nor the matching link row changes.
+		expect(collision).toEqual({ kind: "rejected", error: "attempt_conflict" });
+		expect(snapshot()).toEqual(before);
+		expect(f.rows("coordinator_auth_link_attempts")).toEqual(linkRows);
 	},
 );
 
