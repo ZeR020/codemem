@@ -8,6 +8,10 @@
 import type { Context } from "hono";
 import { Hono } from "hono";
 import { registerCoordinatorAuthControllerReviewRoutes } from "./coordinator-auth-controller-review-route.js";
+import {
+	AUTH_SCHEMA_UPGRADE_REQUIRED,
+	authSchemaUpgradeResponse,
+} from "./coordinator-auth-schema.js";
 import type {
 	CoordinatorBrowserAuth,
 	CoordinatorBrowserAuthClientKey,
@@ -104,7 +108,7 @@ export type CoordinatorAppBrowserAuthOptions =
 			storeFactory: () => CoordinatorDeviceAuthLinkStore;
 			clientKey: CoordinatorBrowserAuthClientKey;
 	  }
-	| { kind: "unavailable" };
+	| { kind: "unavailable"; error?: typeof AUTH_SCHEMA_UPGRADE_REQUIRED };
 
 function recipientInviteErrorStatus(code: string): 403 | 404 | 409 | 410 {
 	if (code === "device_revoked") return 403;
@@ -134,8 +138,13 @@ function registerOptionalCoordinatorAuth(
 	>,
 ): void {
 	if (opts.authLink && opts.browserAuth) throw new Error("coordinator_auth_configuration_conflict");
+	const unavailable =
+		opts.browserAuth?.kind === "unavailable" &&
+		opts.browserAuth.error === AUTH_SCHEMA_UPGRADE_REQUIRED
+			? authSchemaUpgradeResponse
+			: authenticationUnavailableResponse;
 	if (opts.browserAuth?.kind !== "ready") {
-		app.all("/v1/auth/account-link-status", authenticationUnavailableResponse);
+		app.all("/v1/auth/account-link-status", unavailable);
 	}
 	if (opts.browserAuth?.kind === "unavailable") {
 		for (const path of [
@@ -147,7 +156,7 @@ function registerOptionalCoordinatorAuth(
 			"/v1/auth/owner-attempts/*",
 			"/v1/admin/auth-controller-reviews",
 		]) {
-			app.all(path, authenticationUnavailableResponse);
+			app.all(path, unavailable);
 		}
 		return;
 	}
