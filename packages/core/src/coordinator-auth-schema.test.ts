@@ -9,6 +9,7 @@ import {
 	withoutNewAuthorityColumns,
 } from "../../cloudflare-coordinator-worker/test/link-authority-upgrade-fixture.js";
 import { BetterSqliteCoordinatorStore } from "./better-sqlite-coordinator-store.js";
+import { COORDINATOR_AUTH_DEVICE_CLAIM_SCHEMA_STATEMENTS as proof } from "./coordinator-auth-device-claim-schema.js";
 import { AUTH_LINK_SCHEMA_SQL } from "./coordinator-auth-link-contract.js";
 import { LEGACY_INLINE_AUTH_LINK_SCHEMA_SQL } from "./coordinator-auth-link-legacy-inline-test-fixture.js";
 import { attempt, cfg } from "./coordinator-auth-link-test-fixtures.js";
@@ -139,3 +140,54 @@ it("does not create a database when an operator selects a missing file", () => {
 });
 
 afterAll(() => rmSync(directory, { recursive: true, force: true }));
+
+it.each([
+	"CREATE UNIQUE INDEX custom_claim_group ON coordinator_auth_device_claims(group_id)",
+	"CREATE TRIGGER custom_claim_insert BEFORE INSERT ON coordinator_auth_device_claims BEGIN SELECT RAISE(IGNORE); END;",
+])("rejects extra proof objects without repairing them: %s", async (damage) => {
+	// Arrange: the complete reviewed proof schema passes before adding a custom object.
+	const store = new BetterSqliteCoordinatorStore(":memory:");
+	try {
+		await expect(store.assertAuthSchemaReady()).resolves.toBeUndefined();
+		store.db.exec(damage);
+		const schema = store.db.prepare("SELECT * FROM sqlite_master ORDER BY name").all();
+		// Act / Assert: the extra object invalidates readiness and remains untouched.
+		await expect(store.assertAuthSchemaReady()).rejects.toBeInstanceOf(
+			CoordinatorAuthSchemaUpgradeRequiredError,
+		);
+		expect(store.db.prepare("SELECT * FROM sqlite_master ORDER BY name").all()).toEqual(schema);
+	} finally {
+		await store.close();
+	}
+});
+
+it.each([
+	"CREATE TABLE coordinator_auth_device_claims (claim_id TEXT)",
+	proof[0].replace("UNIQUE (coordinator_id, identity_id),", ""),
+	proof[0].replace("'text'", "'te xt'"),
+	...proof.slice(1).map((sql) => sql.replace(/SELECT RAISE\([^;]+;/u, "SELECT 1;")),
+])("rejects incomplete proof definitions after reopening (case %#)", async (damage) => {
+	const path = join(mkdtempSync(join(directory, "damaged-")), "coordinator.sqlite");
+	const isTable = damage.trimStart().startsWith("CREATE TABLE");
+	const original = new BetterSqliteCoordinatorStore(path);
+	original.db.exec("DROP TABLE coordinator_auth_device_claims");
+	if (isTable) original.db.exec(damage);
+	else original.db.exec(proof[0]);
+	for (const sql of proof.slice(1)) original.db.exec(sql);
+	if (!isTable) {
+		const name = /CREATE TRIGGER IF NOT EXISTS (\w+)/u.exec(damage)?.[1];
+		original.db.exec(`DROP TRIGGER ${name}`);
+		original.db.exec(damage);
+	}
+	const before = original.db.prepare("SELECT * FROM sqlite_master ORDER BY name").all();
+	await original.close();
+	const reopened = new BetterSqliteCoordinatorStore(path);
+	try {
+		await expect(reopened.assertAuthSchemaReady()).rejects.toBeInstanceOf(
+			CoordinatorAuthSchemaUpgradeRequiredError,
+		);
+		expect(reopened.db.prepare("SELECT * FROM sqlite_master ORDER BY name").all()).toEqual(before);
+	} finally {
+		await reopened.close();
+	}
+});

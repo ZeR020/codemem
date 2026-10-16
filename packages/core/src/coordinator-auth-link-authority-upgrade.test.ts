@@ -8,11 +8,13 @@ import {
 	withoutNewAuthorityColumns,
 } from "../../cloudflare-coordinator-worker/test/link-authority-upgrade-fixture.js";
 import { AUTH_CONTROLLER_SCHEMA_SQL } from "./coordinator-auth-controller.js";
+import { COORDINATOR_AUTH_DEVICE_CLAIM_SCHEMA_STATEMENTS as proof } from "./coordinator-auth-device-claim-schema.js";
 import {
 	AUTH_LINK_AUTHORITY_UPGRADE_SQL,
 	upgradeAuthLinkAuthoritySchema,
 } from "./coordinator-auth-link-authority-upgrade.js";
 import { LEGACY_INLINE_AUTH_LINK_SCHEMA_SQL } from "./coordinator-auth-link-legacy-inline-test-fixture.js";
+import { AUTH_SCHEMA_READINESS_SQL, AUTH_SCHEMA_READY_COUNT } from "./coordinator-auth-schema.js";
 
 const LEGACY_LINK_SCHEMA_SQL = [
 	"0017_add_auth_account_links.sql",
@@ -42,6 +44,35 @@ function snapshot(db: Database.Database) {
 }
 
 it.each([
+	"CREATE TABLE coordinator_auth_device_claims (claim_id TEXT)",
+	`${proof.join("\n")} CREATE UNIQUE INDEX custom_claim_group ON coordinator_auth_device_claims(group_id);`,
+	`${proof.join("\n")} CREATE TRIGGER custom_claim_insert BEFORE INSERT ON coordinator_auth_device_claims BEGIN SELECT RAISE(IGNORE); END;`,
+	// SQLite resolves these names to the expected objects despite their case.
+	"CREATE TABLE COORDINATOR_AUTH_DEVICE_CLAIMS (claim_id TEXT)",
+	"CREATE TABLE Coordinator_Auth_Device_Claims (claim_id TEXT)",
+	`${proof[0]} CREATE TRIGGER COORDINATOR_AUTH_DEVICE_CLAIMS_IMMUTABLE_UPDATE BEFORE UPDATE ON coordinator_auth_device_claims BEGIN SELECT 1; END;`,
+	`${proof[0]} CREATE TRIGGER Coordinator_Auth_Device_Claims_Insert_Collision BEFORE INSERT ON coordinator_auth_device_claims BEGIN SELECT 1; END;`,
+	proof[0].replace("UNIQUE (coordinator_id, identity_id),", ""),
+	...proof
+		.slice(1)
+		.map((sql) => `${proof[0]} ${sql.replace(/SELECT RAISE\([^;]+;/u, "SELECT 1;")}`),
+])("aborts the whole cutover for unknown proof DDL (case %#)", (damage) => {
+	// Arrange: retain the complete legacy rows and schema, including incompatible proof objects.
+	const db = legacyDatabase();
+	try {
+		db.exec(damage);
+		const before = snapshot(db);
+		const schema = db.prepare("SELECT * FROM sqlite_master ORDER BY name").all();
+		// Act / Assert: reject before any link swap commits, not just at readiness checking.
+		expect(() => upgradeAuthLinkAuthoritySchema(db)).toThrow(/CHECK/);
+		expect(snapshot(db)).toEqual(before);
+		expect(db.prepare("SELECT * FROM sqlite_master ORDER BY name").all()).toEqual(schema);
+	} finally {
+		db.close();
+	}
+});
+
+it.each([
 	["actual migrations", LEGACY_LINK_SCHEMA_SQL],
 	["frozen inline DDL", LEGACY_INLINE_AUTH_LINK_SCHEMA_SQL],
 ])(
@@ -50,9 +81,21 @@ it.each([
 		// Arrange: both supported legacy shapes retain historical rows without live controller pins.
 		const db = legacyDatabase(schemaSql);
 		try {
+			db.exec(
+				readFileSync(
+					new URL(
+						"../../cloudflare-coordinator-worker/migrations/0032_device_claim_proofs.sql",
+						import.meta.url,
+					),
+					"utf8",
+				),
+			);
 			const before = snapshot(db);
 			// Act
 			upgradeAuthLinkAuthoritySchema(db);
+			expect(db.prepare(AUTH_SCHEMA_READINESS_SQL).get()).toEqual({
+				ready: AUTH_SCHEMA_READY_COUNT,
+			});
 			// Assert: the full copy survives, while a repeated upgrade is rejected.
 			expect(snapshot(db).map(withoutNewAuthorityColumns)).toEqual(before);
 			for (const rows of snapshot(db)) {

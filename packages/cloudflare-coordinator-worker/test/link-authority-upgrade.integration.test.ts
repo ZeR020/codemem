@@ -2,6 +2,8 @@ import { env } from "cloudflare:workers";
 import { afterEach, beforeEach, expect, it } from "vitest";
 import { AUTH_LINK_AUTHORITY_UPGRADE_SQL, AUTH_LINK_AUTHORITY_CUTOVER_STATEMENTS } from "../../core/src/coordinator-auth-link-authority-upgrade.js";
 import { AUTH_LINK_SCHEMA_SQL } from "../../core/src/coordinator-auth-link-contract.js";
+import { COORDINATOR_AUTH_DEVICE_CLAIM_SCHEMA_STATEMENTS as proof } from "../../core/src/coordinator-auth-device-claim-schema.js";
+import { AUTH_SCHEMA_READINESS_SQL, AUTH_SCHEMA_READY_COUNT } from "../../core/src/coordinator-auth-schema.js";
 import {
 	legacyLinkAuthorityRowsSql,
 	linkAuthorityDefinitionsSql,
@@ -60,8 +62,51 @@ beforeEach(async () => {
 	}
 	await batch(legacyLinkAuthorityRowsSql);
 });
+
+it.each([
+	"CREATE UNIQUE INDEX custom_claim_group ON coordinator_auth_device_claims(group_id)",
+	"CREATE TRIGGER custom_claim_insert BEFORE INSERT ON coordinator_auth_device_claims BEGIN SELECT RAISE(IGNORE); END;",
+])("native D1 rejects extra proof objects atomically: %s", async (damage) => {
+	// Arrange: all four reviewed proof objects exist before adding the custom object.
+	await env.COORDINATOR_DB.batch(proof.map((sql) => env.COORDINATOR_DB.prepare(sql)));
+	const before = await snapshot();
+	await env.COORDINATOR_DB.prepare(damage).run();
+	const schema = (await env.COORDINATOR_DB.prepare("SELECT * FROM sqlite_master ORDER BY name").all()).results;
+	// Act / Assert: neither the legacy links nor any schema object changes on rejection.
+	await expect(env.COORDINATOR_DB.batch(AUTH_LINK_AUTHORITY_CUTOVER_STATEMENTS.map((sql) => env.COORDINATOR_DB.prepare(sql)))).rejects.toThrow(/CHECK/);
+	expect(await snapshot()).toEqual(before);
+	expect((await env.COORDINATOR_DB.prepare("SELECT * FROM sqlite_master ORDER BY name").all()).results).toEqual(schema);
+});
+
+it.each([
+	"CREATE TABLE coordinator_auth_device_claims (claim_id TEXT)",
+	// SQLite resolves these names to the expected objects despite their case.
+	"CREATE TABLE COORDINATOR_AUTH_DEVICE_CLAIMS (claim_id TEXT)",
+	"CREATE TABLE Coordinator_Auth_Device_Claims (claim_id TEXT)",
+	"CREATE TRIGGER COORDINATOR_AUTH_DEVICE_CLAIMS_IMMUTABLE_UPDATE BEFORE UPDATE ON coordinator_auth_device_claims BEGIN SELECT 1; END;",
+	"CREATE TRIGGER Coordinator_Auth_Device_Claims_Insert_Collision BEFORE INSERT ON coordinator_auth_device_claims BEGIN SELECT 1; END;",
+	proof[0].replace("UNIQUE (coordinator_id, identity_id),", ""),
+	proof[2].replace(/SELECT RAISE\([^;]+;/u, "SELECT 1;"),
+])("native D1 rejects unknown proof DDL atomically (case %#)", async (damage) => {
+	// Arrange: retain the complete legacy rows and schema, including incompatible proof objects.
+	await env.COORDINATOR_DB.prepare("DROP TABLE coordinator_auth_device_claims").run();
+	if (damage.trimStart().startsWith("CREATE TABLE")) await env.COORDINATOR_DB.prepare(damage).run();
+	else {
+		await env.COORDINATOR_DB.prepare(proof[0]).run();
+		await env.COORDINATOR_DB.prepare(damage).run();
+	}
+	const before = await snapshot();
+	const schema = (await env.COORDINATOR_DB.prepare("SELECT * FROM sqlite_master ORDER BY name").all()).results;
+	// Act / Assert: reject before any link swap commits, not just at readiness checking.
+	await expect(env.COORDINATOR_DB.batch(AUTH_LINK_AUTHORITY_CUTOVER_STATEMENTS.map((sql) => env.COORDINATOR_DB.prepare(sql)))).rejects.toThrow(/CHECK/);
+	expect(await snapshot()).toEqual(before);
+	expect((await env.COORDINATOR_DB.prepare("SELECT * FROM sqlite_master ORDER BY name").all()).results).toEqual(schema);
+	expect((await env.COORDINATOR_DB.prepare(AUTH_SCHEMA_READINESS_SQL).first<{ ready: number }>())?.ready).not.toBe(AUTH_SCHEMA_READY_COUNT);
+});
 afterEach(async () => {
 	// Restore only the isolated fixture tables, never a profile or deployment DB.
+	await env.COORDINATOR_DB.prepare("DROP TABLE IF EXISTS coordinator_auth_device_claims").run();
+	await env.COORDINATOR_DB.batch(proof.map((sql) => env.COORDINATOR_DB.prepare(sql)));
 	await batch(
 		`${linkAuthorityTables.map((table) => `DROP TABLE ${table};`).join("\n")} ${AUTH_LINK_SCHEMA_SQL}`,
 	);
@@ -79,6 +124,10 @@ it("native D1 copies every old column, rowid, revoked link and audit event using
 	);
 	await expect(batch(AUTH_LINK_AUTHORITY_UPGRADE_SQL)).rejects.toThrow(/CHECK/);
 	expect(await snapshot()).toEqual(after);
+	expect(await env.COORDINATOR_DB.prepare(AUTH_SCHEMA_READINESS_SQL).first()).toEqual({ ready: AUTH_SCHEMA_READY_COUNT });
+	await env.COORDINATOR_DB.prepare("DROP TRIGGER coordinator_auth_device_claims_immutable_update").run();
+	await env.COORDINATOR_DB.prepare(proof[2].replace(/SELECT RAISE\([^;]+;/u, "SELECT 1;")).run();
+	expect(await env.COORDINATOR_DB.prepare(AUTH_SCHEMA_READINESS_SQL).first()).toEqual({ ready: AUTH_SCHEMA_READY_COUNT - 1 });
 });
 
 it.each([
