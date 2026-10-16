@@ -479,8 +479,10 @@ only a confirmed attempt and writes its immutable proof, account link, and
 creation audit together. Exact finalization retries read the retained receipt;
 they never insert the proof again. Completed status and browser resolution check
 historical proof/link/audit pins instead of rerunning first-binding eligibility.
-Device-authenticated status and finalization retries also require the original
-key's current enrollment and no device/key revocation.
+Device-authenticated status requires a current enrolled, unrevoked key: the
+original key or an exact shared assignment as described below. Finalization
+retries still require the original key's current enrollment and no device/key
+revocation.
 
 Core account-session issuance, redemption, sign-in, profile/account reads, and
 operator link revocation accept device-claim links only with coherent retained
@@ -771,13 +773,13 @@ before its deadline, other than the attempt being checked.
 | Link attempts from the target | A live device-claim attempt names another Identity |
 | Account links for the claim | Any exists, active or revoked |
 | Device claims for the claim | A committed claim exists |
-| Enrollments naming the claim | One belongs to another device or key |
+| Enrollments naming the claim | One belongs to another device or key without the exact same-record peer assignment described below |
 | Attestations naming the claim | One, active or revoked, belongs to another device or key (`identity_id` or `enrollment_identity_id`) |
 | Ownership bindings naming the claim | One belongs to another device or key |
 | Identity-group grants for the claim | Any exists, active or revoked |
 | Invites naming the claim | An unrevoked invite assigns or targets it and is still pending, or is bound to another device or key |
-| Invite or completion Identity footprints | `recipient_actor_id` names the claim and is bound to another device or key, or `inviter_actor_id` names the claim and `inviter_device_id` is another device; completion records tying the claim to another device/key also deny |
-| Legacy team completions naming the claim | A device decision gives it to another device |
+| Invite Identity footprints | `recipient_actor_id` names the claim and is bound to another device or key, or `inviter_actor_id` names the claim and `inviter_device_id` is another device |
+| Legacy team completions naming the claim | Another device/key names it without the exact current assignment described below; the current device with another key, or current key under another device, always denies |
 | Owner-enrollment attempts for the claim | One is live |
 | Link attempts for the claim | A live attempt of either kind comes from another device or key |
 
@@ -785,14 +787,38 @@ These are not contradictions, and must not block a claim:
 
 - records about other people in the same group or Team;
 - unrelated labels and display names that do not name the claim; a claimed
-  Identity tied to another device is ambiguous even when
-  that older record was not an account-ownership proof;
+  Identity tied to another device is ambiguous without an exact current assignment;
 - expired, cancelled, failed, or retired attempts of either flow, including
   attempts that reached OIDC verification;
 - invites that expired or were revoked before being consumed;
 - legacy completion memberships that neither name the claim nor assign it to
   another device or key;
 - evidence that agrees with both the target and the claim.
+
+An exact assignment is an included, enabled decision matching the current device,
+authenticated fingerprint and Identity in the canonical completion selected by
+`legacyTeamCandidateId(coordinator, group)`. Another coordinator's record cannot
+shadow it. Core validates the full manifest, exact canonical JSON, and stored
+candidate/version/completion metadata. Malformed evidence supplies no exception.
+The winning SQL rechecks the captured bytes, scope, current enrollment and
+revocations. A captured assignment cannot disappear during the operation, even
+when that would remove the last footprint; a fresh operation may recapture it.
+
+Only other included, enabled decisions with different fingerprints in that same
+record may avoid the legacy contradiction. A peer enrollment naming the Identity
+must also remain enabled in the current group and match its recorded device,
+fingerprint and Identity, with a canonically different Ed25519 key. Key aliases
+never qualify. All other eligibility checks stay in force; this grants no
+controller, owner-enrollment, invitation or grant authority.
+
+An exactly assigned peer may read the Identity's linked/revoked status through
+its historical attempt/proof/link/creation-audit chain. The origin key may differ;
+the origin device or controller need not remain active. Current-requester
+ownership/enrollment mismatches, revoked or other-Identity attestations in any
+group/key alias, consumed other-Identity invitation assignments and committed
+other-Identity link history still deny access. Token revocation or retired
+controllers do not erase those pins. Guessed Identities expose no metadata, and
+this read never permits another binding or replacement of a revoked link.
 
 The local Identity comes from the current profile context, whether config or
 environment selects it. The viewer and runtime pin that context and stop on any
