@@ -197,3 +197,25 @@ known; wildcard bind hosts remain wildcard hosts and are rejected by the guard.
 Shutdown closes the account registry before draining listeners and closing the
 shared store. Account reads do not initialize another profile or use an admin
 credential. The separate sync listener still exposes no account routes.
+
+## Browser handoffs and completion
+
+The Viewer opens an isolated window from **Link Google account**; the coordinator automatically submits its same-origin start form.
+The start cookie, CSRF token and private device-issued start proof remain required, with **Continue with Google** as a script-free fallback.
+Only after the transaction commits does the validated provider URL open automatically, with a manual fallback.
+
+Google sign-in and explicit account confirmation do not replace signed device proof.
+After confirmation commits, the browser navigates to the saved literal-loopback receiver without a referrer, with a manual fallback.
+The receipt reports checking, not success; website-session redemption is optional and never switches an existing session automatically.
+
+The Viewer retains the window handle without exposing `window.opener`.
+Only its own successful operation plus fresh linked status for the matching original context, group and Identity permits closing.
+Success is remembered across context switches; failed, uncertain or mismatched responses cannot close the window.
+
+Provider isolation can sever the handle, so the receipt also polls its held listener with a random per-receiver token and same-origin fetch checks.
+Only successful signed runtime finalization can mark this result linked and trigger self-close; cleanup waits at most 1.5 seconds for the response to flush.
+Manually opened tabs and browsers refusing closure retain check-status guidance; popup messages and receipt content never authorize a link.
+
+Hosted pages and the receipt use Codemem's dark mint palette, sans-serif type, rounded cards and keyboard focus treatment.
+Light colors follow the OS because these origins cannot read the Viewer's saved theme.
+Exact CSP hashes allow styles and only the fixed start/receipt scripts; receipt connections stay same-origin, with no remote scripts or fonts.

@@ -52,6 +52,13 @@ function useFlowState() {
 	const refs = useRef({
 		privateUrl: null as string | null,
 		popup: null as Window | null,
+		authWindow: null as {
+			window: Window;
+			operationId: string;
+			contextId: string;
+			groupId: string;
+			succeeded: boolean;
+		} | null,
 		delivered: null as string | null,
 		generation: 0,
 		starting: false,
@@ -133,6 +140,7 @@ async function checkExpiredPendingOperation(
 	try {
 		const result = await getAccountOperation(pending.operationId, options.signal);
 		if (options.signal.aborted || options.epoch !== flow.refs.current.generation) return;
+		rememberAuthWindowSuccess(flow, result.operation);
 		if (active(result.operation)) {
 			flow.setPendingOperation(result.operation);
 			return;
@@ -154,10 +162,26 @@ function showStatus(
 	result: AccountView,
 	options: { notice?: string; previousNotice?: string; excludeOperationId?: string },
 ): void {
+	rememberAuthWindowSuccess(flow, result.operation);
 	const verifiedLinked =
 		result.remote.kind === "status" &&
 		result.remote.state === "linked" &&
 		result.remote.identityMatches;
+	const authWindow = flow.refs.current.authWindow;
+	if (
+		verifiedLinked &&
+		authWindow &&
+		authWindow.contextId === result.contextId &&
+		authWindow.groupId === result.selectedGroupId &&
+		authWindow.succeeded
+	) {
+		flow.refs.current.authWindow = null;
+		try {
+			authWindow.window.close();
+		} catch {
+			// Isolated browser windows may need to be closed manually.
+		}
+	}
 	flow.setView(result);
 	if (
 		result.operation &&
@@ -268,6 +292,7 @@ async function adoptConflict(
 			operationId,
 			flow.refs.current.controller?.signal,
 		);
+		if (epoch === flow.refs.current.generation) rememberAuthWindowSuccess(flow, candidate);
 		if (
 			epoch !== flow.refs.current.generation ||
 			!current ||
@@ -381,6 +406,13 @@ function deliverBrowserUrl(
 			flow.refs.current.popup = null;
 			if (target && !target.closed) {
 				target.location.replace(url);
+				flow.refs.current.authWindow = {
+					window: target,
+					operationId: operation.operationId,
+					contextId: operation.contextId,
+					groupId: operation.groupId,
+					succeeded: false,
+				};
 				return;
 			}
 			flow.refs.current.privateUrl = url;
@@ -416,12 +448,23 @@ function useBrowserDelivery(flow: Flow): void {
 
 function openFallback(flow: Flow): void {
 	const url = flow.refs.current.privateUrl;
-	flow.refs.current.privateUrl = null;
-	flow.setFallback(false);
 	if (!url || !flow.view?.coordinator || !validAccountBrowserUrl(url, flow.view.coordinator.origin))
 		return;
-	// With noopener browsers may return null even after opening the new tab.
-	window.open(url, "_blank", "noopener,noreferrer");
+	// Keep a close handle without exposing the Viewer through window.opener.
+	const target = window.open("about:blank", "_blank");
+	if (!target) return;
+	target.opener = null;
+	target.location.replace(url);
+	flow.refs.current.privateUrl = null;
+	flow.setFallback(false);
+	if (flow.operation)
+		flow.refs.current.authWindow = {
+			window: target,
+			operationId: flow.operation.operationId,
+			contextId: flow.operation.contextId,
+			groupId: flow.operation.groupId,
+			succeeded: false,
+		};
 }
 
 async function poll(
@@ -434,6 +477,7 @@ async function poll(
 	try {
 		const result = await getAccountOperation(operation.operationId, signal);
 		if (epoch !== flow.refs.current.generation) return;
+		rememberAuthWindowSuccess(flow, result.operation);
 		showPolledOperation(flow, result, currentView);
 	} catch (error) {
 		if (signal.aborted || epoch !== flow.refs.current.generation) return;
@@ -444,6 +488,18 @@ async function poll(
 		flow.setPendingOperation(operationMissing(error) ? null : { ...operation });
 		flow.setMessage("We couldn’t confirm whether linking finished. Check status.");
 	}
+}
+
+function rememberAuthWindowSuccess(flow: Flow, operation?: AccountOperation | null): void {
+	if (!operation) return;
+	const target = flow.refs.current.authWindow;
+	if (
+		target?.operationId === operation.operationId &&
+		target.contextId === operation.contextId &&
+		target.groupId === operation.groupId &&
+		operation.state === "succeeded"
+	)
+		target.succeeded = true;
 }
 
 function showPolledOperation(
@@ -540,6 +596,7 @@ async function cancel(
 	try {
 		const result = await cancelAccountLink(operation.operationId, abort.signal);
 		if (epoch !== flow.refs.current.generation) return;
+		rememberAuthWindowSuccess(flow, result.operation);
 		if (previous) {
 			flow.setPendingOperation(active(result.operation) ? result.operation : null);
 			flow.setMessage("Cancellation is pending. Check status to confirm.");
