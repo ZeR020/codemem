@@ -209,6 +209,9 @@ export const AUTH_LIFECYCLE_UPGRADE_STATEMENTS = Object.freeze(
 		`CREATE TABLE ${CHECKS} (passed INTEGER NOT NULL CHECK (passed = 1))`,
 		...AUTH_LIFECYCLE_PREDECESSOR_CHECKS.map(({ matches }) => assertion(matches)),
 		assertion(`(${AUTH_SCHEMA_V2_READINESS_SQL}) = ${AUTH_SCHEMA_V2_READY_COUNT}`),
+		assertion(
+			`NOT EXISTS (SELECT 1 FROM sqlite_master WHERE ${newTables.map((sql) => `instr(lower(sql), ${quote(createdDefinition(sql).name)}) > 0`).join(" OR ")})`,
+		),
 		...AUTH_LIFECYCLE_COPY_TABLE_NAMES.flatMap((table) =>
 			authLifecycleSnapshotStatements({ table }),
 		),

@@ -27,8 +27,11 @@ async function restoreFrozenAuthPredecessor() {
 	// Validate inputs before changing even this isolated local test binding.
 	const migrations = frozenPredecessorMigrations(env.TEST_MIGRATIONS);
 	const current = await schema();
-	for (const { type, name, tbl_name } of current.filter(({ sql }) => sql !== null).sort((a, b) => Number(b.type === "trigger") - Number(a.type === "trigger"))) {
-		if (tbl_name.startsWith("coordinator_auth_") || name.startsWith("coordinator_lifecycle_") || name.startsWith("unrelated_") || name === "late_failure") await db.prepare(`DROP ${type.toUpperCase()} IF EXISTS "${name.replaceAll('"', '""')}"`).run();
+	const dropOrder: Record<string, number> = { trigger: 0, view: 1, index: 2, table: 3 };
+	const resetObjects = current.filter(({ sql, name, tbl_name }) => sql !== null && (tbl_name.startsWith("coordinator_auth_") || /coordinator_auth_/iu.test(sql) || name.startsWith("coordinator_lifecycle_") || name.startsWith("unrelated_") || name === "late_failure"));
+	resetObjects.sort((a, b) => (dropOrder[a.type] ?? 4) - (dropOrder[b.type] ?? 4) || Number(a.tbl_name.startsWith("coordinator_auth_")) - Number(b.tbl_name.startsWith("coordinator_auth_")));
+	for (const { type, name } of resetObjects) {
+		await db.prepare(`DROP ${type.toUpperCase()} IF EXISTS "${name.replaceAll('"', '""')}"`).run();
 	}
 	for (const migration of migrations) await db.batch(migration.queries.map((sql) => db.prepare(sql)));
 	// Reuse the explicit authority cutover source, not DDL captured from latest setup.
@@ -166,9 +169,34 @@ it("upgrades populated Worker predecessors atomically and preserves all nine old
 	await expect(db.prepare(`INSERT INTO ${claims} (claim_id,coordinator_id,identity_id,group_id,device_id,public_key,fingerprint,key_id,attempt_id,issuer,auth_config_revision,created_at_ms) SELECT 'new-claim',coordinator_id,'new-identity','new-group','new-device',public_key,fingerprint,?,'missing-attempt',issuer,auth_config_revision,created_at_ms FROM ${claims} WHERE claim_id = 'link-1'`).bind("f".repeat(64)).run()).rejects.toThrow(/genesis_unavailable/);
 });
 
+it("removes future external auth dependencies before restoring and upgrading the frozen predecessor", async () => {
+	// Arrange: these names are outside the auth prefix; only their SQL identifies the dependency.
+	await db.batch([
+		`CREATE TABLE future_dependent (coordinator_id TEXT, link_id TEXT, FOREIGN KEY (coordinator_id, link_id) REFERENCES ${links}(coordinator_id, link_id))`,
+		"INSERT INTO future_dependent VALUES ('synthetic', 'link-0')",
+		`CREATE VIEW future_reader AS SELECT * FROM ${links}`,
+		`CREATE TRIGGER future_reader_trigger AFTER INSERT ON future_dependent BEGIN SELECT * FROM ${links}; END`,
+	].map((sql) => db.prepare(sql)));
+	const callerOwned = await raw(await inventory(["groups", "coordinator_identity_group_grants"]));
+	// Act
+	await restoreFrozenAuthPredecessor();
+	const restored = await schema();
+	const readiness = await db.prepare(AUTH_SCHEMA_V2_READINESS_SQL).first();
+	await upgrade();
+	// Assert
+	expect(restored.filter(({ name }) => ["future_dependent", "future_reader", "future_reader_trigger"].includes(name))).toEqual([]);
+	expect(readiness).toEqual({ ready: 10 });
+	expect(await db.prepare(AUTH_SCHEMA_V2_READINESS_SQL).first()).toEqual({ ready: 9 });
+	expect(await raw(await inventory(["groups", "coordinator_identity_group_grants"]))).toEqual(callerOwned);
+});
+
 it.each([
 	"CREATE INDEX custom_index ON coordinator_auth_account_links(subject)",
 	"CREATE TRIGGER custom_trigger BEFORE INSERT ON coordinator_auth_account_links BEGIN SELECT 1; END",
+	"CREATE VIEW leaked_associations AS SELECT * FROM coordinator_auth_account_associations",
+	"CREATE VIEW leaked_change_attempts AS SELECT * FROM coordinator_auth_link_change_attempts",
+	"CREATE TABLE external_refresh_reader (refresh_id TEXT REFERENCES coordinator_auth_link_profile_refreshes(refresh_id))",
+	"CREATE TRIGGER external_association_reader AFTER INSERT ON unrelated_notes BEGIN SELECT * FROM coordinator_auth_account_associations; END",
 	"CREATE TABLE coordinator_auth_lifecycle_snapshot_account_links (foreign_value TEXT)",
 ])("rejects unsafe predecessor objects without changing any schema or data %#", async (damage) => {
 	// Arrange

@@ -285,6 +285,9 @@ function registerLinkAtomicityTests(test: Test) {
 		// Arrange
 		await authorize(f);
 		await advance(f, "browser_claimed");
+		// Remove only browser proof in this isolated fixture; retain the attempt tombstone.
+		f.db.prepare(`DELETE FROM ${TABLE}`).run();
+		expect(transactionRows(f)).toEqual([]);
 		const before = snapshot(f);
 		const browserBefore = transactionRows(f);
 		const random = vi.spyOn(globalThis.crypto, "getRandomValues").mockImplementation((array) => {
