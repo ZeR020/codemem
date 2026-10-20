@@ -1877,3 +1877,171 @@ describe("Team metadata route", () => {
 		},
 	);
 });
+
+describe("Team setup summary and coordinator admin access", () => {
+	it("still reports a missing coordinator URL as unavailable", async () => {
+		const { store, close } = createRouteStore();
+		const base = readCoordinatorSyncConfig({});
+		const app = teamSetupRoutes({
+			getStore: () => store,
+			snapshotLoaderDependencies: {
+				readConfig: () => ({
+					...base,
+					syncCoordinatorUrl: "",
+					syncCoordinatorGroups: ["configured"],
+					syncCoordinatorAdminSecret: "configured-admin-secret",
+				}),
+				listGroups: vi.fn(async () => []),
+				listDevices: vi.fn(async () => []),
+			},
+		});
+		try {
+			const response = await app.request("/api/sync/team-setup/v1");
+			expect(response.status).toBe(503);
+			expect(await response.json()).toEqual({ error: "team_setup_roster_unavailable" });
+		} finally {
+			close();
+		}
+	});
+
+	it("keeps coordinator list failures transient-classified without a config reason", async () => {
+		const { store, close } = createRouteStore();
+		const base = readCoordinatorSyncConfig({});
+		const app = teamSetupRoutes({
+			getStore: () => store,
+			snapshotLoaderDependencies: {
+				readConfig: () => ({
+					...base,
+					syncCoordinatorUrl: "http://localhost:8787",
+					syncCoordinatorGroups: ["configured"],
+					syncCoordinatorAdminSecret: "configured-admin-secret",
+				}),
+				listGroups: async () => {
+					throw new Error("coordinator rejected request");
+				},
+				listDevices: vi.fn(async () => []),
+			},
+		});
+		try {
+			const response = await app.request("/api/sync/team-setup/v1");
+			expect(response.status).toBe(503);
+			expect(await response.json()).toEqual({ error: "team_setup_roster_unavailable" });
+		} finally {
+			close();
+		}
+	});
+
+	it("reports nothing to migrate when coordinator admin access is absent, but keeps detail fail-closed", async () => {
+		const { store, close } = createRouteStore();
+		const base = readCoordinatorSyncConfig({});
+		const listGroups = vi.fn(async () => []);
+		const app = teamSetupRoutes({
+			getStore: () => store,
+			snapshotLoaderDependencies: {
+				readConfig: () => ({
+					...base,
+					syncCoordinatorUrl: "http://localhost:8787",
+					syncCoordinatorGroups: ["configured"],
+					syncCoordinatorAdminSecret: "",
+				}),
+				listGroups,
+				listDevices: vi.fn(async () => []),
+			},
+		});
+		try {
+			const summary = await app.request("/api/sync/team-setup/v1");
+			expect(summary.status).toBe(200);
+			expect(await summary.json()).toEqual({ version: 1, candidates: [] });
+			const detail = await app.request(`/api/sync/team-setup/v1/${FINISH_CANDIDATE_REF}`);
+			expect(detail.status).toBe(503);
+			expect(await detail.json()).toEqual({ error: "team_setup_roster_unavailable" });
+			expect(listGroups).not.toHaveBeenCalled();
+		} finally {
+			close();
+		}
+	});
+});
+
+describe("Team setup summary after admin access is removed", () => {
+	it("keeps a saved unfinished migration visible after admin access is removed", async () => {
+		const { store, close } = createRouteStore();
+		const base = readCoordinatorSyncConfig({});
+		const publicKey = "saved-draft-public-key";
+		let adminSecret = FINISH_ADMIN_SECRET;
+		let invalidateSummary = () => {};
+		const app = teamSetupRoutes({
+			getStore: () => store,
+			registerSummaryInvalidator: (invalidate) => {
+				invalidateSummary = invalidate;
+			},
+			snapshotLoaderDependencies: {
+				readConfig: () => ({
+					...base,
+					syncCoordinatorUrl: FINISH_COORDINATOR_ID,
+					syncCoordinatorGroups: [FINISH_GROUP_ID],
+					syncCoordinatorAdminSecret: adminSecret,
+				}),
+				listGroups: vi.fn(async () => [
+					{ group_id: FINISH_GROUP_ID, display_name: "Migration Team", archived_at: null },
+				]) as never,
+				listDevices: vi.fn(async () => [
+					{
+						group_id: FINISH_GROUP_ID,
+						device_id: "device-a",
+						public_key: publicKey,
+						fingerprint: fingerprintPublicKey(publicKey),
+						identity_id: null,
+						display_name: "Laptop",
+						enabled: 1,
+						created_at: "2026-09-06T00:00:00.000Z",
+					},
+				]) as never,
+			},
+			completionDependencies: {
+				create: async ({ manifest }) => ({ status: "created", manifest }),
+				list: async () => [],
+			},
+		});
+		try {
+			const before = (await (await app.request("/api/sync/team-setup/v1")).json()) as {
+				candidates: Array<{ candidateRef: string; displayName: string }>;
+			};
+			expect(before.candidates.map((candidate) => candidate.displayName)).toEqual([
+				"Migration Team",
+			]);
+			expect(getLegacyTeamSetupDraft(store.db, FINISH_CANDIDATE_REF)).not.toBeNull();
+			// Many older finished migrations must not crowd out the unfinished one.
+			const insertCompleted = store.db.prepare(
+				`INSERT INTO legacy_team_setup_drafts(
+				 attempt_id, candidate_id, coordinator_id, group_id, state, display_name,
+				 roster_fingerprint, projection_fingerprint, created_at, updated_at, completed_at)
+				 VALUES (?, ?, ?, ?, 'completed', 'Old', 'r', 'p', ?, ?, ?)`,
+			);
+			for (let index = 0; index < 30; index += 1) {
+				const groupId = `a-old-group-${String(index).padStart(2, "0")}`;
+				const at = "2026-01-01T00:00:00.000Z";
+				insertCompleted.run(
+					`old-attempt-${index}`,
+					legacyTeamCandidateId(FINISH_COORDINATOR_ID, groupId),
+					FINISH_COORDINATOR_ID,
+					groupId,
+					at,
+					at,
+					at,
+				);
+			}
+
+			adminSecret = "";
+			invalidateSummary();
+			const response = await app.request("/api/sync/team-setup/v1");
+
+			expect(response.status).toBe(200);
+			const after = (await response.json()) as typeof before;
+			expect(after.candidates.map((candidate) => candidate.candidateRef)).toEqual([
+				FINISH_CANDIDATE_REF,
+			]);
+		} finally {
+			close();
+		}
+	});
+});

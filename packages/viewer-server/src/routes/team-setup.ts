@@ -211,6 +211,96 @@ function safeCoordinatorError(): Error {
 	return new Error("team_setup_roster_unavailable");
 }
 
+class CoordinatorAdminConfigurationMissingError extends Error {
+	constructor() {
+		super("team_setup_roster_unavailable");
+		this.name = "CoordinatorAdminConfigurationMissingError";
+	}
+}
+
+function isPassthroughSnapshotLoadError(error: unknown): boolean {
+	return (
+		error instanceof CoordinatorAdminConfigurationMissingError ||
+		(error instanceof Error && error.message === "legacy_team_setup_roster_too_large")
+	);
+}
+
+/**
+ * Without coordinator admin access this Viewer cannot discover groups to
+ * migrate, so the summary suppresses discovery. Members still see their Teams
+ * from local records, and Devices reports incomplete coordinator setup. Saved,
+ * unfinished migrations stay visible so they can be resumed once access
+ * returns. Only the summary uses this; Team detail and finish stay fail-closed.
+ */
+function summaryWithoutAdminAccess(
+	error: unknown,
+	getStore: () => MemoryStore,
+	readConfig: typeof readCoordinatorSyncConfig,
+): LegacyTeamConfiguredGroupSnapshot[] {
+	if (!(error instanceof CoordinatorAdminConfigurationMissingError)) throw error;
+	const store = getStore();
+	const config = readConfig();
+	const eligibleCandidateRefs = new Set(
+		legacyTeamCandidateGroupDescriptors(
+			store,
+			config.syncCoordinatorUrl,
+			config.syncCoordinatorGroups,
+		).map(({ coordinatorId, groupId }) => legacyTeamCandidateId(coordinatorId, groupId)),
+	);
+	if (eligibleCandidateRefs.size === 0) return [];
+	const eligibleRefs = [...eligibleCandidateRefs];
+	const placeholders = eligibleRefs.map(() => "?").join(", ");
+	const rows = store.db
+		.prepare(
+			`SELECT DISTINCT coordinator_id, group_id FROM legacy_team_setup_drafts
+			 WHERE candidate_id IN (${placeholders})
+			 ORDER BY coordinator_id, group_id`,
+		)
+		.all(...eligibleRefs) as Array<{ coordinator_id: string; group_id: string }>;
+	// Bound the result only after dropping finished work, so old completed
+	// migrations can never crowd out an unfinished one.
+	const pending = rows.flatMap((row) => {
+		const candidateRef = legacyTeamCandidateId(row.coordinator_id, row.group_id);
+		if (!eligibleCandidateRefs.has(candidateRef)) return [];
+		const draft = getLegacyTeamSetupDraft(store.db, candidateRef);
+		if (!draft || draft.state === "completed" || hasCompletedLegacyTeamSetup(store, candidateRef)) {
+			return [];
+		}
+		// Only the saved draft is read for these groups; no roster data is needed.
+		return [
+			{
+				coordinatorId: row.coordinator_id,
+				groupId: row.group_id,
+				displayName: draft.displayName,
+				devices: [],
+			},
+		];
+	});
+	return pending.slice(0, MAX_CONFIGURED_GROUPS);
+}
+
+function loadSummarySnapshots(
+	load: () => Promise<LegacyTeamConfiguredGroupSnapshot[]>,
+	getStore: () => MemoryStore,
+	readConfig: typeof readCoordinatorSyncConfig,
+): () => Promise<LegacyTeamConfiguredGroupSnapshot[]> {
+	return () => load().catch((error) => summaryWithoutAdminAccess(error, getStore, readConfig));
+}
+
+function createLoadedSummarySnapshotCache(
+	load: () => Promise<LegacyTeamConfiguredGroupSnapshot[]>,
+	options: TeamSetupRoutesOptions,
+): ReturnType<typeof createCachedSnapshotLoader> {
+	const readConfig =
+		options.readCoordinatorConfig ??
+		options.snapshotLoaderDependencies?.readConfig ??
+		readCoordinatorSyncConfig;
+	return createCachedSnapshotLoader(
+		loadSummarySnapshots(load, options.getStore, readConfig),
+		SUMMARY_SNAPSHOT_CACHE_TTL_MS,
+	);
+}
+
 function isCoordinatorRosterTooLargeError(error: unknown): boolean {
 	return error instanceof Error && error.message === "coordinator_response_too_large";
 }
@@ -439,7 +529,9 @@ async function loadConfiguredLegacyTeamGroupSnapshotsWith(
 	const hasUrl = Boolean(config.syncCoordinatorUrl);
 	const hasSecret = Boolean(config.syncCoordinatorAdminSecret);
 	if (!hasUrl && !hasSecret && config.syncCoordinatorGroups.length === 0) return [];
-	if (!hasUrl || !hasSecret) throw safeCoordinatorError();
+	// A configured coordinator without an admin secret is an ordinary member.
+	if (hasUrl && !hasSecret) throw new CoordinatorAdminConfigurationMissingError();
+	if (!hasUrl) throw safeCoordinatorError();
 
 	try {
 		const configuredCoordinatorId = buildBaseUrl(config.syncCoordinatorUrl);
@@ -555,9 +647,7 @@ async function loadConfiguredLegacyTeamGroupSnapshotsWith(
 		}
 		return validSnapshots;
 	} catch (error) {
-		if (error instanceof Error && error.message === "legacy_team_setup_roster_too_large") {
-			throw error;
-		}
+		if (isPassthroughSnapshotLoadError(error)) throw error;
 		throw safeCoordinatorError();
 	}
 }
@@ -1541,16 +1631,13 @@ export function teamSetupRoutes(options: TeamSetupRoutesOptions): Hono {
 				candidateRef || deadlineMs != null ? { candidateRef, deadlineMs } : undefined,
 			);
 		} catch (error) {
-			if (error instanceof Error && error.message === "legacy_team_setup_roster_too_large") {
+			if (isPassthroughSnapshotLoadError(error)) {
 				throw error;
 			}
 			throw safeCoordinatorError();
 		}
 	}
-	const loadedSummarySnapshots = createCachedSnapshotLoader(
-		() => loadedSnapshots(),
-		SUMMARY_SNAPSHOT_CACHE_TTL_MS,
-	);
+	const loadedSummarySnapshots = createLoadedSummarySnapshotCache(loadedSnapshots, options);
 	options.registerSummaryInvalidator?.(() => loadedSummarySnapshots.invalidate());
 	const completionDependencies =
 		options.completionDependencies === undefined
