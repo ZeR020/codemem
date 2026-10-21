@@ -27,6 +27,7 @@ export const linkRevocationTables = [
 export type LinkRevocationFixture = RevocationFixture & { now: number };
 type Gate = (query: string, boundary: "read" | "captured" | "write") => Promise<void>;
 type Guarded = (f: LinkRevocationFixture, gate: Gate) => CoordinatorAuthLinkStore;
+const guardedDatabases = new WeakMap<CoordinatorAuthLinkStore, D1DatabaseLike>();
 export function linkRevocationHarness(
 	fixture: (use: (f: LinkRevocationFixture) => Promise<void>) => Promise<void>,
 ) {
@@ -87,12 +88,12 @@ async function authorize(f: LinkRevocationFixture) {
 	});
 	return i;
 }
-async function confirmed(f: LinkRevocationFixture, i: Inputs) {
+async function confirmed(f: LinkRevocationFixture, i: Inputs, profile?: { displayName: string }) {
 	expect(await f.store.createAuthLinkAttempt(i.start, i.cfg)).toMatchObject({ kind: "created" });
 	expect(await f.store.claimAuthLinkAttempt(i.browser, i.cfg)).toMatchObject({ kind: "applied" });
 	expect(
 		await f.store.recordAuthLinkOidcVerified(
-			{ ...i.browser, account: { issuer: i.cfg.issuer, subject: "subject-a" } },
+			{ ...i.browser, account: { issuer: i.cfg.issuer, subject: "subject-a" }, profile },
 			i.cfg,
 		),
 	).toMatchObject({ kind: "applied" });
@@ -142,9 +143,192 @@ const denial = { kind: "rejected", error: "controller_not_active" };
 
 export function registerAuthLinkRevocationContract(test: Test) {
 	registerOrdinary(test);
+	registerBrowserCancelCleanup(test);
+	registerBrowserCancelSignerGuards(test);
+	registerBrowserCancelConfigGuards(test);
+	registerBrowserCancelStateGuards(test);
 	registerRevocations(test);
 	registerProofs(test);
 	registerHistory(test);
+}
+async function browserCancelled(f: LinkRevocationFixture) {
+	const i = await authorize(f);
+	await confirmed(f, i);
+	expect(
+		await f.store.failAuthLinkAttempt(
+			{
+				attemptId: i.start.attemptId,
+				requester: { kind: "browser", browserTransactionHash: i.browser.browserTransactionHash },
+				reason: "cancelled",
+			},
+			i.cfg,
+		),
+	).toMatchObject({ kind: "applied", status: { state: "failed" } });
+	return i;
+}
+function cancelInput(i: Inputs) {
+	return {
+		attemptId: i.start.attemptId,
+		requester: { kind: "device" as const, signer: i.start.signer },
+		reason: "cancelled" as const,
+	};
+}
+function registerBrowserCancelCleanup(test: Test) {
+	test.for([NOW, NOW + TTL - 1])(
+		"own browser-cancel cleanup retries preserve row and authority at time %s",
+		async (now, { fixture: f }) => {
+			// Arrange: cleanup acknowledges failure; it must not rewrite browser evidence.
+			const i = await browserCancelled(f);
+			const before = await effects(f);
+			f.now = now;
+			// Act
+			const first = await f.store.failAuthLinkAttempt(cancelInput(i), i.cfg);
+			const retry = await f.store.failAuthLinkAttempt(cancelInput(i), i.cfg);
+			// Assert
+			const expected = {
+				kind: "existing",
+				status: { attemptId: i.start.attemptId, state: "failed", expiresAtMs: NOW + TTL },
+			};
+			expect(first).toEqual(expected);
+			expect(retry).toEqual(expected);
+			expect(await effects(f)).toEqual(before);
+			expect(await f.rows("coordinator_auth_link_attempts")).toMatchObject([
+				{
+					failure_reason: "browser_cancelled",
+					created_at_ms: NOW,
+					failed_at_ms: NOW,
+					link_id: null,
+				},
+			]);
+		},
+	);
+	test("own pending cancellation still applies once and retries without renewal", async ({
+		fixture: f,
+	}) => {
+		// Arrange
+		const i = await authorize(f);
+		expect(await f.store.createAuthLinkAttempt(i.start, i.cfg)).toMatchObject({ kind: "created" });
+		const authority = await Promise.all(
+			linkRevocationTables.slice(0, 2).map((table) => f.rows(table)),
+		);
+		// Act
+		const first = await f.store.failAuthLinkAttempt(cancelInput(i), i.cfg);
+		f.now += 100;
+		const retry = await f.store.failAuthLinkAttempt(cancelInput(i), i.cfg);
+		// Assert
+		const status = { attemptId: i.start.attemptId, state: "failed", expiresAtMs: NOW + TTL };
+		expect(first).toEqual({ kind: "applied", status });
+		expect(retry).toEqual({ kind: "existing", status });
+		expect(await f.rows("coordinator_auth_link_attempts")).toMatchObject([
+			{ failure_reason: "device_cancelled", created_at_ms: NOW, failed_at_ms: NOW, link_id: null },
+		]);
+		expect(
+			await Promise.all(linkRevocationTables.slice(0, 2).map((table) => f.rows(table))),
+		).toEqual(authority);
+	});
+}
+function registerBrowserCancelSignerGuards(test: Test) {
+	test.for(["groupId", "deviceId", "publicKey", "fingerprint"] as const)(
+		"browser-cancel cleanup rejects foreign signer %s without revealing status",
+		async (field, { fixture: f }) => {
+			// Arrange
+			const i = await browserCancelled(f);
+			const input = cancelInput(i);
+			input.requester.signer = {
+				...input.requester.signer,
+				[field]: field === "fingerprint" ? "f".repeat(64) : "foreign",
+			};
+			const before = await effects(f);
+			// Act
+			const result = await f.store.failAuthLinkAttempt(input, i.cfg);
+			const status = await f.store.getAuthLinkAttemptStatus(
+				i.start.attemptId,
+				input.requester,
+				i.cfg,
+			);
+			// Assert
+			expect(result).toEqual({ kind: "rejected", error: "attempt_unavailable" });
+			expect(status).toBeNull();
+			expect(await effects(f)).toEqual(before);
+		},
+	);
+}
+function registerBrowserCancelConfigGuards(test: Test) {
+	test.for([
+		{ coordinatorId: "other-coordinator" },
+		{ issuer: "https://other.example.test" },
+		{ revision: "f".repeat(64) },
+		{ enabled: false },
+	])("browser-cancel cleanup rejects changed trusted config %#", async (change, { fixture: f }) => {
+		// Arrange
+		const i = await browserCancelled(f);
+		const before = await effects(f);
+		// Act
+		const result = await f.store.failAuthLinkAttempt(cancelInput(i), { ...i.cfg, ...change });
+		// Assert
+		expect(result).toEqual({
+			kind: "rejected",
+			error: "coordinatorId" in change ? "attempt_unavailable" : "auth_config_changed",
+		});
+		expect(await effects(f)).toEqual(before);
+	});
+}
+function registerBrowserCancelStateGuards(test: Test) {
+	test.for(["provider_failure", "config_failure"])(
+		"browser-cancel cleanup rejects other retained failure %s",
+		async (reason, { fixture: f }) => {
+			// Arrange
+			const i = await browserCancelled(f);
+			await f.exec(
+				"UPDATE coordinator_auth_link_attempts SET failure_reason = ? WHERE attempt_id = ?",
+				reason,
+				i.start.attemptId,
+			);
+			const before = await effects(f);
+			// Act
+			const result = await f.store.failAuthLinkAttempt(cancelInput(i), i.cfg);
+			// Assert
+			expect(result).toEqual({ kind: "rejected", error: "attempt_unavailable" });
+			expect(await effects(f)).toEqual(before);
+		},
+	);
+	test.for([NOW - 1, NOW + TTL, NOW + TTL + 1])(
+		"browser-cancel cleanup rejects time %s",
+		async (now, { fixture: f }) => {
+			// Arrange: retain the schema-enforced birth/deadline pair and vary the trusted clock.
+			const i = await browserCancelled(f);
+			f.now = now;
+			const before = await effects(f);
+			// Act
+			const result = await f.store.failAuthLinkAttempt(cancelInput(i), i.cfg);
+			// Assert
+			expect(result).toEqual({ kind: "rejected", error: "attempt_unavailable" });
+			expect(await effects(f)).toEqual(before);
+		},
+	);
+	test.for(["finalized", "session_redeemed"])(
+		"browser-cancel cleanup rejects completed link-bearing %s",
+		async (state, { fixture: f }) => {
+			// Arrange: create a genuine finalized link, not an impossible failed/link-bearing row.
+			const i = await authorize(f);
+			await confirmed(f, i);
+			expect(await f.store.finalizeAuthLinkAttempt(i.final, i.cfg)).toMatchObject({
+				kind: "applied",
+			});
+			if (state === "session_redeemed")
+				await f.exec(
+					"UPDATE coordinator_auth_link_attempts SET state = ? WHERE attempt_id = ?",
+					state,
+					i.start.attemptId,
+				);
+			const before = await effects(f);
+			// Act
+			const result = await f.store.failAuthLinkAttempt(cancelInput(i), i.cfg);
+			// Assert
+			expect(result).toEqual({ kind: "rejected", error: "attempt_unavailable" });
+			expect(await effects(f)).toEqual(before);
+		},
+	);
 }
 function registerOrdinary(test: Test) {
 	for (const identity of [null, "identity-a"]) {
@@ -335,7 +519,7 @@ export function authLinkGuardedD1(db: D1DatabaseLike, gate: Gate, clock: () => n
 		originals.set(wrapped, { statement, query });
 		return wrapped;
 	};
-	return new D1CoordinatorStore(
+	const store = new D1CoordinatorStore(
 		{
 			prepare: (query) => wrap(db.prepare(query), query),
 			batch: async (statements) => {
@@ -351,6 +535,8 @@ export function authLinkGuardedD1(db: D1DatabaseLike, gate: Gate, clock: () => n
 		},
 		{ authClock: clock },
 	);
+	guardedDatabases.set(store, db);
+	return store;
 }
 export function registerAuthLinkAtomicGuards(test: Test, guarded: Guarded) {
 	for (const stage of ["insert", "retry", "consume"] as const) {
@@ -380,6 +566,251 @@ export function registerAuthLinkAtomicGuards(test: Test, guarded: Guarded) {
 	registerCapture(test, guarded);
 	registerRollback(test);
 	registerUnknownReceipt(test, guarded);
+	registerBrowserCancelRace(test, guarded);
+	registerBrowserCancelProfileRetry(test, guarded);
+	registerBrowserCancelPromotedProfile(test, guarded);
+}
+function registerBrowserCancelPromotedProfile(test: Test, guarded: Guarded) {
+	test("own cancellation retry never deletes promoted metadata even at the exact profile key", async ({
+		fixture: f,
+	}) => {
+		// Arrange: promoted display metadata alone cannot confer account authority.
+		const { i, store, profiles, sentinels } = await profileDeleteFaultFixture(f, guarded, 0);
+		const db = guardedDatabases.get(store);
+		if (!db) throw new Error("Missing guarded fixture database");
+		await db
+			.prepare(
+				"UPDATE coordinator_auth_link_profiles SET link_id = ? WHERE coordinator_id = ? AND attempt_id = ?",
+			)
+			.bind("promoted-target", i.cfg.coordinatorId, i.start.attemptId)
+			.run();
+		const before = await profiles();
+		try {
+			// Act
+			await expect(
+				store.failAuthLinkAttempt(
+					{
+						attemptId: i.start.attemptId,
+						requester: {
+							kind: "browser",
+							browserTransactionHash: i.browser.browserTransactionHash,
+						},
+						reason: "cancelled",
+					},
+					i.cfg,
+				),
+			).rejects.toThrow("auth_link_persistence_error");
+			const result = await store.failAuthLinkAttempt(cancelInput(i), i.cfg);
+			// Assert
+			expect(result).toEqual({
+				kind: "existing",
+				status: { attemptId: i.start.attemptId, state: "failed", expiresAtMs: NOW + TTL },
+			});
+			expect(await profiles()).toEqual(before);
+			expect(await sentinels.publicRows()).toEqual(sentinels.publicBefore);
+			expect(await f.rows("coordinator_auth_account_links")).toEqual([]);
+		} finally {
+			await sentinels.cleanup();
+		}
+	});
+}
+function registerBrowserCancelProfileRetry(test: Test, guarded: Guarded) {
+	test.for([0, 1])(
+		"browser-cancel profile deletion recovers after browser fault and %s signed retry faults",
+		async (retryFaults, { fixture: f }) => {
+			// Arrange: stage metadata through the genuine verified OIDC transition.
+			const setup = await profileDeleteFaultFixture(f, guarded, retryFaults);
+			const { i, store, profiles, staged, sentinels } = setup;
+			const before = await effects(f);
+			try {
+				// Act: the state write wins before the separate profile delete throws.
+				await expect(
+					store.failAuthLinkAttempt(
+						{
+							attemptId: i.start.attemptId,
+							requester: {
+								kind: "browser",
+								browserTransactionHash: i.browser.browserTransactionHash,
+							},
+							reason: "cancelled",
+						},
+						i.cfg,
+					),
+				).rejects.toThrow("auth_link_persistence_error");
+				const failed = await effects(f);
+				expect(await profiles()).toEqual(staged);
+				if (retryFaults)
+					await expect(store.failAuthLinkAttempt(cancelInput(i), i.cfg)).rejects.toThrow(
+						"auth_link_persistence_error",
+					);
+				const result = await store.failAuthLinkAttempt(cancelInput(i), i.cfg);
+				// Assert: acknowledgement requires successful deletion, without rewriting failure.
+				expect(result).toEqual({
+					kind: "existing",
+					status: { attemptId: i.start.attemptId, state: "failed", expiresAtMs: NOW + TTL },
+				});
+				expect(setup.deletes()).toBe(2 + retryFaults);
+				expect(await profiles()).toEqual(
+					staged?.filter(
+						(row) =>
+							row.coordinator_id !== i.cfg.coordinatorId || row.attempt_id !== i.start.attemptId,
+					),
+				);
+				expect(await sentinels.publicRows()).toEqual(sentinels.publicBefore);
+				expect(await effects(f)).toEqual(failed);
+				expect(failed.slice(0, 2)).toEqual(before.slice(0, 2));
+				expect(await f.rows("coordinator_auth_link_attempts")).toMatchObject([
+					{
+						state: "failed",
+						failure_reason: "browser_cancelled",
+						created_at_ms: NOW,
+						failed_at_ms: NOW,
+						link_id: null,
+					},
+				]);
+			} finally {
+				await sentinels.cleanup();
+			}
+		},
+	);
+}
+async function profileDeleteFaultFixture(
+	f: LinkRevocationFixture,
+	guarded: Guarded,
+	retryFaults: number,
+) {
+	const i = await authorize(f);
+	await confirmed(f, i, { displayName: "Private staged person" });
+	let faults = 1 + retryFaults;
+	let deletes = 0;
+	const store = guarded(f, async (query, boundary) => {
+		if (boundary !== "write" || !query.startsWith("DELETE FROM coordinator_auth_link_profiles"))
+			return;
+		deletes++;
+		if (faults-- > 0) throw new Error("injected profile delete failure");
+	});
+	const db = guardedDatabases.get(store);
+	if (!db) throw new Error("Missing guarded fixture database");
+	const sentinels = await profileRetrySentinels(db, i);
+	const profiles = async () =>
+		(
+			await db
+				.prepare("SELECT * FROM coordinator_auth_link_profiles ORDER BY coordinator_id,attempt_id")
+				.all<Record<string, unknown>>()
+		).results;
+	const staged = await profiles();
+	expect(staged).toContainEqual(
+		expect.objectContaining({
+			coordinator_id: i.cfg.coordinatorId,
+			attempt_id: i.start.attemptId,
+			link_id: null,
+			display_name: "Private staged person",
+		}),
+	);
+	return { i, store, profiles, staged, sentinels, deletes: () => deletes };
+}
+async function profileRetrySentinels(db: D1DatabaseLike, i: Inputs) {
+	const otherCoordinator = `${i.cfg.coordinatorId}-profile-other`;
+	for (const [coordinator, attemptId, linkId] of [
+		[i.cfg.coordinatorId, `${i.start.attemptId}-other`, null],
+		[otherCoordinator, i.start.attemptId, null],
+		[i.cfg.coordinatorId, `${i.start.attemptId}-promoted`, "retained-published-link"],
+	]) {
+		await db
+			.prepare(
+				`INSERT INTO coordinator_auth_link_profiles (coordinator_id,attempt_id,issuer,subject,auth_config_revision,browser_transaction_hash,link_id,display_name,verified_at_ms) VALUES (?,?,?,?,?,?,?,?,?)`,
+			)
+			.bind(
+				coordinator,
+				attemptId,
+				i.cfg.issuer,
+				"retained-subject",
+				i.cfg.revision,
+				"e".repeat(64),
+				linkId,
+				"Retained metadata",
+				NOW,
+			)
+			.run();
+	}
+	const publicRows = await profileRetryPublicSentinel(db, i);
+	return {
+		publicRows,
+		publicBefore: await publicRows(),
+		cleanup: async () => {
+			await db
+				.prepare("DELETE FROM coordinator_auth_link_profiles WHERE coordinator_id IN (?,?)")
+				.bind(i.cfg.coordinatorId, otherCoordinator)
+				.run();
+			await db
+				.prepare("DELETE FROM coordinator_auth_account_profiles WHERE coordinator_id = ?")
+				.bind(i.cfg.coordinatorId)
+				.run();
+		},
+	};
+}
+async function profileRetryPublicSentinel(db: D1DatabaseLike, i: Inputs) {
+	await db
+		.prepare(
+			"INSERT INTO coordinator_auth_account_profiles (coordinator_id,link_id,display_name,source_session_id,source_signed_in_at_ms) VALUES (?,?,?,?,?)",
+		)
+		.bind(
+			i.cfg.coordinatorId,
+			"retained-published-link",
+			"Public retained person",
+			"retained-session",
+			NOW,
+		)
+		.run();
+	return async () =>
+		(
+			await db
+				.prepare("SELECT * FROM coordinator_auth_account_profiles ORDER BY coordinator_id,link_id")
+				.all()
+		).results;
+}
+function registerBrowserCancelRace(test: Test, guarded: Guarded) {
+	test.for(["unchanged", "failure_reason", "auth_config_revision", "fingerprint"])(
+		"browser-cancel cleanup rereads %s after an asynchronous persistence boundary",
+		async (field, { fixture: f }) => {
+			// Arrange: use the same awaited D1 seam on SQLite-backed and native D1.
+			const i = await browserCancelled(f);
+			let injected = false;
+			let before = await effects(f);
+			const racing = guarded(f, async (query, boundary) => {
+				if (
+					injected ||
+					boundary !== "write" ||
+					!query.startsWith("UPDATE coordinator_auth_link_attempts SET state = 'failed'")
+				)
+					return;
+				injected = true;
+				await Promise.resolve();
+				if (field !== "unchanged")
+					await f.exec(
+						`UPDATE coordinator_auth_link_attempts SET ${field} = ? WHERE attempt_id = ?`,
+						field === "failure_reason" ? "provider_failure" : "e".repeat(64),
+						i.start.attemptId,
+					);
+				before = await effects(f);
+			});
+			// Act
+			const result = await racing.failAuthLinkAttempt(cancelInput(i), i.cfg);
+			// Assert
+			expect(injected).toBe(true);
+			if (field === "unchanged")
+				expect(result).toEqual({
+					kind: "existing",
+					status: { attemptId: i.start.attemptId, state: "failed", expiresAtMs: NOW + TTL },
+				});
+			else
+				expect(result).toEqual({
+					kind: "rejected",
+					error: field === "auth_config_revision" ? "auth_config_changed" : "attempt_unavailable",
+				});
+			expect(await effects(f)).toEqual(before);
+		},
+	);
 }
 function registerUnknownReceipt(test: Test, guarded: Guarded) {
 	test("receipt read failure reports fixed uncertainty, not a false rollback claim", async ({

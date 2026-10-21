@@ -1074,6 +1074,22 @@ export class AuthLinkOperations implements CoordinatorAuthLinkStore {
 		if (!row || !configMatches(row, c) || !requesterMatches(row, r)) return null;
 		return status(row, now);
 	}
+	private async acknowledgeFailedAttempt(
+		row: Attempt,
+		c: CoordinatorAuthLinkConfig,
+		now: number,
+		kind: "applied" | "existing",
+	): Promise<CoordinatorAuthLinkResult> {
+		const cleanup = await this.execute(
+			{
+				sql: "DELETE FROM coordinator_auth_link_profiles WHERE coordinator_id = ? AND attempt_id = ? AND link_id IS NULL",
+				values: [c.coordinatorId, row.attempt_id],
+			},
+			"attempt_conflict",
+		);
+		if (typeof cleanup !== "number") return cleanup;
+		return { kind, status: status(row, now) };
+	}
 	async failAuthLinkAttempt(
 		input: CoordinatorAuthLinkFailInput,
 		config: CoordinatorAuthLinkConfig,
@@ -1104,22 +1120,28 @@ export class AuthLinkOperations implements CoordinatorAuthLinkStore {
 		if (typeof result !== "number") return result;
 		const row = await this.read(i.attemptId, c, { authority: "either" });
 		if (row && !requesterMatches(row, r)) return rejected("attempt_unavailable");
+		// A signed own-attempt cancel can acknowledge browser cancellation without
+		// rewriting its reason or creating any account authority.
+		if (
+			row &&
+			configMatches(row, c) &&
+			r.kind === "device" &&
+			i.reason === "cancelled" &&
+			row.state === "failed" &&
+			row.failure_reason === "browser_cancelled" &&
+			row.link_id === null &&
+			row.created_at_ms <= now &&
+			now < row.expires_at_ms
+		)
+			return this.acknowledgeFailedAttempt(row, c, now, "existing");
 		if (
 			row &&
 			configMatches(row, c) &&
 			requesterMatches(row, r) &&
 			row.state === "failed" &&
 			row.failure_reason === reason
-		) {
-			await this.execute(
-				{
-					sql: "DELETE FROM coordinator_auth_link_profiles WHERE coordinator_id = ? AND attempt_id = ? AND link_id IS NULL",
-					values: [c.coordinatorId, i.attemptId],
-				},
-				"attempt_conflict",
-			);
-			return { kind: result ? "applied" : "existing", status: status(row, now) };
-		}
+		)
+			return this.acknowledgeFailedAttempt(row, c, now, result ? "applied" : "existing");
 		return diagnose(row, c, now);
 	}
 	async finalizeAuthLinkAttempt(
