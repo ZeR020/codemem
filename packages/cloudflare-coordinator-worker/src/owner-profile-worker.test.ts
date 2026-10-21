@@ -805,6 +805,7 @@ async function verifyAccountReceiptReopensOffline({
 	expect(fakeProvider.requests.some(({ url }) => url.endsWith("/jwks"))).toBe(true);
 }
 
+// This real D1/OIDC correctness journey is not a five-second performance requirement.
 it.each([false, true])(
 	"links reviewed A then account-enrolls B without changing keys or grants (lost reply: %s)",
 	async (lostReply) => {
@@ -822,6 +823,7 @@ it.each([false, true])(
 		verifyAccountProfilePreserved({ ...adopted, ...profile, ...owner });
 		await verifyAccountReceiptReopensOffline(adopted);
 	},
+	15_000,
 );
 
 it("browser cancellation of A creates no authority and runtime confirms the stopped link", async () => {
