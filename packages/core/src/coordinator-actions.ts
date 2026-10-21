@@ -4,6 +4,8 @@ import {
 	DEFAULT_COORDINATOR_DB_PATH,
 } from "./better-sqlite-coordinator-store.js";
 import { normalizeCoordinatorAccountLinkOrigin } from "./coordinator-account-link-receiver.js";
+import { isAuthControllerId } from "./coordinator-auth-controller.js";
+import { capture, isHash } from "./coordinator-auth-link-input.js";
 import {
 	type CoordinatorIdentityGroupGrantActionResult,
 	isCoordinatorControllerAttestationReference,
@@ -389,6 +391,112 @@ export async function coordinatorAuthControllerReviewAction(
 	);
 	if (!payload) throw new Error("controller_review_response_invalid");
 	return payload;
+}
+
+function parseQualificationActionResponse(
+	payload: Record<string, unknown> | null,
+	request: { attestationId: string; confirmEvidenceDigest?: string },
+): Record<string, unknown> {
+	const common = ["state", "attestation_id", "coordinator_id", "evidence_digest"];
+	const fields =
+		request.confirmEvidenceDigest === undefined
+			? [
+					...common,
+					"fingerprint",
+					"review_receipt_id",
+					"link_id",
+					"claim_id",
+					"identity_id",
+					"group_id",
+					"device_id",
+				]
+			: [...common, "qualification_id"];
+	const response = capture(payload, fields);
+	if (!response || !payload || Object.hasOwn(payload, "error"))
+		throw new Error("qualification_response_invalid");
+	if (
+		response.attestation_id !== request.attestationId ||
+		!isAuthControllerId(response.coordinator_id) ||
+		!isHash(response.evidence_digest)
+	)
+		throw new Error("qualification_response_invalid");
+	if (request.confirmEvidenceDigest === undefined) {
+		if (
+			response.state !== "ready" ||
+			!isHash(response.fingerprint) ||
+			!["review_receipt_id", "link_id", "claim_id", "identity_id", "group_id", "device_id"].every(
+				(field) => isAuthControllerId(response[field]),
+			)
+		)
+			throw new Error("qualification_response_invalid");
+		return response;
+	}
+	if (
+		(response.state !== "created" && response.state !== "existing") ||
+		!isAuthControllerId(response.qualification_id) ||
+		response.evidence_digest !== request.confirmEvidenceDigest
+	)
+		throw new Error("qualification_response_invalid");
+	return response;
+}
+
+/** Network preview unless an explicitly reviewed digest is supplied. Never retries. */
+export async function coordinatorQualifyOwnerAction(opts: {
+	remoteUrl: string;
+	adminSecret: string;
+	attestationId: string;
+	confirmEvidenceDigest?: string;
+	timeoutS?: number;
+}): Promise<Record<string, unknown>> {
+	const origin = normalizeCoordinatorAccountLinkOrigin(opts.remoteUrl);
+	if (!origin || !isCoordinatorControllerAttestationReference(opts.attestationId))
+		throw new Error("qualification_invalid_input");
+	if (
+		opts.confirmEvidenceDigest !== undefined &&
+		!/^[a-f0-9]{64}$/u.test(opts.confirmEvidenceDigest)
+	)
+		throw new Error("qualification_invalid_input");
+	if (!opts.adminSecret) throw new Error("qualification_admin_required");
+	const body: Record<string, unknown> = { attestation_id: opts.attestationId };
+	if (opts.confirmEvidenceDigest !== undefined)
+		body.confirm_evidence_digest = opts.confirmEvidenceDigest;
+	try {
+		const result = await remoteRequest(
+			"POST",
+			`${origin}/v1/admin/owner-qualifications`,
+			opts.adminSecret,
+			body,
+			null,
+			opts.timeoutS ?? 3,
+			16384,
+		);
+		return parseQualificationActionResponse(result, {
+			attestationId: body.attestation_id as string,
+			confirmEvidenceDigest: body.confirm_evidence_digest as string | undefined,
+		});
+	} catch (error) {
+		const fallback =
+			body.confirm_evidence_digest === undefined
+				? "qualification_unavailable"
+				: "qualification_outcome_unknown";
+		if (!(error instanceof RemoteCoordinatorRequestError)) throw new Error(fallback);
+		const code = [
+			"invalid_input",
+			"unavailable",
+			"preview_changed",
+			"qualification_conflict",
+			"qualification_invalid_input",
+			"qualification_unavailable",
+			"qualification_outcome_unknown",
+			"unauthorized",
+			"rate_limited",
+			"body_too_large",
+		].includes(error.code)
+			? error.code
+			: fallback;
+		// Fixed diagnostics only: no remote body, credential, transport message or cause.
+		throw new RemoteCoordinatorRequestError(error.status, code);
+	}
 }
 
 function inviteUrlWarnings(rawUrl: string | null | undefined): string[] {
