@@ -28,14 +28,18 @@ import {
 	tryResolveEmbeddingRevision,
 	tryResolveEmbeddingVectorIdentityLabel,
 } from "./embeddings.js";
-import { buildFilterBranchesWithContext, type OwnershipFilterContext } from "./filters.js";
+import type { OwnershipFilterContext } from "./filters.js";
 import {
 	completeMaintenanceJob,
 	getMaintenanceJob,
 	startMaintenanceJob,
 } from "./maintenance-jobs.js";
 import { projectColumnClause } from "./project.js";
-import { summaryContinuityFilter } from "./summary-memory.js";
+import {
+	buildAuthorizedSemanticMemoryIdsQuery,
+	resolveSemanticSearchModelFromCatalog,
+	semanticResult,
+} from "./semantic-query.js";
 import type { ReplicationVectorWork } from "./sync-replication.js";
 import type { MemoryFilters } from "./types.js";
 import {
@@ -109,25 +113,6 @@ function deleteBackfillCandidateSnapshot(db: Database, tableName: string): void 
 // disable the local read boundary — scopeVisibleFilterContext() always forces
 // it on below. Field list otherwise mirrors OwnershipFilterContext.
 export type SemanticSearchScopeContext = Omit<OwnershipFilterContext, "enforceScopeVisibility">;
-
-function scopeVisibleFilterContext(context: SemanticSearchScopeContext): OwnershipFilterContext {
-	return {
-		actorId: context?.actorId ?? "",
-		deviceId: context?.deviceId ?? "",
-		claimedDeviceIds: context?.claimedDeviceIds ?? [],
-		legacyActorIds: context?.legacyActorIds ?? [],
-		enforceScopeVisibility: true,
-		// Forward the pre-resolved visible scope set so the KNN candidate filter
-		// gets the index-eligible `scope_id IN (...)` fast path. Callers reach
-		// semanticSearch via ownershipFilterContext(store) (search.ts / store.ts),
-		// which already resolves this set. Forward DB/key context too so fallback
-		// resolution applies the same effective decisions, not raw managed rows.
-		visibleScopeIds: context?.visibleScopeIds,
-		scopeVisibilityDb: context?.scopeVisibilityDb,
-		expectedPublicKey: context?.expectedPublicKey,
-		loadExpectedPublicKey: context?.loadExpectedPublicKey,
-	};
-}
 
 function clampSemanticLimit(limit: number): number {
 	if (limit === Number.POSITIVE_INFINITY) return 200;
@@ -215,50 +200,6 @@ export function resolveSemanticSearchModel(db: Database, currentModel?: string):
 		getMaintenanceJob(db, VECTOR_MODEL_MIGRATION_JOB),
 		listVectorModels(db),
 	);
-}
-
-function resolveSemanticSearchModelFromCatalog(
-	currentModel: string,
-	job: ReturnType<typeof getMaintenanceJob>,
-	models: readonly (string | null)[],
-): string | null {
-	const metadata = job?.metadata ?? {};
-	const sourceModel = typeof metadata.source_model === "string" ? metadata.source_model : null;
-	const targetModel = typeof metadata.target_model === "string" ? metadata.target_model : null;
-	const reconciliationTargetCoverageComplete =
-		metadata.reconciliation_target_coverage_complete === true;
-	if (models.length === 0) return null;
-	const hasCurrentModel = models.includes(currentModel);
-	const hasCompatibleLegacyModel =
-		currentModel === DEFAULT_EMBEDDING_VECTOR_IDENTITY_LABEL &&
-		models.includes(LEGACY_DEFAULT_EMBEDDING_MODEL);
-	if (
-		(job?.status === "running" || job?.status === "pending") &&
-		reconciliationTargetCoverageComplete &&
-		targetModel === currentModel
-	) {
-		return hasCurrentModel ? currentModel : null;
-	}
-	if (
-		(job?.status === "running" || job?.status === "pending" || job?.status === "failed") &&
-		sourceModel &&
-		sourceModel !== currentModel
-	) {
-		const compatibleLegacyRebuild =
-			sourceModel === LEGACY_DEFAULT_EMBEDDING_MODEL &&
-			targetModel === DEFAULT_EMBEDDING_VECTOR_IDENTITY_LABEL &&
-			currentModel === DEFAULT_EMBEDDING_VECTOR_IDENTITY_LABEL;
-		if (!compatibleLegacyRebuild) return null;
-		if (models.includes(sourceModel)) return sourceModel;
-		if (hasCurrentModel) return currentModel;
-		return null;
-	}
-	if (job?.status === "completed" && targetModel === currentModel) {
-		return hasCurrentModel ? currentModel : null;
-	}
-	if (hasCompatibleLegacyModel) return LEGACY_DEFAULT_EMBEDDING_MODEL;
-	if (hasCurrentModel && models.every((model) => model === currentModel)) return currentModel;
-	return null;
 }
 
 /**
@@ -1825,45 +1766,7 @@ export interface SemanticSearchResult {
 	facts: string | null;
 }
 
-function semanticResult(row: Record<string, unknown>): SemanticSearchResult {
-	return {
-		id: Number(row.id),
-		kind: String(row.kind ?? "observation"),
-		title: String(row.title ?? ""),
-		body_text: String(row.body_text ?? ""),
-		confidence: Number(row.confidence ?? 0),
-		tags_text: String(row.tags_text ?? ""),
-		metadata_json: row.metadata_json == null ? null : String(row.metadata_json),
-		created_at: String(row.created_at ?? ""),
-		updated_at: String(row.updated_at ?? ""),
-		session_id: Number(row.session_id),
-		score: 1.0 / (1.0 + Number(row.distance ?? 0)),
-		distance: Number(row.distance ?? 0),
-		narrative: row.narrative == null ? null : String(row.narrative),
-		facts: row.facts == null ? null : String(row.facts),
-	};
-}
-
-function buildAuthorizedSemanticMemoryIdsQuery(
-	filters: MemoryFilters | null,
-	context: SemanticSearchScopeContext,
-	summarySessionId: number | null | undefined,
-): { sql: string; params: unknown[] } {
-	const branches = buildFilterBranchesWithContext(filters, scopeVisibleFilterContext(context));
-	const continuity = summaryContinuityFilter(summarySessionId);
-	const queries = branches.map((branch) => {
-		const join = branch.joinSessions
-			? "JOIN sessions ON sessions.id = memory_items.session_id"
-			: "";
-		const clauses = ["memory_items.active = 1", ...branch.clauses, ...continuity.clauses];
-		return `SELECT memory_items.id FROM memory_items ${join}
-			WHERE ${clauses.join(" AND ")}`;
-	});
-	return {
-		sql: queries.join(" UNION ALL "),
-		params: branches.flatMap((branch) => [...branch.params, ...continuity.params]),
-	};
-}
+export { semanticResult };
 
 /**
  * Search for memories by vector similarity using exact sqlite-vec distance.
@@ -1898,6 +1801,28 @@ export async function semanticSearch(
 	const firstEmbedding = embeddings[0];
 	if (!firstEmbedding) return [];
 	const queryEmbedding = serializeFloat32(firstEmbedding);
+	return rankSemanticEmbedding(
+		db,
+		queryEmbedding,
+		searchModels,
+		limit,
+		filters,
+		context,
+		summarySessionId,
+	);
+}
+
+/** Internal exact ranking stage shared with the opt-in read-only worker experiment. */
+export function rankSemanticEmbedding(
+	db: Database,
+	queryEmbedding: Buffer,
+	searchModels: string[],
+	limit: number,
+	filters: MemoryFilters | null,
+	context: SemanticSearchScopeContext,
+	summarySessionId?: number | null,
+): SemanticSearchResult[] {
+	if (searchModels.length === 0) return [];
 	const effectiveLimit = clampSemanticLimit(limit);
 	const authorizedIds = buildAuthorizedSemanticMemoryIdsQuery(filters, context, summarySessionId);
 	const modelPlaceholders = searchModels.map(() => "?").join(", ");
