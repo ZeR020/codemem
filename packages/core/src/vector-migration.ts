@@ -15,6 +15,7 @@ import {
 	updateMaintenanceJob,
 } from "./maintenance-jobs.js";
 import type { ReplicationVectorWork } from "./sync-replication.js";
+import { readVectorCorpusFence } from "./vector-corpus-epoch.js";
 import {
 	prepareVectorCutoverValidation,
 	type VectorCutoverValidation,
@@ -523,7 +524,6 @@ function checkCompletedStaleScan(
 			stale_scan_exhausted: true,
 			stale_scan_exhausted_max_rowid: scan.scannedMaxRowId,
 		};
-		updateMaintenanceJob(db, VECTOR_MODEL_MIGRATION_JOB, { metadata: persisted });
 		return { canReturn: true, metadata: persisted };
 	}
 	const exhaustedMaxRowId = metadata.stale_scan_exhausted_max_rowid;
@@ -543,7 +543,6 @@ function checkCompletedStaleScan(
 		!hasSourceModelVectorsAfter(db, targetModel, exhaustedMaxRowId)
 	) {
 		const refreshed = { ...metadata, stale_scan_exhausted_max_rowid: currentMaxRowId };
-		updateMaintenanceJob(db, VECTOR_MODEL_MIGRATION_JOB, { metadata: refreshed });
 		return { canReturn: true, metadata: refreshed };
 	}
 	const invalidated = {
@@ -551,7 +550,6 @@ function checkCompletedStaleScan(
 		stale_scan_exhausted: undefined,
 		stale_scan_exhausted_max_rowid: undefined,
 	};
-	updateMaintenanceJob(db, VECTOR_MODEL_MIGRATION_JOB, { metadata: invalidated });
 	return { canReturn: false, metadata: invalidated };
 }
 
@@ -1256,8 +1254,7 @@ function acceptCompletedCleanupValidation(
 ): boolean {
 	return db
 		.transaction(() => {
-			const latestJob = getMaintenanceJob(db, VECTOR_MODEL_MIGRATION_JOB);
-			if (JSON.stringify(latestJob) !== JSON.stringify(options.originalJob)) return false;
+			if (!isCurrentCleanupJob(db, options.targetModel, { job: options.originalJob })) return false;
 			const reason = options.validation.retryReason();
 			if (reason || options.shouldStop?.()) {
 				deferCompletedCleanup(
@@ -1282,10 +1279,46 @@ function acceptCompletedCleanupValidation(
 		.immediate();
 }
 
+function readCompletedScanFence(db: SqliteDatabase): string {
+	return JSON.stringify({
+		...readVectorCorpusFence(db),
+		dataVersion: Number(db.pragma("data_version", { simple: true })),
+		totalChanges: Number(db.prepare("SELECT total_changes()").pluck().get()),
+	});
+}
+
+function prepareCompletedCleanupOwner(
+	db: SqliteDatabase,
+	targetModel: string,
+	expectedJob: MigrationJob,
+) {
+	if (!isCurrentCleanupJob(db, targetModel, { job: expectedJob })) return null;
+	const metadata = (expectedJob?.metadata ?? {}) as MigrationMetadata;
+	const before = readCompletedScanFence(db);
+	// Compatibility scans may walk the entire index; do not reserve the writer here.
+	const staleScan = checkCompletedStaleScan(db, targetModel, metadata);
+	return db
+		.transaction(() => {
+			if (!isCurrentCleanupJob(db, targetModel, { job: expectedJob })) return null;
+			if (readCompletedScanFence(db) !== before) return null;
+			if (staleScan.metadata !== metadata) {
+				updateMaintenanceJob(db, VECTOR_MODEL_MIGRATION_JOB, { metadata: staleScan.metadata });
+			}
+			if (staleScan.canReturn) return null;
+			// Keep the checked owner, including any watermark invalidation, across validation.
+			return {
+				metadata: staleScan.metadata,
+				job: getMaintenanceJob(db, VECTOR_MODEL_MIGRATION_JOB),
+			};
+		})
+		.immediate();
+}
+
 async function finishCompletedCleanupPass(
 	db: SqliteDatabase,
 	targetModel: string,
 	metadata: MigrationMetadata,
+	originalJob: MigrationJob,
 	signal?: AbortSignal,
 	shouldStop?: () => boolean,
 ): Promise<CompletedCleanupPassResult> {
@@ -1298,7 +1331,6 @@ async function finishCompletedCleanupPass(
 	if (signal?.aborted) return stop;
 
 	const previouslyRemoved = Number(metadata.removed_stale_rows ?? 0);
-	const originalJob = getMaintenanceJob(db, VECTOR_MODEL_MIGRATION_JOB);
 	const validation = prepareVectorCutoverValidation(db, targetModel, { signal, phase: "cleanup-" });
 	const prunedTargetRows = validation.deleted;
 	let accepted: boolean;
@@ -1418,19 +1450,19 @@ export async function runVectorMigrationPass(
 		metadataMemoryIds(existingMetadata.pending_delete_memory_ids).length;
 	let restartCompletedMigration = false;
 	let reconciliationTargetCoverageComplete = false;
-	let completedMetadata = existingMetadata;
+	const completedMetadata = existingMetadata;
 	if (
 		existingJob?.status === "completed" &&
 		completedMetadata.target_model === targetModel &&
 		queuedSyncWorkCount === 0
 	) {
-		const staleScan = checkCompletedStaleScan(db, targetModel, completedMetadata);
-		if (staleScan.canReturn) return;
-		completedMetadata = staleScan.metadata;
+		const cleanupOwner = prepareCompletedCleanupOwner(db, targetModel, existingJob);
+		if (!cleanupOwner) return;
 		const cleanupResult = await finishCompletedCleanupPass(
 			db,
 			targetModel,
-			completedMetadata,
+			cleanupOwner.metadata,
+			cleanupOwner.job,
 			options.signal,
 			options.shouldStop,
 		);
