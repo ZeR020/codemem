@@ -252,6 +252,13 @@ export const claudeHookFileContextCommand = claudeHookFileContextCmd.action(
 		}
 		const trimmed = raw.trim();
 		if (!trimmed) {
+			if (opts.transport) {
+				process.stdout.write(
+					`${JSON.stringify({ error: "parse_error", message: "transport request required" })}\n`,
+				);
+				process.exitCode = 1;
+				return;
+			}
 			emitJson(continueResult());
 			return;
 		}
