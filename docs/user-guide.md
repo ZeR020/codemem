@@ -24,6 +24,34 @@ The local command changes only the selected existing database; the export applie
 nothing. Run the exported statements in one atomic D1 binding batch only after the
 separate approval; follow the [deployment guide](cloudflare-coordinator-deployment.md#optional-account-management-extension) for that apply and deployment.
 
+Owner-resolution receipt storage is a separate, explicit extension that requires
+the current account-management schema first. After pausing auth writers, draining
+pending attempts, making a backup and obtaining separate approval, an operator can
+install it on an existing regular SQLite file:
+
+```fish
+codemem coordinator upgrade-account-schema --owner-resolution --db-path 'coordinator.sqlite'
+codemem coordinator upgrade-account-schema --owner-resolution --export-sql --json
+```
+
+This mode installs empty, immutable receipt storage only: it does not resolve an
+owner, change access or provide a recovery UI. It rejects partial or unknown receipt
+schemas instead of repairing them. The command does not pause writers, drain attempts
+or make a backup; `--export-sql` opens no database and applies nothing, even when
+`CODEMEM_DB` is set. Export cannot be combined with a database path, and
+`--owner-resolution` cannot be combined with `--device-unlink`.
+
+For local apply, use a trusted maintenance account that owns the regular database
+file and its containing folder. Group/world-writable files or folders, unsafe parent
+locations and detected path or identity changes are rejected; inspect the file and
+parent ownership/permissions before retrying. The command does not change permissions.
+Keep all writers stopped and protect the database, SQLite companion files and parent
+paths from changes throughout maintenance. Canonical-path and identity rechecks detect
+observed replacements but do not prove which file descriptor SQLite opened or prevent
+a hostile same-account swap-and-restore race, including in WAL mode. ACL and platform
+limits require separate operator inspection; see the
+[local maintenance requirements](cloudflare-coordinator-deployment.md#optional-owner-resolution-receipt-storage).
+
 ## Explore the viewer
 
 The Feed shows captured memories in the same order used when packing context: the full title, narrative, then every fact. Cards open by default; use **Collapse memory** or **Expand memory** to hide or reveal content and supplemental provenance, and use search to narrow the list.
