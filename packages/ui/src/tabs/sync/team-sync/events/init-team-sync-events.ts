@@ -4,6 +4,10 @@
  * populated on first render. Kept separate from the render pipeline so
  * the render path can stay pure with respect to DOM listeners. */
 
+import {
+	mountOperationStatusHost,
+	startOperationStatus,
+} from "../../../../components/operation-status";
 import * as api from "../../../../lib/api";
 import { clearFieldError, friendlyError, markFieldError } from "../../../../lib/form";
 import { humanPresentationLabel } from "../../../../lib/identity-presentation";
@@ -87,6 +91,8 @@ function joinFeedback(result: JoinResult): SyncActionFeedback {
 export function initTeamSyncEvents(refreshCallback: () => void, loadSyncData: () => Promise<void>) {
 	renderAdminSetupDisclosure();
 	renderInvitePolicySelect();
+	const operationStatusRoot = document.getElementById("operationStatusRoot");
+	if (operationStatusRoot) mountOperationStatusHost(operationStatusRoot);
 
 	const syncNowButton = document.getElementById("syncNowButton") as HTMLButtonElement | null;
 	const syncShareProjectsButton = document.getElementById(
@@ -358,28 +364,82 @@ export function initTeamSyncEvents(refreshCallback: () => void, loadSyncData: ()
 		}
 	});
 
+	initManualSyncEvents(syncNowButton, refreshCallback);
+}
+
+function initManualSyncEvents(
+	syncNowButton: HTMLButtonElement | null,
+	refreshCallback: () => void,
+) {
+	let syncPending = false;
+	if (syncNowButton) {
+		syncNowButton.disabled =
+			state.viewerActorId === null || syncNowButton.getAttribute("aria-busy") === "true";
+	}
 	syncNowButton?.addEventListener("click", async () => {
-		if (!syncNowButton) return;
+		if (!syncNowButton || syncPending || syncNowButton.disabled) return;
+		const actorId = state.viewerActorId;
+		if (actorId === null) return;
+		syncPending = true;
 		syncNowButton.disabled = true;
+		syncNowButton.setAttribute("aria-busy", "true");
 		syncNowButton.textContent = "Syncing\u2026";
+		const operation = startOperationStatus("Syncing devices…", "You can keep browsing.");
+		const finish = (message: string, tone: "warning" | "success") => {
+			if (operation) operation.finish(message, tone);
+			else showGlobalNotice(message, tone);
+		};
+		let confirmed = false;
 		try {
 			const result = await api.triggerSync();
+			// Do not let the summary's empty-list fallback turn an invalid response into success.
+			if (!isSyncResult(result) || actorId !== state.viewerActorId) {
+				throw new Error("Unconfirmed sync result");
+			}
 			const summary = summarizeSyncRunResult(result);
-			showGlobalNotice(summary.message, summary.warning ? "warning" : undefined);
+			finish(summary.message, summary.warning ? "warning" : "success");
+			confirmed = true;
 		} catch (error) {
-			showGlobalNotice(
-				friendlyError(
-					error,
-					"Failed to start sync. Retry once, then run codemem sync doctor if the problem keeps coming back.",
-				),
-				"warning",
-			);
-			syncNowButton.textContent = "Retry";
-			syncNowButton.disabled = false;
-			return;
+			finish(manualSyncErrorMessage(error, actorId), "warning");
+		} finally {
+			syncPending = false;
+			syncNowButton.disabled = state.viewerActorId === null;
+			syncNowButton.removeAttribute("aria-busy");
+			syncNowButton.textContent = "Sync now";
 		}
-		syncNowButton.disabled = false;
-		syncNowButton.textContent = "Sync now";
-		refreshCallback();
+		// The app schedules the view refresh and owns its eventual error feedback.
+		if (confirmed) void refreshCallback();
 	});
+}
+
+function manualSyncErrorMessage(error: unknown, actorId: typeof state.viewerActorId): string {
+	if (
+		actorId === state.viewerActorId &&
+		error instanceof Error &&
+		error.message === "sync_disabled"
+	) {
+		return "Sync is disabled. Enable device sync in Settings before trying again.";
+	}
+	return "Couldn’t confirm whether sync finished. Check device sync status before retrying.";
+}
+
+function isSyncResult(result: unknown): result is api.SyncRunResponse {
+	if (!result || typeof result !== "object" || !("items" in result)) return false;
+	if (!Array.isArray(result.items)) return false;
+	return result.items.every(
+		(item) =>
+			item &&
+			typeof item === "object" &&
+			typeof item.peer_device_id === "string" &&
+			typeof item.ok === "boolean" &&
+			isSyncCount(item.opsIn) &&
+			isSyncCount(item.opsOut) &&
+			(item.opsSkipped === undefined || isSyncCount(item.opsSkipped)) &&
+			(item.error === undefined || typeof item.error === "string") &&
+			Array.isArray(item.addressErrors),
+	);
+}
+
+function isSyncCount(value: unknown): value is number {
+	return typeof value === "number" && Number.isFinite(value) && value >= 0;
 }
