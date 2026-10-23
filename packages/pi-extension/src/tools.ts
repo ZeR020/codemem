@@ -1279,6 +1279,7 @@ async function executeMemorySessionSearch(
 	return withToolError("memory_session_search", async () => {
 		const query = String(params.query ?? "");
 		if (!query.trim()) return errorResult("query required");
+		const project = projectOrClient(params, client);
 		return httpOrCli(
 			client,
 			signal,
@@ -1288,7 +1289,7 @@ async function executeMemorySessionSearch(
 						query,
 						limit: params.limit != null ? Number(params.limit) : undefined,
 						snippet_chars: params.snippet_chars != null ? Number(params.snippet_chars) : undefined,
-						project: optionalFilter(params.project),
+						project,
 						session_id: optionalFilter(params.session_id),
 					},
 					signal,
@@ -1297,7 +1298,9 @@ async function executeMemorySessionSearch(
 				return jsonResult(res.data);
 			},
 			async () => {
-				const { stdout } = await client.execCodemem(sessionSearchCliArgs(params), { signal });
+				const { stdout } = await client.execCodemem(sessionSearchCliArgs({ ...params, project }), {
+					signal,
+				});
 				return jsonResult(parseCliJson(stdout));
 			},
 		);
@@ -1342,7 +1345,9 @@ function registerMemorySessionSearch(
 				"`codemem pi-import-sessions`.",
 			parameters: Type.Object({
 				query: Type.String({ description: "Free-text search over stored pi session text" }),
-				project: Type.Optional(Type.String({ description: "Filter by project label" })),
+				project: Type.Optional(
+					Type.String({ description: "Project label (defaults to the current Pi project)" }),
+				),
 				session_id: Type.Optional(Type.String({ description: "Filter by pi session id" })),
 				limit: Type.Optional(
 					Type.Integer({ minimum: 1, maximum: 20, default: 10, description: "Max results" }),

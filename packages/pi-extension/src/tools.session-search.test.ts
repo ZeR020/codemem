@@ -122,7 +122,11 @@ describe("memory_session_search registration", () => {
 });
 
 describe("memory_session_search HTTP path", () => {
-	it("renders the route response and forwards query params", async () => {
+	it.each([
+		{ project: undefined, expectedProject: "current-project" },
+		{ project: "pi-search-proj", expectedProject: "pi-search-proj" },
+		{ project: "   ", expectedProject: "current-project" },
+	])("scopes HTTP project $project", async ({ project, expectedProject }) => {
 		const cwd = process.cwd();
 		const seenQuery: URL[] = [];
 		vi.stubGlobal(
@@ -144,6 +148,7 @@ describe("memory_session_search HTTP path", () => {
 		);
 		const client = new PiCodememClient(onlineConfig, createViewerRuntime(), {
 			cwd,
+			project: "current-project",
 			execImpl: async () => {
 				throw new Error("CLI should not run");
 			},
@@ -154,7 +159,7 @@ describe("memory_session_search HTTP path", () => {
 			"t1",
 			{
 				query: "lighthouse",
-				project: "pi-search-proj",
+				project,
 				session_id: "pi-sess-1",
 				limit: 3,
 				snippet_chars: 500,
@@ -166,7 +171,7 @@ describe("memory_session_search HTTP path", () => {
 		expect(seenQuery).toHaveLength(1);
 		const params = seenQuery[0].searchParams;
 		expect(params.get("query")).toBe("lighthouse");
-		expect(params.get("project")).toBe("pi-search-proj");
+		expect(params.get("project")).toBe(expectedProject);
 		expect(params.get("session_id")).toBe("pi-sess-1");
 		expect(params.get("limit")).toBe("3");
 		expect(params.get("snippet_chars")).toBe("500");
@@ -213,9 +218,17 @@ describe("memory_session_search HTTP path", () => {
 });
 
 describe("memory_session_search viewer-unreachable fallback", () => {
-	it.each(["lighthouse", "--help", "--json", "-lighthouse"])(
-		"falls back to CLI preserving query %s as text",
-		async (query) => {
+	it.each([
+		{ query: "lighthouse", project: undefined, expectedProject: "current-project" },
+		{ query: "lighthouse", project: "   ", expectedProject: "current-project" },
+		...["lighthouse", "--help", "--json", "-lighthouse"].map((query) => ({
+			query,
+			project: "pi-search-proj",
+			expectedProject: "pi-search-proj",
+		})),
+	])(
+		"falls back to CLI preserving query $query and project $expectedProject (project=$project)",
+		async ({ query, project, expectedProject }) => {
 			vi.stubGlobal(
 				"fetch",
 				vi.fn(async () => {
@@ -224,6 +237,7 @@ describe("memory_session_search viewer-unreachable fallback", () => {
 			);
 			const cliArgs: string[][] = [];
 			const client = new PiCodememClient(onlineConfig, createViewerRuntime(), {
+				project: "current-project",
 				execImpl: async (args) => {
 					cliArgs.push([...args]);
 					return { stdout: JSON.stringify(FIXTURE_RESPONSE), stderr: "" };
@@ -235,7 +249,7 @@ describe("memory_session_search viewer-unreachable fallback", () => {
 				"t1",
 				{
 					query,
-					project: "pi-search-proj",
+					project,
 					session_id: "pi-sess-1",
 					limit: 3,
 					snippet_chars: 500,
@@ -248,8 +262,9 @@ describe("memory_session_search viewer-unreachable fallback", () => {
 			expect(cliArgs[0][0]).toBe("pi-session-search");
 			expect(cliArgs[0]).toContain("--json");
 			expect(cliArgs[0].slice(-2)).toEqual(["--", query]);
-			expect(cliArgs[0]).toContain("--project");
-			expect(cliArgs[0]).toContain("pi-search-proj");
+			expect(
+				cliArgs[0].slice(cliArgs[0].indexOf("--project"), cliArgs[0].indexOf("--project") + 2),
+			).toEqual(["--project", expectedProject]);
 			expect(cliArgs[0]).toContain("--session-id");
 			expect(cliArgs[0]).toContain("pi-sess-1");
 			expect(cliArgs[0]).toContain("--limit");
