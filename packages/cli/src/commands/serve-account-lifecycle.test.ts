@@ -26,7 +26,8 @@ const mocks = vi.hoisted(() => {
 		createApp: vi.fn<(options: AppOptions) => { fetch: () => void }>(),
 		createSyncApp: vi.fn<(options: AppOptions) => { fetch: () => void }>(),
 		getStore: vi.fn(),
-		closeStore: vi.fn(),
+		closeStore: vi.fn<() => Promise<void>>(),
+		logError: vi.fn(),
 		initDatabase: vi.fn(),
 		readAtPath: vi.fn(),
 		readConfig: vi.fn(),
@@ -60,7 +61,7 @@ vi.mock("node:child_process", () => ({ spawn: mocks.spawn, spawnSync: mocks.spaw
 vi.mock("@clack/prompts", () => ({
 	intro: vi.fn(),
 	outro: vi.fn(),
-	log: { warn: vi.fn(), error: vi.fn(), info: vi.fn(), step: vi.fn(), success: vi.fn() },
+	log: { warn: vi.fn(), error: mocks.logError, info: vi.fn(), step: vi.fn(), success: vi.fn() },
 }));
 vi.mock("@codemem/core", async (original) => ({
 	...(await original<typeof import("@codemem/core")>()),
@@ -84,6 +85,7 @@ vi.mock("@codemem/core", async (original) => ({
 }));
 vi.mock("@codemem/server", () => ({
 	getStore: mocks.getStore,
+	closeStore: mocks.closeStore,
 	closeStoreAsync: mocks.closeStore,
 	createApp: mocks.createApp,
 	createSyncApp: mocks.createSyncApp,
@@ -99,10 +101,12 @@ vi.mock("@hono/node-server", () => ({ serve: mocks.serve }));
 
 function deferred() {
 	let resolve!: () => void;
-	const promise = new Promise<void>((yes) => {
+	let reject!: (error: unknown) => void;
+	const promise = new Promise<void>((yes, no) => {
 		resolve = yes;
+		reject = no;
 	});
-	return { promise, resolve };
+	return { promise, resolve, reject };
 }
 const HOME = "/fixture/account-lifecycle-home";
 const DB = join(HOME, "running.sqlite");
@@ -139,7 +143,7 @@ beforeEach(() => {
 		if (process.env.CODEMEM_DB !== DB) throw new Error("Unexpected default database access");
 		return mocks.store;
 	});
-	mocks.closeStore.mockImplementation(() => {
+	mocks.closeStore.mockImplementation(async () => {
 		mocks.calls.push("store");
 	});
 	mocks.initDatabase.mockImplementation((path) => {
@@ -170,6 +174,11 @@ beforeEach(() => {
 		return listener;
 	});
 	vi.mocked(existsSync).mockReturnValue(false);
+	vi.mocked(readFileSync)
+		.mockReset()
+		.mockImplementation(() => {
+			throw new Error("Unexpected file read");
+		});
 	const on = process.on.bind(process);
 	vi.spyOn(process, "on").mockImplementation((event, listener) => {
 		if (event === "SIGINT" || event === "SIGTERM") signals.set(event, listener as () => void);
@@ -307,7 +316,143 @@ describe("foreground account profile and listener wiring", () => {
 	);
 });
 
+describe("foreground viewer PID ownership cleanup", () => {
+	it("preserves an existing foreign viewer PID record after a bind failure", async () => {
+		// Arrange: this startup never reaches the callback that writes its own PID.
+		const pidPath = join(HOME, "viewer.pid");
+		vi.mocked(existsSync).mockImplementation((path) => String(path) === pidPath);
+		vi.mocked(readFileSync).mockReturnValue(
+			JSON.stringify({ pid: process.pid + 1, host: "127.0.0.1", port: 7441 }),
+		);
+		await startForegroundViewer(invocation());
+		const errorHandler = listeners[0]?.on.mock.calls.find(([event]) => event === "error")?.[1];
+		if (!errorHandler) throw new Error("Missing actual listener error callback");
+
+		// Act: deliver the listener failure without binding a real socket.
+		errorHandler(Object.assign(new Error("Address in use"), { code: "EADDRINUSE" }));
+		await exited.promise;
+
+		// Assert: failed startup cannot remove the running viewer's ownership record.
+		expect(writeFileSync).not.toHaveBeenCalled();
+		expect(rmSync).not.toHaveBeenCalledWith(pidPath);
+		expect(exits).toEqual([1]);
+	});
+	it.each(["own", "replaced"] as const)(
+		"removes only its own viewer PID record during graceful shutdown (%s record)",
+		async (owner) => {
+			// Arrange: listen successfully, then optionally replace the ownership record.
+			const pidPath = join(HOME, "viewer.pid");
+			await startForegroundViewer(invocation());
+			listening();
+			const writtenRecord = String(vi.mocked(writeFileSync).mock.calls[0]?.[1]);
+			const record = JSON.parse(writtenRecord);
+			vi.mocked(existsSync).mockImplementation((path) => String(path) === pidPath);
+			vi.mocked(readFileSync).mockReturnValue(
+				JSON.stringify({ ...record, pid: owner === "own" ? process.pid : process.pid + 1 }),
+			);
+
+			// Act
+			await shutdown();
+
+			// Assert: cleanup checks current ownership, not whether startup once wrote the file.
+			expect(record.pid).toBe(process.pid);
+			if (owner === "own") expect(rmSync).toHaveBeenCalledWith(pidPath);
+			else expect(rmSync).not.toHaveBeenCalledWith(pidPath);
+			expect(exits).toEqual([0]);
+		},
+	);
+	it.each(["own", "replaced"] as const)(
+		"removes only its own viewer PID record at the forced shutdown deadline (%s record)",
+		async (owner) => {
+			// Arrange: stall registry cleanup so only the 30-second safety timer can exit.
+			const closing = deferred();
+			mocks.registryClose.mockReturnValue(closing.promise);
+			const pidPath = join(HOME, "viewer.pid");
+			await startForegroundViewer(invocation());
+			listening();
+			vi.mocked(existsSync).mockImplementation((path) => String(path) === pidPath);
+			vi.mocked(readFileSync).mockReturnValue(
+				JSON.stringify({ pid: process.pid, host: "127.0.0.1", port: 7441 }),
+			);
+			const requestShutdown = signals.get("SIGTERM");
+			if (!requestShutdown) throw new Error("Missing actual shutdown callback");
+
+			// Act: another viewer may replace the file while graceful cleanup is stalled.
+			requestShutdown();
+			vi.mocked(readFileSync).mockReturnValue(
+				JSON.stringify({
+					pid: owner === "own" ? process.pid : process.pid + 1,
+					host: "127.0.0.1",
+					port: 7441,
+				}),
+			);
+			await vi.advanceTimersByTimeAsync(29_999);
+			const exitsBeforeDeadline = [...exits];
+			await vi.advanceTimersByTimeAsync(1);
+			const forcedExits = [...exits];
+			const forcedRemovals = [...vi.mocked(rmSync).mock.calls];
+			closing.resolve();
+			await vi.advanceTimersByTimeAsync(0);
+
+			// Assert: force-exit preserves replacement ownership and still cleans its own file.
+			expect(exitsBeforeDeadline).toEqual([]);
+			expect(forcedExits).toEqual([1]);
+			expect(forcedRemovals.some(([path]) => path === pidPath)).toBe(owner === "own");
+		},
+	);
+});
+
 describe("foreground account shutdown wiring", () => {
+	it("reports store-drain rejection and exits with failure after awaiting the close promise", async () => {
+		// Arrange: rejection happens only after shutdown reaches the final owned store drain.
+		const closing = deferred();
+		const closeEntered = deferred();
+		const failure = new Error("fixture async store close failed");
+		mocks.closeStore.mockImplementation(() => {
+			mocks.calls.push("store");
+			closeEntered.resolve();
+			return closing.promise;
+		});
+		await startForegroundViewer(invocation());
+		const requestShutdown = signals.get("SIGTERM");
+		if (!requestShutdown) throw new Error("Missing actual shutdown callback");
+
+		// Act: no actual signal or process exit is used, and the force-exit timer never advances.
+		requestShutdown();
+		await closeEntered.promise;
+		const exitsWhileClosing = [...exits];
+		closing.reject(failure);
+		await vi.advanceTimersByTimeAsync(0);
+
+		// Assert: a failed graceful drain must not skip process exit or become success.
+		expect(exitsWhileClosing).toEqual([]);
+		expect(mocks.calls).toEqual(["registry", "listener:0", "store"]);
+		expect(mocks.closeStore).toHaveBeenCalledOnce();
+		expect(mocks.logError).toHaveBeenCalledExactlyOnceWith(failure.message);
+		expect(exits).toEqual([1]);
+	});
+	it("waits for asynchronous store drain before reporting process exit", async () => {
+		// Arrange: the shared close spy represents the server's asynchronous close API.
+		const closing = deferred();
+		mocks.closeStore.mockImplementation(() => {
+			mocks.calls.push("store");
+			return closing.promise;
+		});
+		await startForegroundViewer(invocation());
+
+		// Act: drain promise reactions without advancing the forced-exit safety timer.
+		const finished = shutdown();
+		await vi.advanceTimersByTimeAsync(0);
+		const exitsBeforeStoreDrained = [...exits];
+		closing.resolve();
+		await finished;
+
+		// Assert: release the fixture promise even on RED, then verify the owner awaited it.
+		expect(exitsBeforeStoreDrained).toEqual([]);
+		expect(mocks.closeStore).toHaveBeenCalledOnce();
+		expect(mocks.calls.at(-1)).toBe("store");
+		expect(exits).toEqual([0]);
+	});
 	it.each(["SIGTERM", "SIGINT"])(
 		"waits for registry cleanup before draining either listener on %s",
 		async (signal) => {
