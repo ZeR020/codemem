@@ -197,6 +197,7 @@ import {
 	recipientOwnerWriteSql,
 	validateRecipientOwnerInput,
 } from "./coordinator-recipient-owner-consistency.js";
+import { ResolvedAccountOwnerStatusOperations } from "./coordinator-resolved-account-owner-status.js";
 import {
 	type CapturedScopeMember,
 	captureScopeAuthorizationInput,
@@ -1319,6 +1320,21 @@ export class D1CoordinatorStore implements CoordinatorStore {
 		...args: Parameters<AccountOwnerTargetOperations["readAccountOwnerTarget"]>
 	) {
 		return this.accountOwnerTarget.readAccountOwnerTarget(...args);
+	}
+	readResolvedAccountOwnerStatus(
+		...args: Parameters<ResolvedAccountOwnerStatusOperations["readResolvedAccountOwnerStatus"]>
+	) {
+		return new ResolvedAccountOwnerStatusOperations({
+			...this.accountChangeBackend,
+			all: async <T>({ sql, values }: AuthLinkStatement) => {
+				const result = await this.db
+					.prepare(sql)
+					.bind(...values)
+					.all<T>();
+				if (!result.results) throw new Error("resolved_account_owner_status_unavailable");
+				return result.results;
+			},
+		}).readResolvedAccountOwnerStatus(...args);
 	}
 	private ownerResolutionReviews(): OwnerResolutionReviewOperations {
 		return new OwnerResolutionReviewOperations({
