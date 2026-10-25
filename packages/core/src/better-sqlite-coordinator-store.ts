@@ -203,6 +203,7 @@ import {
 } from "./coordinator-membership-effects.js";
 import { COORDINATOR_OWNER_ENROLLMENT_SCHEMA_SQL } from "./coordinator-owner-enrollment-schema.js";
 import {
+	type NegativeOwnerConsistency,
 	prepareNegativeOwnerConsistency,
 	withNegativeOwnerConsistency,
 } from "./coordinator-owner-negative-consistency.js";
@@ -214,6 +215,11 @@ import {
 	requirePeerDiscoveryRows,
 } from "./coordinator-peer-discovery.js";
 import { projectInviteGuardEvidence } from "./coordinator-project-invite-guards.js";
+import {
+	prepareRecipientOwnerConsistency,
+	recipientOwnerWriteSql,
+	validateRecipientOwnerInput,
+} from "./coordinator-recipient-owner-consistency.js";
 import {
 	type CapturedScopeMember,
 	captureScopeAuthorizationInput,
@@ -1908,24 +1914,18 @@ export class BetterSqliteCoordinatorStore implements CoordinatorStore {
 	): Promise<CoordinatorRecipientInviteAcceptance> {
 		const opts = { ...input };
 		const consumedAt = normalizeInviteExpiresAt(opts.now);
-		const recipientDisplayName = opts.recipientDisplayName ?? null;
 		const deviceDisplayName = opts.deviceDisplayName ?? null;
-		if (
-			!opts.identityId ||
-			!opts.deviceId ||
-			!opts.publicKey ||
-			!opts.fingerprint ||
-			opts.identityId !== opts.identityId.trim() ||
-			opts.deviceId !== opts.deviceId.trim() ||
-			opts.identityId.length > 256 ||
-			opts.deviceId.length > 256 ||
-			/[\p{Cc}\p{Cf}]/u.test(opts.identityId) ||
-			/[\p{Cc}\p{Cf}]/u.test(opts.deviceId)
-		) {
-			throw new Error("invite_identity_conflict");
-		}
+		validateRecipientOwnerInput(opts);
 		const preflightInvite = await this.getInviteByTokenForInspection(opts.token);
 		const preflightInspection = preflightInvite ? await inspectInvite(preflightInvite) : null;
+		const consistency = await prepareRecipientOwnerConsistency(
+			{
+				...this.schemaBackend,
+				all: async <T>({ sql, values }: AuthLinkStatement) =>
+					this.db.prepare(sql).all(...values) as T[],
+			},
+			opts,
+		);
 		return this.db
 			.transaction((): CoordinatorRecipientInviteAcceptance => {
 				const invite = this.db
@@ -1974,30 +1974,14 @@ export class BetterSqliteCoordinatorStore implements CoordinatorStore {
 				const authorization = this.recipientInviteAuthorization(invite, opts, participantSubjects);
 				const { sql: authorizationSql, values: authorizationValues } = authorization;
 				this.assertRecipientInviteAuthorized(invite, opts, participantSubjects);
-				const changed = invite.consumed_at
-					? 0
-					: this.db
-							.prepare(`UPDATE coordinator_invites SET token = ?, consumed_at = ?, bound_device_id = ?,
-							bound_public_key = ?, bound_fingerprint = ?, recipient_actor_id = ?,
-							recipient_display_name = ?, recipient_device_display_name = ?
-							WHERE invite_id = ? AND consumed_at IS NULL AND revoked_at IS NULL
-							AND expires_at > ? AND invite_kind = ?
-							AND EXISTS (SELECT 1 FROM groups g WHERE g.group_id = coordinator_invites.group_id
-								AND g.archived_at IS NULL) AND ${authorizationSql}`)
-							.run(
-								`consumed:${invite.invite_id}`,
-								consumedAt,
-								opts.deviceId,
-								opts.publicKey,
-								opts.fingerprint,
-								authoritativeIdentityId,
-								recipientDisplayName,
-								deviceDisplayName,
-								invite.invite_id,
-								consumedAt,
-								opts.inviteKind,
-								...authorizationValues,
-							).changes;
+				this.assertRecipientOwnerPin(consistency);
+				const retained = consistency.retainedRecheck;
+				const changed = this.consumeRecipientOwnerToken(invite, opts, {
+					authorization,
+					consistency,
+					consumedAt,
+				});
+				let pendingPin = retained;
 				const saved = this.getRecipientInviteById(invite.invite_id);
 				if (
 					saved.bound_device_id !== opts.deviceId ||
@@ -2010,7 +1994,9 @@ export class BetterSqliteCoordinatorStore implements CoordinatorStore {
 					throw new Error("invite_identity_conflict");
 				if (changed === 1) {
 					this.db
-						.prepare(`INSERT INTO enrolled_devices(
+						.prepare(
+							recipientOwnerWriteSql(
+								`INSERT INTO enrolled_devices(
 						group_id, device_id, public_key, fingerprint, identity_id, display_name, enabled, created_at
 					) SELECT ?, ?, ?, ?, ?, ?, 1, ?
 					WHERE ${authorizationSql}
@@ -2021,8 +2007,12 @@ export class BetterSqliteCoordinatorStore implements CoordinatorStore {
 						display_name = COALESCE(enrolled_devices.display_name, excluded.display_name),
 						enabled = 1
 					WHERE enrolled_devices.identity_id IS NULL
-						OR enrolled_devices.identity_id = excluded.identity_id`)
+							OR enrolled_devices.identity_id = excluded.identity_id`,
+								retained,
+							),
+						)
 						.run(
+							...retained.values,
 							invite.group_id,
 							opts.deviceId,
 							opts.publicKey,
@@ -2033,33 +2023,13 @@ export class BetterSqliteCoordinatorStore implements CoordinatorStore {
 							...authorizationValues,
 						);
 				} else {
-					this.db
-						.prepare(`UPDATE enrolled_devices SET identity_id = ?
-						WHERE group_id = ? AND device_id = ? AND identity_id IS NULL
-							AND public_key = ? AND fingerprint = ?
-							AND ${authorizationSql}`)
-						.run(
-							authoritativeIdentityId,
-							invite.group_id,
-							opts.deviceId,
-							opts.publicKey,
-							opts.fingerprint,
-							...authorizationValues,
-						);
+					pendingPin = this.repairRecipientOwnerIdentity(invite, opts, {
+						authorization,
+						consistency,
+					});
 				}
 				this.assertRecipientInviteAuthorized(invite, opts, participantSubjects);
-				const enrollment = this.db
-					.prepare(`SELECT ${ENROLLMENT_COLUMNS}
-					FROM enrolled_devices WHERE group_id = ? AND device_id = ? AND enabled = 1`)
-					.get(invite.group_id, opts.deviceId) as CoordinatorEnrollment | undefined;
-				if (!enrollment) throw new Error("invite_acceptance_incomplete");
-				if (
-					enrollment.public_key !== opts.publicKey ||
-					enrollment.fingerprint !== opts.fingerprint ||
-					enrollment.identity_id !== authoritativeIdentityId
-				) {
-					throw new Error("invite_identity_conflict");
-				}
+				this.validateAcceptedRecipientOwner(invite, opts);
 				let bootstrapGrant: CoordinatorBootstrapGrant | null = null;
 				if (
 					preflightInspection.kind === "add_device" &&
@@ -2074,10 +2044,15 @@ export class BetterSqliteCoordinatorStore implements CoordinatorStore {
 					if (seed) {
 						const grantId = tokenUrlSafe(12);
 						const claimed = this.db
-							.prepare(`UPDATE coordinator_invites SET bootstrap_grant_id = ?,
+							.prepare(
+								recipientOwnerWriteSql(
+									`UPDATE coordinator_invites SET bootstrap_grant_id = ?,
 						 trust_state = 'bootstrap_grant_created'
-							 WHERE invite_id = ? AND bootstrap_grant_id IS NULL AND ${authorizationSql}`)
-							.run(grantId, invite.invite_id, ...authorizationValues);
+								 WHERE invite_id = ? AND bootstrap_grant_id IS NULL AND ${authorizationSql}`,
+									pendingPin,
+								),
+							)
+							.run(...pendingPin.values, grantId, invite.invite_id, ...authorizationValues);
 						if (claimed.changes === 1) {
 							bootstrapGrant = insertBootstrapGrantSync(
 								this.db,
@@ -2101,6 +2076,7 @@ export class BetterSqliteCoordinatorStore implements CoordinatorStore {
 				}
 				// Trigger effects belong to this transaction too; denial rolls back all acceptance writes.
 				this.assertRecipientInviteAuthorized(savedWithGrant, opts, participantSubjects);
+				this.assertRecipientOwnerPin(pendingPin);
 				return {
 					status: changed === 1 ? "accepted" : "existing",
 					invite: savedWithGrant,
@@ -2109,6 +2085,101 @@ export class BetterSqliteCoordinatorStore implements CoordinatorStore {
 				};
 			})
 			.immediate();
+	}
+
+	private repairRecipientOwnerIdentity(
+		invite: CoordinatorInvite,
+		opts: CoordinatorConsumeRecipientInviteInput,
+		options: { authorization: AuthLinkStatement; consistency: NegativeOwnerConsistency },
+	): AuthLinkStatement {
+		const { authorization, consistency } = options;
+		const repaired = this.db
+			.prepare(
+				recipientOwnerWriteSql(
+					`UPDATE enrolled_devices SET identity_id = ?
+			WHERE group_id = ? AND device_id = ? AND identity_id IS NULL
+			AND public_key = ? AND fingerprint = ? AND ${authorization.sql}`,
+					consistency,
+				),
+			)
+			.run(
+				...consistency.values,
+				opts.identityId,
+				invite.group_id,
+				opts.deviceId,
+				opts.publicKey,
+				opts.fingerprint,
+				...authorization.values,
+			);
+		// A zero-row repair does not consume the initial owner evidence.
+		return repaired.changes === 1 ? consistency.retainedRecheck : consistency;
+	}
+
+	private validateAcceptedRecipientOwner(
+		invite: CoordinatorInvite,
+		opts: CoordinatorConsumeRecipientInviteInput,
+	) {
+		const enrollment = this.db
+			.prepare(`SELECT ${ENROLLMENT_COLUMNS}
+ FROM enrolled_devices WHERE group_id = ? AND device_id = ? AND enabled = 1`)
+			.get(invite.group_id, opts.deviceId) as CoordinatorEnrollment | undefined;
+		if (!enrollment) throw new Error("invite_acceptance_incomplete");
+		if (
+			enrollment.public_key !== opts.publicKey ||
+			enrollment.fingerprint !== opts.fingerprint ||
+			enrollment.identity_id !== opts.identityId
+		)
+			throw new Error("invite_identity_conflict");
+	}
+
+	private assertRecipientOwnerPin(
+		predicate: AuthLinkStatement | null,
+	): asserts predicate is AuthLinkStatement {
+		if (
+			!predicate ||
+			(this.db.prepare(predicate.sql).get(...predicate.values) as { matches: number } | undefined)
+				?.matches !== 1
+		)
+			throw new Error("device_ownership_authorization_unavailable");
+	}
+
+	private consumeRecipientOwnerToken(
+		invite: CoordinatorInvite,
+		opts: CoordinatorConsumeRecipientInviteInput,
+		options: {
+			authorization: AuthLinkStatement;
+			consistency: AuthLinkStatement;
+			consumedAt: string;
+		},
+	) {
+		if (invite.consumed_at) return 0;
+		const { authorization, consistency, consumedAt } = options;
+		return this.db
+			.prepare(
+				recipientOwnerWriteSql(
+					`UPDATE coordinator_invites SET token = ?, consumed_at = ?, bound_device_id = ?,
+ bound_public_key = ?, bound_fingerprint = ?, recipient_actor_id = ?, recipient_display_name = ?, recipient_device_display_name = ?
+ WHERE invite_id = ? AND consumed_at IS NULL AND revoked_at IS NULL AND expires_at > ? AND invite_kind = ?
+ AND EXISTS (SELECT 1 FROM groups g WHERE g.group_id = coordinator_invites.group_id AND g.archived_at IS NULL)
+ AND ${authorization.sql}`,
+					consistency,
+				),
+			)
+			.run(
+				...consistency.values,
+				`consumed:${invite.invite_id}`,
+				consumedAt,
+				opts.deviceId,
+				opts.publicKey,
+				opts.fingerprint,
+				opts.identityId,
+				opts.recipientDisplayName ?? null,
+				opts.deviceDisplayName ?? null,
+				invite.invite_id,
+				consumedAt,
+				opts.inviteKind,
+				...authorization.values,
+			).changes;
 	}
 
 	private prepareProjectInviteGuards(

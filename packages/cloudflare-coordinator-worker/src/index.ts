@@ -38,6 +38,7 @@ export interface CreateCloudflareCoordinatorWorkerOptions {
 	now?: () => string;
 	adminSecret?: (env: CloudflareCoordinatorEnv) => string | null;
 	browserAuth?: CoordinatorBrowserAuthOptions;
+	recipientInviteCoordinatorId?: string;
 }
 
 function jsonResponse(payload: Record<string, unknown>, status = 200): Response {
@@ -80,6 +81,7 @@ function createLegacyCloudflareCoordinatorWorker(
 				adminSecret: coordinatorAdminSecret(env, opts),
 				now: opts.now,
 				requestVerifier: verifyCloudflareCoordinatorRequest,
+				recipientInviteCoordinatorId: opts.recipientInviteCoordinatorId,
 			});
 			return app.fetch(request);
 		},
@@ -491,6 +493,8 @@ function disabledWorker(
 ) {
 	return createCloudflareCoordinatorWorker({
 		browserAuth: { config: { enabled: false, coordinatorId: settings.coordinatorId } },
+		recipientInviteCoordinatorId:
+			typeof settings.coordinatorId === "string" ? settings.coordinatorId : undefined,
 	});
 }
 

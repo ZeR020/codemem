@@ -15,6 +15,7 @@ export interface CreateD1CoordinatorAppOptions {
 	requestVerifier: CoordinatorRequestVerifier;
 	requestRateLimit?: CoordinatorRequestRateLimitOptions;
 	deviceRevocation?: CoordinatorDeviceRevocationContext;
+	recipientInviteCoordinatorId?: string;
 	browserAuth?:
 		| Exclude<CoordinatorAppBrowserAuthOptions, { kind: "ready" }>
 		| Omit<Extract<CoordinatorAppBrowserAuthOptions, { kind: "ready" }>, "storeFactory">;
@@ -31,6 +32,7 @@ export function createD1CoordinatorApp(
 	return createCoordinatorApp({
 		storeFactory: () => new D1CoordinatorStore(db),
 		deviceRevocation: opts.deviceRevocation,
+		recipientInviteCoordinatorId: opts.recipientInviteCoordinatorId,
 		runtime,
 		requestVerifier: opts.requestVerifier,
 		requestRateLimit: opts.requestRateLimit,

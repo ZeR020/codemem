@@ -380,6 +380,8 @@ export interface CoordinatorInspectRecipientInviteInput {
 }
 
 export interface CoordinatorConsumeRecipientInviteInput {
+	/** Internal server-config namespace only; never accepted from invite HTTP JSON. */
+	coordinatorId?: string;
 	token: string;
 	inviteKind: CoordinatorRecipientInviteKind;
 	identityId: string;
