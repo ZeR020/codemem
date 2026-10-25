@@ -5,6 +5,11 @@ import {
 	type ControllerHistorySnapshot,
 	captureControllerHistorySnapshot,
 } from "./coordinator-auth-controller-history.js";
+import {
+	AUTH_CONTROLLER_OWNER_CTE,
+	AUTH_CONTROLLER_OWNER_GUARD,
+	type CoordinatorAuthControllerOwnerSnapshot,
+} from "./coordinator-auth-controller-owner.js";
 
 /** Persistence of completed, trusted admin reviews, not authentication of request JSON.
  * Future routes must authenticate the configured admin before invoking this capability.
@@ -26,6 +31,7 @@ export interface CoordinatorAuthControllerReviewInput {
 
 export interface CoordinatorAuthControllerVerifiedSnapshot {
 	enrollmentIdentityId: string | null;
+	accountOwnerTarget?: CoordinatorAuthControllerOwnerSnapshot;
 	/** Captured by the trusted history reader when supplied. */
 	legacyHistory?: ControllerHistorySnapshot;
 	invites: {
@@ -184,8 +190,10 @@ export function captureVerifiedSnapshot(
 		invites,
 	};
 	const history = captureOptionalField(value, "legacyHistory", captureControllerHistorySnapshot);
-	if (history === null) return null;
+	const target = captureOptionalField(value, "accountOwnerTarget", captureOwnerTarget);
+	if (history === null || target === null) return null;
 	if (history !== undefined) snapshot.legacyHistory = history;
+	if (target !== undefined) snapshot.accountOwnerTarget = target;
 	if (new TextEncoder().encode(JSON.stringify(snapshot)).byteLength > 1_000_000) return null;
 	return snapshot;
 }
@@ -199,6 +207,40 @@ function captureOptionalField<T>(
 	if (!descriptor) return field in value ? null : undefined;
 	if (!Object.hasOwn(descriptor, "value")) return null;
 	return capture(descriptor.value);
+}
+
+function captureOwnerTarget(value: unknown): CoordinatorAuthControllerOwnerSnapshot | null {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+	const fields = [
+		"purpose",
+		"coordinatorId",
+		"targetIdentityId",
+		"issuer",
+		"linkId",
+		"authConfigRevision",
+		"createdAtMs",
+	] as const;
+	if (Reflect.ownKeys(value).length !== fields.length) return null;
+	const copy: Record<string, unknown> = {};
+	for (const field of fields) {
+		const descriptor = Object.getOwnPropertyDescriptor(value, field);
+		if (!descriptor || !Object.hasOwn(descriptor, "value")) return null;
+		copy[field] = descriptor.value;
+	}
+	if (
+		copy.purpose !== "existing_account_owner" ||
+		!Number.isSafeInteger(copy.createdAtMs) ||
+		(copy.createdAtMs as number) < 0
+	)
+		return null;
+	if (
+		!["coordinatorId", "targetIdentityId", "issuer", "linkId"].every((field) =>
+			isAuthControllerId(copy[field]),
+		) ||
+		!isReviewFieldValid("evidenceDigest", copy.authConfigRevision)
+	)
+		return null;
+	return copy as unknown as CoordinatorAuthControllerOwnerSnapshot;
 }
 
 function captureOptionalSnapshot(
@@ -228,6 +270,7 @@ export function captureAuthControllerReview(
 		const snapshot = captureOptionalSnapshot(input);
 		if (snapshot === null) return null;
 		if (!historyMatchesReview(snapshot?.legacyHistory, captured)) return null;
+		if (!ownerTargetMatchesReview(snapshot, captured)) return null;
 		if (snapshot !== undefined) captured.verifiedSnapshot = snapshot;
 	} catch {
 		return null;
@@ -245,6 +288,19 @@ function historyMatchesReview(
 		history.deviceId === input.deviceId &&
 		history.publicKey === input.publicKey &&
 		history.fingerprint === input.fingerprint
+	);
+}
+
+function ownerTargetMatchesReview(
+	snapshot: CoordinatorAuthControllerVerifiedSnapshot | undefined,
+	input: Partial<CoordinatorAuthControllerReviewInput>,
+): boolean {
+	const target = snapshot?.accountOwnerTarget;
+	if (!target) return true;
+	return (
+		!!snapshot?.legacyHistory &&
+		target.coordinatorId === input.coordinatorId &&
+		target.targetIdentityId === input.identityId
 	);
 }
 
@@ -405,6 +461,93 @@ export const AUTH_CONTROLLER_RETRY_ELIGIBLE_SQL = `
 		${AUTH_CONTROLLER_SNAPSHOT_GUARD}
 		${AUTH_CONTROLLER_AUTHORITY_GUARD}`;
 
+/** Named builder keeps ordinary exported SQL unchanged and usable without connection tables. */
+export function authControllerReviewSql(
+	base: string,
+	input: CoordinatorAuthControllerReviewInput,
+): string {
+	if (!input.verifiedSnapshot?.accountOwnerTarget) return base;
+	const { subject, statement } = ownerReviewStages(base);
+	return `${AUTH_CONTROLLER_SNAPSHOT_CTE}, ${AUTH_CONTROLLER_OWNER_CTE},
+		controller_review_subject AS MATERIALIZED (${subject})
+		${statement} ${AUTH_CONTROLLER_OWNER_GUARD}`;
+}
+
+/** Internal explicit-resolution path only. The collector must first prove the
+ * current label weak; snapshot and authority guards still pin that exact label.
+ * Ordinary creation, retries and mutation readers retain their original SQL.
+ */
+export function authControllerOwnerResolutionSql(
+	mode: "create" | "eligible",
+	input: CoordinatorAuthControllerReviewInput,
+): string {
+	const stages = authControllerOwnerResolutionStages(mode, input);
+	return `${stages.ctes} ${stages.statement}`;
+}
+
+/** Keep eligibility proof roots flat when composing a checked batch assertion. */
+export function authControllerOwnerResolutionStages(
+	mode: "create" | "eligible",
+	input: CoordinatorAuthControllerReviewInput,
+): { ctes: string; statement: string } {
+	if (!input.verifiedSnapshot?.accountOwnerTarget)
+		throw new Error("account_owner_authority_unavailable");
+	const base = mode === "create" ? AUTH_CONTROLLER_INSERT_SQL : AUTH_CONTROLLER_RETRY_ELIGIBLE_SQL;
+	const stages = ownerReviewStages(base);
+	const subject = stages.subject.replace(
+		"(e.identity_id IS NULL OR e.identity_id = ?)",
+		"(e.identity_id IS NULL OR e.identity_id = ? OR e.identity_id IS json_extract((SELECT value FROM snapshot), '$.enrollmentIdentityId'))",
+	);
+	return {
+		ctes: `${AUTH_CONTROLLER_SNAPSHOT_CTE}, ${AUTH_CONTROLLER_OWNER_CTE},
+			controller_review_subject AS MATERIALIZED (${subject})`,
+		statement: `${stages.statement} ${AUTH_CONTROLLER_OWNER_GUARD}`,
+	};
+}
+
+/** These are three trusted templates, not arbitrary caller SQL. Keep both deep
+ * evidence trees in separate root stages so D1 never combines their depth.
+ */
+function ownerReviewStages(base: string): { subject: string; statement: string } {
+	if (base === AUTH_CONTROLLER_INSERT_SQL) {
+		const insertAt = base.indexOf("INSERT INTO coordinator_auth_controller_attestations");
+		const sourceAt = base.indexOf(
+			"FROM enrolled_devices e JOIN groups g ON g.group_id = e.group_id",
+			insertAt,
+		);
+		return {
+			subject: `SELECT e.* ${base.slice(sourceAt)}`,
+			statement: `${base.slice(insertAt, sourceAt)} FROM controller_review_subject e WHERE 1`,
+		};
+	}
+	if (base === AUTH_CONTROLLER_RETRY_ELIGIBLE_SQL) {
+		const selectAt = base.indexOf("SELECT 1 AS eligible FROM enrolled_devices e");
+		return {
+			subject: base.slice(selectAt).replace("SELECT 1 AS eligible", "SELECT e.*"),
+			statement: "SELECT 1 AS eligible FROM controller_review_subject e WHERE 1",
+		};
+	}
+	if (base === AUTH_CONTROLLER_RETRY_ACTIVE_SQL) {
+		const selectAt = base.indexOf("SELECT a.* FROM coordinator_auth_controller_attestations a");
+		return {
+			subject: base.slice(selectAt),
+			statement: "SELECT e.* FROM controller_review_subject e WHERE 1",
+		};
+	}
+	throw new Error("account_owner_statement_invalid");
+}
+
+function ownerGuardValues(
+	input: CoordinatorAuthControllerReviewInput,
+	authority: (string | null)[],
+): (string | null)[] {
+	if (!input.verifiedSnapshot?.accountOwnerTarget) return [];
+	const keyId = authority[authority.length - 1];
+	if (typeof keyId !== "string" || keyId.length === 0)
+		throw new Error("account_owner_authority_unavailable");
+	return [keyId];
+}
+
 export function authControllerRetryEligibleValues(
 	input: CoordinatorAuthControllerReviewInput,
 	authority: (string | null)[],
@@ -417,6 +560,7 @@ export function authControllerRetryEligibleValues(
 		input.fingerprint,
 		input.identityId,
 		...authority,
+		...ownerGuardValues(input, authority),
 	];
 }
 
@@ -425,14 +569,16 @@ export function authControllerInsertValues(
 	createdAt: string,
 	authority: (string | null)[],
 ): (string | null)[] {
-	return [
-		...authControllerSnapshotValues(input),
+	const snapshot = authControllerSnapshotValues(input);
+	const metadata = [
 		input.attestationId,
 		input.coordinatorId,
 		input.identityId,
 		input.reviewReceiptId,
 		input.evidenceDigest,
 		createdAt,
+	];
+	const enrollmentAndAuthority = [
 		input.groupId,
 		input.deviceId,
 		input.publicKey,
@@ -440,6 +586,14 @@ export function authControllerInsertValues(
 		input.identityId,
 		...authority,
 	];
+	if (input.verifiedSnapshot?.accountOwnerTarget)
+		return [
+			...snapshot,
+			...enrollmentAndAuthority,
+			...metadata,
+			...ownerGuardValues(input, authority),
+		];
+	return [...snapshot, ...metadata, ...enrollmentAndAuthority];
 }
 
 const AUTH_CONTROLLER_CURRENT_SQL = `
@@ -474,6 +628,7 @@ export function authControllerRetryActiveValues(
 		input.coordinatorId,
 		input.attestationId,
 		...authority,
+		...ownerGuardValues(input, authority),
 	];
 }
 

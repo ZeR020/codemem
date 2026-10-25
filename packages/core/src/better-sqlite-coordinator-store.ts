@@ -56,6 +56,7 @@ import {
 	authControllerInsertValues,
 	authControllerRetryEligibleValues,
 	authControllerRetryResult,
+	authControllerReviewSql,
 	authControllerUnavailableResult,
 	type CoordinatorAuthControllerAttestation,
 	type CoordinatorAuthControllerCreateResult,
@@ -1296,7 +1297,7 @@ export class BetterSqliteCoordinatorStore implements CoordinatorStore {
 				);
 				try {
 					const inserted = this.db
-						.prepare(AUTH_CONTROLLER_INSERT_SQL)
+						.prepare(authControllerReviewSql(AUTH_CONTROLLER_INSERT_SQL, review))
 						.run(...authControllerInsertValues(review, nowISO(), authority));
 					if (inserted.changes === 0)
 						return {
@@ -1324,7 +1325,7 @@ export class BetterSqliteCoordinatorStore implements CoordinatorStore {
 	): CoordinatorAuthControllerCreateResult {
 		if (
 			!this.db
-				.prepare(AUTH_CONTROLLER_RETRY_ELIGIBLE_SQL)
+				.prepare(authControllerReviewSql(AUTH_CONTROLLER_RETRY_ELIGIBLE_SQL, input))
 				.get(...authControllerRetryEligibleValues(input, authority))
 		)
 			return {

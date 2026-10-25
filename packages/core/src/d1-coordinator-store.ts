@@ -33,6 +33,7 @@ import {
 	authControllerInsertValues,
 	authControllerRetryActiveValues,
 	authControllerRetryResult,
+	authControllerReviewSql,
 	authControllerUnavailableResult,
 	type CoordinatorAuthControllerAttestation,
 	type CoordinatorAuthControllerCreateResult,
@@ -1393,7 +1394,7 @@ export class D1CoordinatorStore implements CoordinatorStore {
 		try {
 			const inserted = await runChanges(
 				this.db
-					.prepare(AUTH_CONTROLLER_INSERT_SQL)
+					.prepare(authControllerReviewSql(AUTH_CONTROLLER_INSERT_SQL, review))
 					.bind(...authControllerInsertValues(review, nowISO(), authority)),
 			);
 			if (inserted === 0)
@@ -1425,7 +1426,7 @@ export class D1CoordinatorStore implements CoordinatorStore {
 		if (result.kind === "rejected") return result;
 		const active = await firstRow<CoordinatorAuthControllerAttestation>(
 			this.db
-				.prepare(AUTH_CONTROLLER_RETRY_ACTIVE_SQL)
+				.prepare(authControllerReviewSql(AUTH_CONTROLLER_RETRY_ACTIVE_SQL, input))
 				.bind(...authControllerRetryActiveValues(input, authority)),
 		);
 		// A change after the conflict read makes this review stale, including revocation.
