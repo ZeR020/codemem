@@ -4,6 +4,8 @@
 	"private": true,
 	"type": "module",
 	"scripts": {
+		"ci:test": "node ../../scripts/ci-package-test.mjs",
+		"ci:worker": "node ../../scripts/ci-package-test.mjs worker-integration",
 		"clean": "rm -rf dist tsconfig.tsbuildinfo",
 		"build": "pnpm exec vite build && pnpm run check:bundle:prepared && pnpm exec tsc --build",
 		"check:bundle": "pnpm --filter @codemem/core build && pnpm run check:bundle:prepared",
@@ -19,6 +21,8 @@
 		"@codemem/core": "workspace:^"
 	},
 	"devDependencies": {
+		"@codemem/server": "workspace:^",
+		"codemem": "workspace:^",
 		"@cloudflare/vitest-pool-workers": "^0.22.0",
 		"@cloudflare/workers-types": "^5.20261019.1",
 		"@types/better-sqlite3": "catalog:",

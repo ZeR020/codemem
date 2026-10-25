@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { describe, it } from "node:test";
@@ -187,6 +187,41 @@ it("runs synthetic account acceptance separately with pinned package Chromium an
 	assert.doesNotMatch(job, /^\s*(?:if|continue-on-error|permissions|secrets):/m);
 });
 
+it("keeps every CI package module and test unchanged under the existing Biome policy", () => {
+	// Arrange: use an already-included path without extending the repository's ignore policy.
+	const root = new URL("../", import.meta.url);
+	const scripts = new URL("scripts/", root);
+	const names = readdirSync(scripts).filter((name) => /^ci-package-.*\.mjs$/u.test(name));
+	assert.ok(names.length > 0, "expected CI package modules and tests");
+	for (const name of names) {
+		const source = readFileSync(new URL(name, scripts), "utf8");
+		for (const input of [source, `${source} `]) {
+			// Act: --write returns safe fixes on stdout, never writes the source file.
+			const result = spawnSync(
+				process.env.npm_execpath ?? "pnpm",
+				[
+					"exec",
+					"biome",
+					"check",
+					"--write",
+					"--error-on-warnings",
+					"--stdin-file-path=scripts/ci-workflow.test.mjs",
+				],
+				{ cwd: root, input, encoding: "utf8" },
+			);
+			// Assert: reject both diagnostics and safe fixes that would change the source bytes.
+			const diagnostic = `${name}: ${result.error?.message ?? ""}\n${result.stderr}`;
+			assert.equal(result.status, 0, diagnostic);
+			if (input === source) {
+				assert.equal(result.stdout, input, diagnostic);
+			} else {
+				// Negative control: a formatting violation must not pass byte equality.
+				assert.notEqual(result.stdout, input, diagnostic);
+			}
+		}
+	}
+});
+
 describe("normal CI workflow source contract", () => {
 	it("does not rebuild workspace dependencies from the Worker build", () => {
 		assert.match(workerPackage.scripts.build, /pnpm run check:bundle:prepared/u);
@@ -207,13 +242,18 @@ describe("normal CI workflow source contract", () => {
 		assert.equal(getTopLevelBlock(ciWorkflow, "concurrency"), getExpectedConcurrency("ci"));
 	});
 
-	it("runs the workflow source contract in the TypeScript Test job", () => {
+	it("routes the TypeScript Test job through the root prerequisite launcher", () => {
+		// Arrange
 		const testJob = getJob(ciWorkflow, "ts-test");
-
-		assert.match(
-			testJob,
-			/^ {8}run: pnpm run test:release && pnpm run test:adapter-normalizers && pnpm run test:ci-workflow && pnpm run test:semantic-installed && pnpm run test:ci$/m,
+		// Act
+		const commands = [...testJob.matchAll(/^ {8}run: (.+)$/gm)].map((match) => match[1]);
+		// Assert: root prerequisite execution is covered by buildCommands tests.
+		assert.equal(rootPackage.scripts["ci:package-probe"], "node scripts/ci-package-pipeline.mjs");
+		assert.equal(
+			commands.filter((command) => command === "pnpm run ci:package-probe ci-packages").length,
+			1,
 		);
+		assert.doesNotMatch(commands.join("\n"), /pnpm run test:release|pnpm run test:ci\b/);
 	});
 });
 
@@ -244,7 +284,7 @@ describe("CI test scheduling contract", () => {
 			/testTimeout|passWithNoTests|--testNamePattern|--project|--no-file-parallelism/u,
 		);
 		assert.match(getJob(ciWorkflow, "ts-test"), /^ {4}name: TypeScript Test$/m);
-		assert.doesNotMatch(getJob(ciWorkflow, "ts-test"), /^\s*(?:if|continue-on-error):/m);
+		assert.doesNotMatch(getJob(ciWorkflow, "ts-test"), /^ {4}(?:if|continue-on-error):/m);
 	});
 
 	for (const { name, failPhase, status, calls } of [

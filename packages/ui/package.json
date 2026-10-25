@@ -3,6 +3,7 @@
 	"private": true,
 	"type": "module",
 	"scripts": {
+		"ci:test:ui": "node ../../scripts/ci-package-test.mjs",
 		"clean": "rm -rf ../viewer-server/static",
 		"dev": "node ./scripts/make-dev-html.mjs && vite",
 		"gallery:dev": "node ./scripts/make-gallery-html.mjs && vite --config vite.gallery.config.ts",
@@ -41,6 +42,7 @@
 		"tslib": "^2.8.1"
 	},
 	"devDependencies": {
+		"@codemem/server": "workspace:^",
 		"@playwright/test": "1.63.0",
 		"@fontsource-variable/geist": "5.3.0",
 		"@fontsource-variable/jetbrains-mono": "5.3.0",
