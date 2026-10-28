@@ -24,7 +24,7 @@ codemem is persistent coding memory across sessions, machines, and teammates for
 - **Automatic injection for OpenCode 1 and 2** — the plugin injects context into every prompt, no manual steps; the OpenCode 2 integration is beta
 - **Claude Code plugin support** — install from the codemem marketplace source
 - **Multi-agent** — OpenCode, Claude Code, Codex, and pi share one project-scoped store
-- **Pi coding agent** — session capture, automatic recall, and 15 native memory tools including `memory_session_search`; no MCP required
+- **Pi coding agent** — session capture, automatic recall, and 15 native memory tools including `memory_session_search`, which the codemem MCP server also exposes; no MCP required for Pi
 - **Built-in viewer** — browse memories, sessions, and observer output in a local web UI
 - **Remote MCP access** — advanced single-user self-hosting can expose an OAuth-protected Streamable HTTP MCP endpoint to configured remote clients; keep the localhost viewer private ([guide](docs/remote-mcp-oauth.md))
 
@@ -269,7 +269,7 @@ codemem stats
 codemem db raw-events-status
 ```
 
-The extension captures Pi activity, recalls into the latest user message of the request copy, attaches context after a successful built-in `read`, and registers 15 native `memory_*` tools by default, including `memory_session_search` over stored Pi conversation text, scoped to the current project unless explicitly overridden. MCP is not required. Observer setup can fill unset settings from Pi API-key providers only. Pi OAuth-only credentials cannot be auto-derived for the observer; configure an observer connection separately ([observer auth](docs/user-guide.md#observer-auth-configuration)).
+The extension captures Pi activity, recalls into the latest user message of the request copy, attaches context after a successful built-in `read`, and registers 15 native `memory_*` tools by default, including `memory_session_search` over stored Pi conversation text, scoped to the current project unless explicitly overridden. MCP is not required. The codemem MCP server also registers `memory_session_search` over the same stored user/assistant text for MCP-connected clients. Observer setup can fill unset settings from Pi API-key providers only. Pi OAuth-only credentials cannot be auto-derived for the observer; configure an observer connection separately ([observer auth](docs/user-guide.md#observer-auth-configuration)).
 
 Pre-install Pi session history is not imported automatically. Backfill it with `codemem pi-import-sessions`, then search stored user/assistant text with `codemem pi-session-search <query>`.
 
@@ -427,7 +427,7 @@ codemem setup --opencode-only
 
 This updates your OpenCode config to install the plugin and register the MCP server. Restart OpenCode to activate.
 
-Pi registers the same memory tools natively by default and does not need MCP. See [Pi extension](docs/plugin-reference.md#pi-extension).
+Pi registers the same memory tools natively by default and does not need MCP. MCP-connected clients also get `memory_session_search`, which searches stored Pi user/assistant transcript text (not memories, metadata, or tool payloads) with the same query bounds as the CLI and viewer route. See [Pi extension](docs/plugin-reference.md#pi-extension).
 
 The standalone `codemem-mcp-ts` binary runs the same stdio server used by `codemem mcp`. Viewer autostart is on by default for both invocation paths; set `CODEMEM_VIEWER=0` or `CODEMEM_VIEWER_AUTO=0` to disable. MCP autostart and the `serve start`/`stop`/`restart` lifecycle identify a running viewer through `GET /api/health` (service discriminator `codemem-viewer`), with one bounded `GET /api/stats` compatibility probe when an older viewer returns `404`.
 

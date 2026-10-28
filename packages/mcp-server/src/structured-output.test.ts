@@ -66,6 +66,10 @@ const expectedAnnotations = {
 		readOnlyHint: true,
 		openWorldHint: false,
 	},
+	memory_session_search: {
+		readOnlyHint: true,
+		openWorldHint: false,
+	},
 	memory_timeline: {
 		readOnlyHint: true,
 		openWorldHint: false,
@@ -177,7 +181,7 @@ async function rememberFixturePair(): Promise<[number, number]> {
 }
 
 describe("registered MCP tool declarations", () => {
-	it("publishes an output schema and the audited annotations for all 14 tools", async () => {
+	it("publishes an output schema and the audited annotations for all 15 tools", async () => {
 		// Arrange: the expected map pins read locality and write semantics.
 		const expectedNames = Object.keys(expectedAnnotations).toSorted();
 
@@ -416,6 +420,10 @@ describe("empty MCP structured outputs", () => {
 			query: "absent",
 			project: missingProject,
 		});
+		const sessions = await callSuccess("memory_session_search", {
+			query: "absent",
+			project: missingProject,
+		});
 		const recent = await callSuccess("memory_recent", { project: missingProject });
 		const batch = await callSuccess("memory_get_observations", { ids: [] });
 		const timeline = await callSuccess("memory_timeline", {
@@ -438,6 +446,14 @@ describe("empty MCP structured outputs", () => {
 		// Assert
 		expect(search).toEqual({ items: [] });
 		expect(index).toEqual({ items: [] });
+		expect(sessions).toEqual({
+			query: "absent",
+			query_truncated: false,
+			results: [],
+			returned: 0,
+			total_matches: 0,
+			truncated: false,
+		});
 		expect(recent).toEqual({ items: [] });
 		expect(batch).toEqual({ items: [] });
 		expect(timeline).toEqual({ items: [] });
