@@ -176,6 +176,15 @@ export function buildMessageEndPayload(input: {
 	};
 }
 
+const PI_MCP_MEMORY_TOOL_PREFIX = "mcp__codemem__memory_";
+const CANONICAL_MEMORY_TOOL_PREFIX = "codemem_memory_";
+
+/** Only Pi's exact MCP namespace is translated; foreign servers and lookalikes keep their name. */
+export function normalizePiMcpMemoryToolName(toolName: string): string | null {
+	if (!toolName.startsWith(PI_MCP_MEMORY_TOOL_PREFIX)) return null;
+	return CANONICAL_MEMORY_TOOL_PREFIX + toolName.slice(PI_MCP_MEMORY_TOOL_PREFIX.length);
+}
+
 export function buildToolCallPayload(input: {
 	sessionId: string;
 	cwd?: string | null;
@@ -185,6 +194,7 @@ export function buildToolCallPayload(input: {
 	toolInput?: Record<string, unknown>;
 	entryId?: string | null;
 }): PiHookPayload {
+	const toolName = normalizePiMcpMemoryToolName(input.toolName) ?? input.toolName;
 	return {
 		...basePayload({
 			piEvent: "tool_call",
@@ -194,7 +204,7 @@ export function buildToolCallPayload(input: {
 			toolCallId: input.toolCallId,
 			entryId: input.entryId,
 		}),
-		toolName: input.toolName,
+		toolName,
 		toolInput: input.toolInput ?? {},
 	};
 }
@@ -210,7 +220,12 @@ export function buildToolResultPayload(input: {
 	isError?: boolean;
 	error?: unknown;
 	entryId?: string | null;
+	/** Caller proved this result contains recall output (codemode aggregate). */
+	omitResultContent?: boolean;
 }): PiHookPayload {
+	// Content is redacted only in this ingest copy, never Pi's model-visible result.
+	const recallToolName = normalizePiMcpMemoryToolName(input.toolName);
+	const omitResult = recallToolName !== null || Boolean(input.omitResultContent);
 	const payload: PiHookPayload = {
 		...basePayload({
 			piEvent: "tool_result",
@@ -220,15 +235,15 @@ export function buildToolResultPayload(input: {
 			toolCallId: input.toolCallId,
 			entryId: input.entryId,
 		}),
-		toolName: input.toolName,
+		toolName: recallToolName ?? input.toolName,
 		toolInput: input.toolInput ?? {},
 		isError: Boolean(input.isError),
 	};
 	if (input.isError) {
-		payload.error = input.error ?? true;
+		payload.error = omitResult ? true : (input.error ?? true);
 		payload.toolOutput = null;
 	} else {
-		payload.toolOutput = input.toolOutput ?? null;
+		payload.toolOutput = omitResult ? null : (input.toolOutput ?? null);
 	}
 	return payload;
 }

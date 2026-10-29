@@ -57,6 +57,7 @@ import {
 	serializeToolOutput,
 	stableMessageEntryId,
 } from "./payloads.js";
+import { RecallCorrelation } from "./recall-correlation.js";
 import { registerMemoryTools } from "./tools.js";
 import { createViewerRuntime, stopViewerTracking, type ViewerRuntime } from "./viewer.js";
 
@@ -280,7 +281,11 @@ async function fileContextAppend(
 		if (!fileCtx.text.trim()) return;
 		const block = fileCtx.preformatted ? fileCtx.text : formatPiInjectionBlock(fileCtx.text, 4_000);
 		const existing = normalizeToolResultContent(event.content);
-		return { content: [...existing, { type: "text" as const, text: `\n\n${block}` }] };
+		return {
+			content: [...existing, { type: "text" as const, text: `\n\n${block}` }],
+			// Pi drops structuredContent when a handler replaces content, so return it unchanged.
+			structuredContent: event.structuredContent,
+		};
 	} catch {
 		return;
 	}
@@ -426,6 +431,7 @@ async function onToolResult(
 	state: SessionState,
 	client: PiCodememClient,
 	config: PiExtensionConfig,
+	recall: RecallCorrelation,
 	pi: ExtensionAPI,
 	event: ToolResultEvent,
 	ctx: ExtensionContext,
@@ -448,6 +454,7 @@ async function onToolResult(
 		toolOutput: serializeToolOutput(event.content),
 		isError: Boolean(event.isError),
 		error: event.isError ? serializeToolOutput(event.content) : null,
+		omitResultContent: recall.shouldOmitResult(event.toolCallId, toolName),
 	});
 	await safeIngest(client, payload, state, pi, ctx.signal);
 	return fileContextAppend(client, config, event, toolName, toolInput, ctx.signal);
@@ -484,6 +491,24 @@ function onSessionCompactFailed(injector: PiInjector): void {
 	injector.clearCompaction();
 }
 
+/** Wire tool-event correlation; handlers stay synchronous so taint lands before awaits. */
+function wireToolEventHandlers(
+	pi: ExtensionAPI,
+	state: SessionState,
+	client: PiCodememClient,
+	config: PiExtensionConfig,
+	recall: RecallCorrelation,
+): void {
+	pi.on("session_start", () => recall.reset());
+	pi.on("session_shutdown", () => recall.reset());
+	pi.on("tool_execution_start", (event) => recall.noteStart(event));
+	pi.on("tool_execution_end", (event) => recall.noteEnd(event.toolCallId));
+	pi.on("turn_end", () => recall.settle());
+	pi.on("agent_settled", () => recall.settle());
+	pi.on("tool_call", (event, ctx) => onToolCall(state, client, pi, event, ctx));
+	pi.on("tool_result", (event, ctx) => onToolResult(state, client, config, recall, pi, event, ctx));
+}
+
 /**
  * Extension factory. Default export required by pi package loader.
  */
@@ -491,6 +516,7 @@ export default function codememPiExtension(pi: ExtensionAPI): void {
 	const config: PiExtensionConfig = loadPiExtensionConfig();
 	const runtime: ViewerRuntime = createViewerRuntime();
 	const state = createSessionState();
+	const recall = new RecallCorrelation();
 	const client = new PiCodememClient(config, runtime, {
 		cwd: state.cwd,
 		project: state.project,
@@ -525,13 +551,12 @@ export default function codememPiExtension(pi: ExtensionAPI): void {
 	pi.on("session_shutdown", (event, ctx) =>
 		onSessionShutdown(state, client, runtime, pi, event, ctx),
 	);
+	pi.on("agent_settled", () => injector.clearCompaction());
+	wireToolEventHandlers(pi, state, client, config, recall);
 	pi.on("message_end", (event, ctx) => onMessageEnd(state, client, injector, pi, event, ctx));
-	pi.on("tool_call", (event, ctx) => onToolCall(state, client, pi, event, ctx));
-	pi.on("tool_result", (event, ctx) => onToolResult(state, client, config, pi, event, ctx));
 	pi.on("session_before_compact", (event, ctx) => onBeforeCompact(state, client, pi, event, ctx));
 	pi.on("session_compact", (event) => onSessionCompact(injector, event));
 	pi.on("session_compact_failed", () => onSessionCompactFailed(injector));
-	pi.on("agent_settled", () => injector.clearCompaction());
 	pi.on("context", (event, ctx) => onContext(injector, config, event, ctx));
 }
 
