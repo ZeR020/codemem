@@ -8,7 +8,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-export type PiToolsMode = "native" | "mcp-adapter";
+export type PiToolsMode = "native" | "mcp-adapter" | "mcp";
 
 export type PiExtensionConfig = {
 	toolsMode: PiToolsMode;
@@ -158,9 +158,11 @@ function resolveToolsMode(fileValue: unknown, envValue: string | undefined): PiT
 	const env = envValue?.trim().toLowerCase();
 	if (env === "mcp-adapter" || env === "mcp_adapter" || env === "adapter") return "mcp-adapter";
 	if (env === "native") return "native";
+	if (env === "mcp") return "mcp";
 	const file =
 		typeof fileValue === "string" ? fileValue.trim().toLowerCase().replace(/_/g, "-") : "";
 	if (file === "mcp-adapter" || file === "adapter") return "mcp-adapter";
+	if (file === "mcp") return "mcp";
 	return "native";
 }
 
