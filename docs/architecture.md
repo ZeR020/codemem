@@ -70,6 +70,8 @@ Support tiers describe operational expectations for each adapter path:
 | Windsurf integration | Experimental | Planned via shared adapter contract after OpenCode/Claude stabilization. |
 | Cursor integration | Experimental | Planned via shared adapter contract after OpenCode/Claude stabilization. |
 
+Pi also supports explicit `pi.tools_mode: "mcp"`: session-start registration hands the existing `codemem mcp` server to Pi with codemode exposure, session cwd, resolved database, inherited identity/configuration and the resolved session project (`CODEMEM_PROJECT`). Pi owns connection/reconnection/shutdown; the extension re-registers only on target changes and never falls back to direct tools on registration failure. Native remains the absent/empty and fresh-setup default; both MCP modes register zero direct tools. User disable/exposure settings and same-name file entries retain Pi's precedence. See [MCP opt-in and precedence](plugin-reference.md#mcp-opt-in-and-precedence).
+
 Rollout sequencing:
 
 1. Stabilize adapter schema + queue/flush reliability.

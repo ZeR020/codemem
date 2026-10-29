@@ -335,6 +335,21 @@ Restart Pi. Setup honors `PI_CODING_AGENT_DIR`. A fresh setup adds `npm:@codemem
 
 `--pi-mcp` is optional and legacy. It configures the third-party `pi-mcp-adapter` surface when that adapter is detected: it keeps an existing codemem MCP entry unless `--force` is supplied, and sets `pi.tools_mode` to `mcp-adapter`. It does not configure Pi's native MCP. Without the adapter, setup writes nothing MCP-related. `--pi-extension-path <path>` writes a local `packages` entry instead of the npm pin (dev).
 
+### MCP opt-in and precedence
+
+Set `"pi": { "tools_mode": "mcp" }` in codemem config (or `CODEMEM_PI_TOOLS_MODE=mcp`) and reload Pi. Absent/empty mode still selects `native`; fresh setup still writes `native`, and explicit `native`, `mcp` and `mcp-adapter` choices are preserved. `--pi-mcp` remains the legacy adapter setup flag.
+
+In explicit `mcp`, the extension calls Pi's `registerMcpServer("codemem", …)` with codemode exposure. Pi owns stdio discovery, reconnect and shutdown. Codemode scripts discover the 15 underlying tools with `searchTools()` under `mcp__codemem`; they are not 15 direct model declarations. Native mode registers 15 direct tools; both MCP modes register none directly. Ingest, injection and recall-feedback exclusion are unchanged.
+
+The handoff uses the session cwd, the existing resolved database target, and `CODEMEM_PROJECT` from the same project resolution as ingest. Other environment-derived configuration and identity are inherited, including the distinction between absent, empty and populated `CODEMEM_ACTOR_ID`. Registration changes only when its effective target changes, not each turn.
+
+- A same-name user `mcp.json` entry wins over the extension registration. Use it for Pi's `enabled: false`, `exposure` and `toolExposure` controls; the extension does not edit that file.
+- A third-party adapter registering `/mcp` displaces Pi's built-in MCP. Remove or disable the adapter to use built-in delivery; otherwise keep the explicit `mcp-adapter` mode.
+- `--no-mcp`, tool exclusions and `autoEnableCodemode: false` remain user choices. Codemem does not force codemode, `defaultTools` or exposure overrides.
+- Inspect Pi's `/mcp` diagnostics for precedence and connection failures. Registration failures name a remedy and never silently register direct tools. Explicitly select `native` and reload for rollback.
+
+No custom transport or automatic collision detector is added; independently configured tool surfaces remain user-owned.
+
 Uninstall: remove the `@codemem/pi-extension` packages entry and restart Pi. The shared store is left intact. Hidden `pi-hook-*` commands are adapter plumbing, not setup steps.
 
 ### Surfaces
@@ -364,8 +379,8 @@ Session search covers the Pi conversation text codemem ingests (user/assistant t
 
 - `codemem pi-session-search <query>` searches stored Pi sessions. Flags: `--project <project>`, `--session-id <id>`, `--limit <n>` (1–20, default 10), `--snippet-chars <n>` (100–4000, default 1200), `--json`, `-d/--db-path`.
 - `codemem pi-import-sessions` backfills `~/.pi/agent/sessions/**/*.jsonl` (honors `PI_CODING_AGENT_DIR`) into the raw-event store. Deterministic event ids dedupe against live capture; size/mtime-unchanged files are skipped per destination database. Unsafe partial overlap is reported per file without rewriting stored history; use a separate destination database for a complete import. `--extract` (off by default, observer-model cost scales with backlog) drains pending Pi sessions through the standard sweeper flush so extracted memories carry Pi attribution. Without it, the command stores searchable events without running extraction, though a running viewer's sweeper can still pick them up like any other backlog.
-- The pi extension's native `memory_session_search` exists only in native tools mode (its `mcp-adapter` mode registers no native tools); it calls `GET /api/pi/sessions/search` and falls back to `codemem pi-session-search --json` when the viewer is unavailable. Both transports default to the current Pi project; a non-blank `project` argument overrides it. The manually invoked CLI and direct viewer route remain unscoped when no project filter is supplied.
-- The codemem MCP server registers its own `memory_session_search`, so MCP-connected surfaces — including the `mcp-adapter` path — get the same search additively. It runs `searchPiSessions` against its own store in-process (no HTTP or CLI round trip) with the same parameters, bounds, response shape, and raw-transcript-only privacy. An omitted `project` resolves lazily per call from `CODEMEM_PROJECT` or the server's working directory; an explicit `project` overrides it, and `session_id` only narrows within that effective project.
+- The pi extension's native `memory_session_search` exists only in native tools mode (its `mcp` and `mcp-adapter` modes register no native tools); it calls `GET /api/pi/sessions/search` and falls back to `codemem pi-session-search --json` when the viewer is unavailable. Both transports default to the current Pi project; a non-blank `project` argument overrides it. The manually invoked CLI and direct viewer route remain unscoped when no project filter is supplied.
+- The codemem MCP server registers its own `memory_session_search`, so MCP-connected surfaces — including explicit `mcp` and `mcp-adapter` paths — get the same search additively. It runs `searchPiSessions` against its own store in-process (no HTTP or CLI round trip) with the same parameters, bounds, response shape, and raw-transcript-only privacy. An omitted `project` resolves lazily per call from `CODEMEM_PROJECT` or the server's working directory; an explicit `project` overrides it, and `session_id` only narrows within that effective project.
 
 Import `--json` preserves the top-level import counters and adds `extraction: {requested, flushedEvents, failedSessions, pendingSessions, error}`. `failedSessions` counts flush errors during this run; `pendingSessions` counts the remaining Pi backlog, or is `null` when extraction was not requested. `error` contains the first observer-initialization or session-flush error, or `null`. Extraction snapshots only Pi pending streams and attempts each once, so older non-Pi streams and failed sessions cannot hide later Pi history. Initialization failure, session failure, or remaining Pi backlog exits with code 1 in both output modes; JSON also includes `error: "pi_extraction_incomplete"` and `message`. Successfully imported events remain stored, and failed batches retain the standard sweeper retry behavior.
 

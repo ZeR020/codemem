@@ -1,4 +1,4 @@
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -52,5 +52,48 @@ describe("loadPiExtensionConfig", () => {
 		expect(cfg.toolsMode).toBe("mcp-adapter");
 		expect(cfg.injectLimit).toBe(3);
 		expect(cfg.injectPrompts).toBe(true);
+	});
+
+	it("selects explicit mcp while absent, empty, and invalid stay native", () => {
+		const path = join(mkdtempSync(join(tmpdir(), "codemem-pi-mode-")), "config.json");
+		process.env.CODEMEM_CONFIG = path;
+		delete process.env.CODEMEM_PI_TOOLS_MODE;
+		const writeMode = (value: unknown) =>
+			writeFileSync(path, JSON.stringify({ pi: { tools_mode: value } }));
+		const mode = () => loadPiExtensionConfig(process.env).toolsMode;
+
+		writeMode("mcp");
+		expect(mode()).toBe("mcp");
+		expect(readFileSync(path, "utf8")).toBe(JSON.stringify({ pi: { tools_mode: "mcp" } }));
+		writeMode(" MCP ");
+		expect(mode()).toBe("mcp");
+		writeMode("");
+		expect(mode()).toBe("native");
+		writeMode("bogus");
+		expect(mode()).toBe("native");
+		expect(readFileSync(path, "utf8")).toContain("bogus");
+		writeMode(null);
+		expect(mode()).toBe("native");
+		writeMode(5);
+		expect(mode()).toBe("native");
+		writeFileSync(path, JSON.stringify({ pi: {} }));
+		expect(mode()).toBe("native");
+
+		process.env.CODEMEM_PI_TOOLS_MODE = "mcp";
+		writeMode("");
+		expect(mode()).toBe("mcp");
+		delete process.env.CODEMEM_PI_TOOLS_MODE;
+		writeMode("native");
+		expect(mode()).toBe("native");
+		process.env.CODEMEM_PI_TOOLS_MODE = "mcp";
+		writeMode("mcp-adapter");
+		expect(mode()).toBe("mcp");
+		process.env.CODEMEM_PI_TOOLS_MODE = "bogus";
+		writeMode("mcp");
+		expect(mode()).toBe("mcp");
+		process.env.CODEMEM_PI_TOOLS_MODE = "native";
+		writeMode("mcp");
+		expect(mode()).toBe("native");
+		expect(defaultPiExtensionConfig().toolsMode).toBe("native");
 	});
 });
