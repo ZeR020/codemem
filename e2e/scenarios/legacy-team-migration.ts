@@ -858,12 +858,13 @@ export async function runLegacyTeamMigrationScenario(ctx: ScenarioContext): Prom
 		typeof sharedDevice?.existingIdentityRef === "string",
 		"Shared Device did not report a reusable existing assignment",
 	);
+	// Another device's label is retained for explicit confirmation, never pre-filled as a suggestion.
 	assert(
 		sharedDevice?.verifiedEvidenceKind === "active_assignment" &&
-			sharedDevice.existingIdentityRef !== null &&
-			sharedDevice.suggestedIdentityRef === sharedDevice.existingIdentityRef &&
-			sharedDevice.expectation.kind === "existing",
-		"Shared Device assignment was not reused across Team drafts",
+			sharedDevice.suggestedIdentityRef === null &&
+			sharedDevice.expectation.kind === "existing" &&
+			sharedDevice.expectation.identityRef === sharedDevice.existingIdentityRef,
+		"Shared Device existing assignment was not retained for explicit confirmation",
 	);
 	await assignDevice(ctx, beta, "Shared Device", "Shared Person", "included", "28-beta-shared");
 	await assignDevice(
