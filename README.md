@@ -24,7 +24,7 @@ codemem is persistent coding memory across sessions, machines, and teammates for
 - **Automatic injection for OpenCode 1 and 2** — the plugin injects context into every prompt, no manual steps; the OpenCode 2 integration is beta
 - **Claude Code plugin support** — install from the codemem marketplace source
 - **Multi-agent** — OpenCode, Claude Code, Codex, and pi share one project-scoped store
-- **Pi coding agent** — session capture, automatic recall, and 15 native memory tools including `memory_session_search`, which the codemem MCP server also exposes; no MCP required for Pi
+- **Pi coding agent** — session capture, automatic recall, and 15 memory tools through Pi's built-in MCP and codemode by default; explicit native tools remain available
 - **Built-in viewer** — browse memories, sessions, and observer output in a local web UI
 - **Remote MCP access** — advanced single-user self-hosting can expose an OAuth-protected Streamable HTTP MCP endpoint to configured remote clients; keep the localhost viewer private ([guide](docs/remote-mcp-oauth.md))
 
@@ -269,9 +269,9 @@ codemem stats
 codemem db raw-events-status
 ```
 
-The extension captures Pi activity, recalls into the latest user message of the request copy, attaches context after a successful built-in `read`, and registers 15 native `memory_*` tools by default, including `memory_session_search` over stored Pi conversation text, scoped to the current project unless explicitly overridden. MCP is not required. The codemem MCP server also registers `memory_session_search` over the same stored user/assistant text for MCP-connected clients. Observer setup can fill unset settings from Pi API-key providers only. Pi OAuth-only credentials cannot be auto-derived for the observer; configure an observer connection separately ([observer auth](docs/user-guide.md#observer-auth-configuration)).
+The extension captures Pi activity, recalls into the latest user message of the request copy, attaches context after a successful built-in `read`, and delivers all 15 `memory_*` tools through Pi's built-in MCP with codemode exposure by default. This includes `memory_session_search` over stored Pi user/assistant conversation text, scoped to the current project unless explicitly overridden. No adapter or `mcp.json` is needed. Observer setup can fill unset settings from Pi API-key providers only. Pi OAuth-only credentials cannot be auto-derived for the observer; configure an observer connection separately ([observer auth](docs/user-guide.md#observer-auth-configuration)).
 
-To opt into Pi's built-in MCP and codemode instead, set `"pi": { "tools_mode": "mcp" }` in your codemem config and reload Pi. The default and fresh setup remain `native`; `--pi-mcp` still selects the separate legacy adapter path. See [MCP opt-in and precedence](docs/plugin-reference.md#mcp-opt-in-and-precedence).
+Fresh setup writes `pi.tools_mode: "mcp"`; an absent or empty mode also selects `mcp`. Existing setups pinned to `native` stay native: setup does not migrate explicit choices. To switch, set `"pi": { "tools_mode": "mcp" }` in codemem config and reload Pi; set `"native"` to roll back to 15 direct tools. `--pi-mcp` still selects the separate legacy adapter path. See [MCP default and precedence](docs/plugin-reference.md#mcp-default-and-precedence).
 
 Pre-install Pi session history is not imported automatically. Backfill it with `codemem pi-import-sessions`, then search stored user/assistant text with `codemem pi-session-search <query>`.
 
@@ -429,7 +429,7 @@ codemem setup --opencode-only
 
 This updates your OpenCode config to install the plugin and register the MCP server. Restart OpenCode to activate.
 
-Pi registers the same memory tools natively by default and does not need MCP. MCP-connected clients also get `memory_session_search`, which searches stored Pi user/assistant transcript text (not memories, metadata, or tool payloads) with the same query bounds as the CLI and viewer route. See [Pi extension](docs/plugin-reference.md#pi-extension).
+Pi uses this same MCP server through its extension-managed default, with codemode exposure; explicit `native` keeps direct tools. `memory_session_search` searches stored Pi user/assistant transcript text (not memories, metadata, or tool payloads) with the same query bounds as the CLI and viewer route. This raw-transcript search is distinct from visibility-filtered memory retrieval. See [Pi extension](docs/plugin-reference.md#pi-extension).
 
 The standalone `codemem-mcp-ts` binary runs the same stdio server used by `codemem mcp`. Viewer autostart is on by default for both invocation paths; set `CODEMEM_VIEWER=0` or `CODEMEM_VIEWER_AUTO=0` to disable. MCP autostart and the `serve start`/`stop`/`restart` lifecycle identify a running viewer through `GET /api/health` (service discriminator `codemem-viewer`), with one bounded `GET /api/stats` compatibility probe when an older viewer returns `404`.
 
@@ -447,7 +447,7 @@ Environment variables still override file values once a config file has been sel
 
 Claude `Read` hooks look up file context through the local Viewer after checking the file path and size. Healthy and empty HTTP results start no CLI child; unavailable transport uses a capability-checked CLI or an exact plugin-version-pinned fallback within one deadline. See [Claude integration](docs/plugin-reference.md#claude-marketplace-install) for delivery tracking and timeout details.
 
-Pi prompt recall, file context, and the native tool surface are documented in [Pi extension](docs/plugin-reference.md#pi-extension).
+Pi prompt recall, file context, and the MCP and explicit native tool surfaces are documented in [Pi extension](docs/plugin-reference.md#pi-extension).
 
 Codemem config mutations use a same-directory lock and atomic replacement. Concurrent Codemem writers fail with a retryable conflict instead of silently losing an update; malformed or unreadable existing config is left unchanged. External editors do not participate in the lock, so Codemem checks that the file has not changed again immediately before replacement. Existing mode, owner, and group metadata is retained on POSIX systems. Atomic replacement also retains ACLs and extended attributes on macOS and on GNU/Linux systems whose `/bin/cp` supports explicit metadata preservation; a metadata-copy failure on those systems aborts the save before rename. Windows, non-GNU Linux, and other platforms retain the existing mode behavior, but Node does not provide a portable API for preserving their extended ACL metadata.
 

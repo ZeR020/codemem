@@ -128,6 +128,13 @@ describe("extension factory lifecycle", () => {
 		for (const name of expectedEvents) {
 			expect(handlers.has(name), `missing handler for ${name}`).toBe(true);
 		}
+		// Default `mcp`: the server is registered at session_start, so no direct tools.
+		expect(tools).toHaveLength(0);
+	});
+	it("registers the 15 direct tools only when native is pinned", () => {
+		vi.stubEnv("CODEMEM_PI_TOOLS_MODE", "native");
+		const { pi, tools } = createMockPi();
+		codememPiExtension(pi as never);
 		expect(tools.map((t) => t.name).toSorted()).toEqual(expectedToolNames().toSorted());
 	});
 	it("skips native tools when tools_mode is mcp-adapter", () => {
@@ -993,6 +1000,7 @@ describe("memory_search git-root project", () => {
 
 	it("memory_search tool scopes to the git-root project from a nested cwd", async () => {
 		vi.stubEnv("CODEMEM_PROJECT", "");
+		vi.stubEnv("CODEMEM_PI_TOOLS_MODE", "native");
 		const tmpDir = mkdtempSync(join(tmpdir(), "codemem-pi-tool-scope-"));
 		const repoRoot = join(tmpDir, "scoped-repo");
 		const nested = join(repoRoot, "packages", "core");
@@ -1037,9 +1045,9 @@ describe("memory_search git-root project", () => {
 });
 
 describe("config defaults", () => {
-	it("default config is native tools + inject + file_context", () => {
+	it("default config is mcp tools + inject + file_context", () => {
 		const cfg: PiExtensionConfig = defaultPiExtensionConfig();
-		expect(cfg.toolsMode).toBe("native");
+		expect(cfg.toolsMode).toBe("mcp");
 		expect(cfg.injectPrompts).toBe(true);
 		expect(cfg.fileContext).toBe(true);
 		expect(cfg.viewerPort).toBe(38888);

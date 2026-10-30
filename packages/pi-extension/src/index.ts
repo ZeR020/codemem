@@ -559,7 +559,7 @@ export default function codememPiExtension(pi: ExtensionAPI): void {
 		},
 	});
 
-	// Native tools only when not in mcp-adapter mode (D6).
+	// MCP modes leave tool delivery to Pi or the adapter.
 	if (config.toolsMode === "native") {
 		registerMemoryTools(pi, client);
 	}
