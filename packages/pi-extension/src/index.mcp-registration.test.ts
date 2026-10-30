@@ -296,3 +296,29 @@ describe("mcp-mode hook continuity", () => {
 		expect(JSON.stringify(harness.captured)).not.toContain("RECALLED");
 	});
 });
+
+describe("default surface", () => {
+	it("registers codemem at session_start when no tools mode is configured", async () => {
+		delete process.env.CODEMEM_PI_TOOLS_MODE;
+		const harness = createHarness();
+		const cwd = makeTarget("default-target");
+
+		expect(harness.tools).toEqual([]);
+		await emit(harness, "session_start", { reason: "startup" }, sessionCtx(cwd));
+
+		expect(harness.registrations).toHaveLength(1);
+		expect(harness.registrations[0]?.config.exposure).toBe("codemode");
+	});
+
+	it("reports the missing registration API with no direct-tool fallback by default", async () => {
+		delete process.env.CODEMEM_PI_TOOLS_MODE;
+		const harness = createHarness(false);
+		const ctx = sessionCtx(makeTarget("default-no-api"));
+		ctx.ui.notify = (message: string) => harness.notices.push(message);
+
+		await emit(harness, "session_start", { reason: "startup" }, ctx);
+
+		expect(harness.tools).toEqual([]);
+		expect(harness.notices.join("\n")).toContain("no MCP registration API");
+	});
+});

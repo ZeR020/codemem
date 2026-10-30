@@ -1,4 +1,4 @@
-// Explicit `mcp` mode: Pi owns the transport; we hand it the session target (env is template-parsed once).
+// Default or explicit `mcp`: Pi owns transport; we hand it the session target (env is template-parsed once).
 
 import { resolve } from "node:path";
 import type { ExtensionAPI, McpServerConfig } from "@earendil-works/pi-coding-agent";

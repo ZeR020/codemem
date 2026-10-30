@@ -210,7 +210,7 @@ describe("buildPiExtensionPackageSpec / isPiExtensionPackageEntry", () => {
 });
 
 describe("installPi — fresh install", () => {
-	it("appends the packages entry, sets pi.tools_mode native, and derives observer_* (no secrets)", () => {
+	it("appends the packages entry, sets pi.tools_mode mcp, and derives observer_* (no secrets)", () => {
 		seedPiApiKeyInstall(piHome);
 
 		expect(installPi({ force: false })).toBe(true);
@@ -231,7 +231,7 @@ describe("installPi — fresh install", () => {
 		expect(config).not.toHaveProperty("observer_openai_use_responses");
 		expect(config).not.toHaveProperty("observer_api_key");
 		expect(JSON.stringify(config)).not.toContain(FIXTURE_KEY);
-		expect(config.pi).toEqual({ tools_mode: "native" });
+		expect(config.pi).toEqual({ tools_mode: "mcp" });
 
 		// Backup created for pre-existing settings.json.
 		expect(existsSync(join(piHome, "settings.json.codemem.bak"))).toBe(true);
@@ -363,7 +363,7 @@ describe("installPi — observer derivation", () => {
 		expect(config.observer_base_url).toBe("https://api.anthropic.com");
 		// Pre-set wire flag must not be flipped by pi derivation.
 		expect(config.observer_openai_use_responses).toBe(true);
-		expect(config.pi).toEqual({ tools_mode: "native" });
+		expect(config.pi).toEqual({ tools_mode: "mcp" });
 	});
 
 	it("does not persist official OpenAI Responses defaults as custom-gateway flags", () => {
@@ -554,7 +554,7 @@ describe("installPi — --pi-mcp opt-in", () => {
 		expect(installPi({ force: false, piMcp: false })).toBe(true);
 		expect(existsSync(join(piHome, "mcp.json"))).toBe(false);
 		const config = readJson(configPath);
-		expect(config.pi).toEqual({ tools_mode: "native" });
+		expect(config.pi).toEqual({ tools_mode: "mcp" });
 	});
 
 	it("with --pi-mcp and adapter present: writes mcp.json and sets tools_mode mcp-adapter", () => {
@@ -577,7 +577,7 @@ describe("installPi — --pi-mcp opt-in", () => {
 		expect(config.pi).toEqual({ tools_mode: "mcp-adapter" });
 	});
 
-	it("with --pi-mcp and adapter absent: writes nothing MCP-related, stays native, and explains the prerequisite", () => {
+	it("with --pi-mcp and adapter absent: writes nothing MCP-related, keeps the mcp default, and explains the legacy prerequisite", () => {
 		writeJson(join(piHome, "settings.json"), { packages: [] });
 		const warns: string[] = [];
 		const spy = vi.spyOn(p.log, "warn").mockImplementation((msg: string) => {
@@ -589,8 +589,9 @@ describe("installPi — --pi-mcp opt-in", () => {
 		spy.mockRestore();
 		expect(existsSync(join(piHome, "mcp.json"))).toBe(false);
 		const config = readJson(configPath);
-		expect(config.pi).toEqual({ tools_mode: "native" });
+		expect(config.pi).toEqual({ tools_mode: "mcp" });
 		expect(warns.join("\n")).toMatch(/pi-mcp-adapter/i);
+		expect(warns.join("\n")).toMatch(/built-in MCP default needs no adapter/i);
 	});
 
 	it("detects the adapter via an extensions/ directory name", () => {
@@ -630,26 +631,46 @@ describe("installPi — --pi-mcp opt-in", () => {
 });
 
 describe("installPi — explicit tools mode is preserved", () => {
-	it.each(["native", "mcp-adapter", "mcp"] as const)(
-		"keeps an explicit %s mode and an unrelated mcp.json untouched",
-		(mode) => {
-			writeJson(join(piHome, "settings.json"), { packages: [] });
-			const mcp = {
-				mcpServers: {
-					codemem: { command: "npx", args: ["-y", "codemem", "mcp"] },
-					other: { command: "echo" },
-				},
-			};
-			writeJson(join(piHome, "mcp.json"), mcp);
-			writeJson(configPath, { pi: { tools_mode: mode, inject_prompts: false } });
+	it.each([
+		["tools_mode", "native"],
+		["tools_mode", "mcp-adapter"],
+		["tools_mode", "mcp"],
+		["toolsMode", "native"],
+		["toolsMode", "mcp-adapter"],
+		["toolsMode", "mcp"],
+	] as const)("keeps explicit %s=%s and an unrelated mcp.json untouched", (key, mode) => {
+		writeJson(join(piHome, "settings.json"), { packages: [] });
+		const mcp = {
+			mcpServers: {
+				codemem: { command: "npx", args: ["-y", "codemem", "mcp"] },
+				other: { command: "echo" },
+			},
+		};
+		writeJson(join(piHome, "mcp.json"), mcp);
+		const mcpBytes = readFileSync(join(piHome, "mcp.json"), "utf8");
+		writeJson(configPath, { pi: { [key]: mode, inject_prompts: false } });
 
-			expect(installPi({ force: false })).toBe(true);
-			expect(installPi({ force: false })).toBe(true);
+		expect(installPi({ force: false })).toBe(true);
+		expect(installPi({ force: false })).toBe(true);
 
-			expect(readJson(configPath).pi).toEqual({ tools_mode: mode, inject_prompts: false });
-			expect(readJson(join(piHome, "mcp.json"))).toEqual(mcp);
-		},
-	);
+		expect(readJson(configPath).pi).toEqual({ [key]: mode, inject_prompts: false });
+		expect(readJson(join(piHome, "mcp.json"))).toEqual(mcp);
+		expect(readFileSync(join(piHome, "mcp.json"), "utf8")).toBe(mcpBytes);
+	});
+
+	it.each([
+		{ stored: null, expected: null },
+		{ stored: "", expected: "mcp" },
+	])("retains snake/camel precedence for tools_mode=$stored", ({ stored, expected }) => {
+		writeJson(join(piHome, "settings.json"), { packages: [] });
+		writeJson(configPath, { pi: { tools_mode: stored, toolsMode: "native" } });
+
+		expect(installPi()).toBe(true);
+		expect(installPi()).toBe(true);
+
+		expect(readJson(configPath).pi).toEqual({ tools_mode: expected, toolsMode: "native" });
+		expect(existsSync(join(piHome, "mcp.json"))).toBe(false);
+	});
 });
 
 describe("installPi — parse failure abort", () => {

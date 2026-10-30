@@ -1015,7 +1015,7 @@ function isOfficialObserverBaseUrl(url: string): boolean {
 
 function nextPiToolsBlock(
 	existing: Record<string, unknown>,
-	toolsMode: "native" | "mcp-adapter",
+	toolsMode: "native" | "mcp-adapter" | "mcp",
 ): { piBlock: Record<string, unknown>; toolsModeUpdated: boolean } {
 	const existingPi =
 		existing.pi != null && typeof existing.pi === "object" && !Array.isArray(existing.pi)
@@ -1027,8 +1027,9 @@ function nextPiToolsBlock(
 		piBlock.tools_mode = "mcp-adapter";
 		return { piBlock, toolsModeUpdated: true };
 	}
-	if (piBlock.tools_mode == null || piBlock.tools_mode === "") {
-		piBlock.tools_mode = "native";
+	const existingMode = piBlock.tools_mode ?? piBlock.toolsMode;
+	if (existingMode == null || existingMode === "") {
+		piBlock.tools_mode = toolsMode;
 		return { piBlock, toolsModeUpdated: true };
 	}
 	return { piBlock, toolsModeUpdated: false };
@@ -1167,7 +1168,7 @@ function writeUpdatedCodememConfig(next: Record<string, unknown>, updated: strin
  * Derive unset observer_* keys from pi config and ensure pi.tools_mode default.
  * Never persists API keys or tokens from pi auth.
  */
-function wirePiCodememConfig(opts: { toolsMode: "native" | "mcp-adapter" }): boolean {
+function wirePiCodememConfig(opts: { toolsMode: "native" | "mcp-adapter" | "mcp" }): boolean {
 	let existing: Record<string, unknown>;
 	try {
 		existing = readCodememConfigFile();
@@ -1205,7 +1206,7 @@ function installPiMcp(
 	const adapterPresent = isPiMcpAdapterDetected(piDir);
 	if (!adapterPresent) {
 		p.log.warn(
-			"MCP in pi requires the pi-mcp-adapter package. Install it (e.g. `pi install npm:pi-mcp-adapter`), then re-run `codemem setup --pi-only --pi-mcp`.",
+			"The legacy pi MCP adapter surface requires the pi-mcp-adapter package. Install it (e.g. `pi install npm:pi-mcp-adapter`), then re-run `codemem setup --pi-only --pi-mcp`. Pi's built-in MCP default needs no adapter.",
 		);
 		return { ok: true, wrote: false, adapterPresent: false };
 	}
@@ -1278,7 +1279,7 @@ export function installPi(options: InstallPiOptions = {}): boolean {
 	}
 
 	let ok = true;
-	let toolsMode: "native" | "mcp-adapter" = "native";
+	let toolsMode: "native" | "mcp-adapter" | "mcp" = "mcp";
 	if (options.piMcp) {
 		const mcpResult = installPiMcp(piDir, force);
 		ok = mcpResult.ok && ok;
@@ -1295,7 +1296,9 @@ export function installPi(options: InstallPiOptions = {}): boolean {
 		p.log.info("Pi next steps:");
 		p.log.info("  - Start (or restart) pi to load the extension package");
 		if (!options.piMcp) {
-			p.log.info("  - Optional MCP surface: install pi-mcp-adapter, then re-run with --pi-mcp");
+			p.log.info(
+				"  - Optional legacy adapter surface: install pi-mcp-adapter, then re-run with --pi-mcp (the built-in MCP default needs no adapter)",
+			);
 		}
 		p.log.info(
 			"  - To disable: remove the @codemem/pi-extension entry from pi settings.json packages",

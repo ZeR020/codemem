@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import codememPiExtension, { __setTestExecImpl, defaultPiExtensionConfig } from "./index.js";
 
-/** Literal roster: the native default must stay exactly these 15 direct tools. */
+/** Literal roster: explicit native mode must stay exactly these 15 direct tools. */
 const NATIVE_TOOL_NAMES = [
 	"memory_distill_candidates",
 	"memory_expand",
@@ -60,8 +60,15 @@ describe("Pi host compatibility", () => {
 		expect(pkg.devDependencies["@earendil-works/pi-coding-agent"]).toBe("1.4.0");
 	});
 
-	it("registers the exact 15-tool native default", () => {
-		expect(defaultPiExtensionConfig().toolsMode).toBe("native");
+	it("defaults to the mcp surface with no direct tools", () => {
+		expect(defaultPiExtensionConfig().toolsMode).toBe("mcp");
+		const { pi, tools } = createMockPi();
+		codememPiExtension(pi as never);
+		expect(tools).toEqual([]);
+	});
+
+	it("registers the exact 15-tool native roster when native is pinned", () => {
+		process.env.CODEMEM_PI_TOOLS_MODE = "native";
 		const { pi, tools } = createMockPi();
 		codememPiExtension(pi as never);
 		expect(tools.map((tool) => tool.name).toSorted()).toEqual(NATIVE_TOOL_NAMES);
@@ -77,6 +84,7 @@ describe("Pi host compatibility", () => {
 
 	it("forwards the third execute argument (abort signal) to the CLI path", async () => {
 		process.env.CODEMEM_VIEWER = "0";
+		process.env.CODEMEM_PI_TOOLS_MODE = "native";
 		const execCalls: Array<{ args: string[]; signal?: AbortSignal }> = [];
 		__setTestExecImpl(async (args, opts) => {
 			execCalls.push({ args, signal: opts?.signal });
