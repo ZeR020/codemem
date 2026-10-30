@@ -54,7 +54,7 @@ describe("loadPiExtensionConfig", () => {
 		expect(cfg.injectPrompts).toBe(true);
 	});
 
-	it("selects explicit mcp while absent, empty, and invalid stay native", () => {
+	it("selects mcp for absent, empty, or nullish mode and native for unknown or invalid values", () => {
 		const path = join(mkdtempSync(join(tmpdir(), "codemem-pi-mode-")), "config.json");
 		process.env.CODEMEM_CONFIG = path;
 		delete process.env.CODEMEM_PI_TOOLS_MODE;
@@ -68,16 +68,25 @@ describe("loadPiExtensionConfig", () => {
 		writeMode(" MCP ");
 		expect(mode()).toBe("mcp");
 		writeMode("");
-		expect(mode()).toBe("native");
+		expect(mode()).toBe("mcp");
+		writeMode("   ");
+		expect(mode()).toBe("mcp");
 		writeMode("bogus");
 		expect(mode()).toBe("native");
 		expect(readFileSync(path, "utf8")).toContain("bogus");
 		writeMode(null);
-		expect(mode()).toBe("native");
+		expect(mode()).toBe("mcp");
 		writeMode(5);
 		expect(mode()).toBe("native");
 		writeFileSync(path, JSON.stringify({ pi: {} }));
+		expect(mode()).toBe("mcp");
+		// tools_mode ?? toolsMode: nullish falls through to the alias, a blank string does not.
+		writeFileSync(path, JSON.stringify({ pi: { tools_mode: null, toolsMode: "native" } }));
 		expect(mode()).toBe("native");
+		writeFileSync(path, JSON.stringify({ pi: { tools_mode: "", toolsMode: "native" } }));
+		expect(mode()).toBe("mcp");
+		writeFileSync(path, JSON.stringify({ pi: { toolsMode: "mcp-adapter" } }));
+		expect(mode()).toBe("mcp-adapter");
 
 		process.env.CODEMEM_PI_TOOLS_MODE = "mcp";
 		writeMode("");
@@ -94,6 +103,6 @@ describe("loadPiExtensionConfig", () => {
 		process.env.CODEMEM_PI_TOOLS_MODE = "native";
 		writeMode("mcp");
 		expect(mode()).toBe("native");
-		expect(defaultPiExtensionConfig().toolsMode).toBe("native");
+		expect(defaultPiExtensionConfig().toolsMode).toBe("mcp");
 	});
 });

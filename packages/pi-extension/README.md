@@ -29,7 +29,7 @@ Dev / local-path install (equivalent to `--pi-extension-path`):
 
 Build first so `dist/index.js` exists (`pnpm --filter @codemem/pi-extension build`).
 
-**Uninstall:** remove the `@codemem/pi-extension` packages entry and restart pi. The shared memory store is left intact.
+**Uninstall:** remove the `@codemem/pi-extension` packages entry and restart Pi. This disables its capture/injection hooks, direct tools and extension-owned MCP registration in that Pi instance. Stored memories remain intact; manual `mcp.json` entries remain user-owned and can still expose tools independently.
 
 ## What it does
 
@@ -37,7 +37,7 @@ Build first so `dist/index.js` exists (`pnpm --filter @codemem/pi-extension buil
 - **MCP recall safety** — excludes result/error bodies from the exact `mcp__codemem__memory_*` namespace and containing codemode aggregates in the ingest copy, without changing the result delivered to Pi or the model. See [Pi recall-feedback exclusion](https://github.com/kunickiaj/codemem/blob/main/docs/architecture.md#pi-recall-feedback-exclusion).
 - **Injection** — on pi's `context` event, appends a `## codemem memories` block to the latest user message of the **request copy** (never the system prompt, never the saved session). Older user messages replay the exact bytes already injected for them, and a new pack is fetched only for the latest undecided message, so the provider's prefix cache stays stable. Already-shown items are cut from new packs when the pack response carries renderer spans. A contract-valid HTTP or `pack --json` response, including a zero-item pack, ends that fetch; `{}` and error-shaped bodies fall through. Those span-bearing successes log `inject.pack.ok source=pi` to the plugin log, the same line `pi-hook-inject` writes when it is the fallback. Decisions live in memory: a restart fetches again.
 - **File context** — after a successful built-in `read`, related memories may be appended to that tool result. Failed reads and other tools are skipped.
-- **Tools** — registers the 15 `memory_*` tools natively (HTTP preferred, CLI fallback), including `memory_session_search` over stored Pi session text. Every HTTP operation first proves the viewer is target-aware (`GET /api/prompt-pack-profile` must report this process's `db_path` + `identity_target`) and re-sends the target on the query, so a foreign or stale older viewer on the port is never trusted (409 or unproven → targeted CLI path). Non-idempotent `memory_remember` does NOT CLI-replay on ambiguous HTTP failures (timeout/5xx/reset after send). No `pi-mcp-adapter` needed. Direct registration is skipped in `mcp` and `mcp-adapter` modes; the codemem MCP server still provides `memory_session_search` there, executing in-process against its own store with the same bounds and raw user/assistant-text privacy.
+- **Tools** — by default registers the existing `codemem mcp` server with Pi, exposing all 15 `memory_*` tools through codemode, including `memory_session_search`. No adapter or MCP file is required. Explicit `native` registers 15 direct tools (HTTP preferred, CLI fallback); explicit `mcp-adapter` leaves delivery to the legacy adapter. Native HTTP proves the viewer serves this process's database and identity before sending requests; an unproven/stale viewer or 409 falls back to the targeted CLI. Non-idempotent `memory_remember` does not replay ambiguous HTTP failures. MCP session search runs against the server's own store with the same bounds and raw user/assistant-text privacy; it is not visibility-filtered memory search.
 - **Compaction** — `session_before_compact` attempts a flush only and never returns a custom summary. `session_compact` skips one new fetch only when `willRetry` is set and `reason` is not `manual`. Failed compaction, `agent_settled`, manual compaction, and a later user message clear that skip. A threshold compact skips only if that same guard matches.
 - **Fork/resume** — re-keys stream identity on every `session_start`. Ingest cursor metadata persists via `pi.appendEntry` (`codemem.cursor`). Recall decisions stay in memory and are cleared on `session_start`; a restart refetches.
 - **Cross-agent** — one shared, project-scoped store. Memories from OpenCode/Claude/Codex inject into pi and the reverse.
@@ -55,7 +55,7 @@ Read from `CODEMEM_CONFIG` when set, otherwise `$XDG_CONFIG_HOME/codemem` or `~/
 
 | Key / env | Default | Meaning |
 | --- | --- | --- |
-| `pi.tools_mode` / `CODEMEM_PI_TOOLS_MODE` | `native` | `native`: 15 direct tools; `mcp`: Pi-managed MCP with codemode exposure; `mcp-adapter`: independently configured adapter |
+| `pi.tools_mode` / `CODEMEM_PI_TOOLS_MODE` | `mcp` | `mcp`: Pi-managed MCP with codemode exposure; `native`: 15 direct tools; `mcp-adapter`: independently configured adapter |
 | `pi.inject_prompts` / `CODEMEM_PI_INJECT_PROMPTS` | `true` | Attach the memory pack to the latest user message on each model request |
 | `pi.file_context` / `CODEMEM_PI_FILE_CONTEXT` | `true` | Append related memories to successful built-in read results when available |
 
@@ -79,20 +79,20 @@ Example config:
 ```json
 {
   "pi": {
-    "tools_mode": "native",
+    "tools_mode": "mcp",
     "inject_prompts": true,
     "file_context": true
   }
 }
 ```
 
-### Built-in MCP opt-in
+### Built-in MCP default and migration
 
-Set `pi.tools_mode` to `"mcp"` (or `CODEMEM_PI_TOOLS_MODE=mcp`) and reload Pi. Unset/empty mode still means `native`, and fresh setup still writes `native`; explicit choices are preserved. `--pi-mcp` remains the legacy adapter flag, not this opt-in.
+Absent/empty mode selects `mcp`, and fresh setup writes `mcp`. Older setups that recorded `native` remain native: setup preserves explicit `native`, `mcp` and `mcp-adapter` choices rather than automatically migrating them. Set `pi.tools_mode` to `"mcp"` (or `CODEMEM_PI_TOOLS_MODE=mcp`) and reload Pi to switch; set `"native"` and reload to roll back. The existing `toolsMode` alias is also preserved; `tools_mode` wins unless nullish. A recognized environment value overrides the file. `--pi-mcp` remains the legacy adapter flag, not a requirement for built-in MCP.
 
 In `mcp`, Pi starts `codemem mcp` with the session cwd, resolved database and project, and inherited environment/identity. All 15 tools, including session search, are discoverable through codemode's `searchTools()` without 15 direct model declarations. Ingest, injection and recall-feedback protection stay enabled. No `mcp.json` is created or edited.
 
-User controls still win: `--no-mcp`, tool exclusions and `autoEnableCodemode: false` are not overridden. A same-name `mcp.json` entry overrides the extension registration and can set `enabled`, `exposure` or `toolExposure`. An adapter owning `/mcp` displaces built-in MCP; remove/disable it to use built-in delivery. Check Pi's `/mcp` diagnostics and [precedence guidance](https://github.com/kunickiaj/codemem/blob/main/docs/plugin-reference.md#mcp-opt-in-and-precedence). Registration errors never silently enable direct tools; fix the reported cause or explicitly select `native` and reload.
+User controls still win: `--no-mcp`, tool exclusions and `autoEnableCodemode: false` are not overridden. A same-name `mcp.json` entry overrides the extension registration and can set `enabled`, `exposure` or `toolExposure`. An adapter owning `/mcp` displaces built-in MCP; remove/disable it to use built-in delivery. Check Pi's `/mcp` diagnostics and [precedence guidance](https://github.com/kunickiaj/codemem/blob/main/docs/plugin-reference.md#mcp-default-and-precedence). Registration errors never silently enable direct tools; fix the reported cause or explicitly select `native` and reload.
 
 ## Lifecycle
 
