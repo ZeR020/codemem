@@ -226,8 +226,13 @@ host-compatibility change from the previous `>=0.84.1 <1` peer: Pi 0.x hosts
 must upgrade before installing. `pi update` replaces the Pi host;
 `pi update --extensions` only reconciles installed packages. A Nix installation
 cannot update itself with `pi update`; use the official installer flow or
-`nix profile upgrade pi`. Native tools stay the setup default with 15 `memory_*`
-tools, and the explicit `native` and `mcp-adapter` modes are unchanged.
+`nix profile upgrade pi`. Absent/empty tool mode and fresh setup now select
+Pi's built-in MCP with codemode exposure for all 15 `memory_*` tools. No adapter
+or setup-managed MCP file is needed. Older setup-pinned `native` users stay
+native; explicit `native` and `mcp-adapter` choices are preserved. Set
+`pi.tools_mode` to `"mcp"` to switch, or `"native"` to roll back, then reload Pi.
+Stored memories require no migration; manual MCP configuration remains user-owned.
+See [MCP migration and precedence](plugin-reference.md#mcp-default-and-precedence).
 
 ## Transition notes
 

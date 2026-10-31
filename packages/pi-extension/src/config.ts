@@ -27,7 +27,7 @@ export type PiExtensionConfig = {
 };
 
 const DEFAULTS: PiExtensionConfig = {
-	toolsMode: "native",
+	toolsMode: "mcp",
 	injectPrompts: true,
 	fileContext: true,
 	viewerHost: "127.0.0.1",
@@ -162,7 +162,11 @@ function resolveToolsMode(fileValue: unknown, envValue: string | undefined): PiT
 	const file =
 		typeof fileValue === "string" ? fileValue.trim().toLowerCase().replace(/_/g, "-") : "";
 	if (file === "mcp-adapter" || file === "adapter") return "mcp-adapter";
+	if (file === "native") return "native";
 	if (file === "mcp") return "mcp";
+	// Absent/blank selects the default surface; unknown or invalid values keep the legacy native fallback.
+	const unset = fileValue == null || (typeof fileValue === "string" && file === "");
+	if (unset) return DEFAULTS.toolsMode;
 	return "native";
 }
 
