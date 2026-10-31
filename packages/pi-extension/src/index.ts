@@ -43,6 +43,7 @@ import {
 } from "./client.js";
 import { loadPiExtensionConfig, type PiExtensionConfig } from "./config.js";
 import { createPiInjector, type PiContextMessage, type PiInjector } from "./inject.js";
+import { type CodememMcpRegistrar, createCodememMcpRegistrar } from "./mcp-registration.js";
 import {
 	buildBeforeCompactPayload,
 	buildMessageEndPayload,
@@ -216,7 +217,7 @@ function warnDuplicateToolSurface(ctx: ExtensionContext, cwd: string): void {
 		const hit = candidates.some((p) => mcpJsonHasCodememEntry(p));
 		if (!hit) return;
 		const msg =
-			'codemem: both native tools and an mcp.json codemem entry are present. Pick one surface: set pi.tools_mode to "mcp-adapter" (or CODEMEM_PI_TOOLS_MODE=mcp-adapter) to use MCP only, or remove the codemem entry from mcp.json to keep native tools.';
+			'codemem: both native tools and an mcp.json codemem entry are present. Pick one surface: set pi.tools_mode to "mcp" (extension-managed server) or "mcp-adapter" (adapter) to use MCP only, or remove the codemem entry from mcp.json to keep native tools.';
 		try {
 			const ui = (ctx as { ui?: { notify?: (m: string) => void } }).ui;
 			if (ui && typeof ui.notify === "function") {
@@ -230,6 +231,23 @@ function warnDuplicateToolSurface(ctx: ExtensionContext, cwd: string): void {
 	} catch {
 		// best-effort; never break session_start
 	}
+}
+
+/** Register the explicit mcp surface; failures are reported, never replaced by direct tools. */
+function onSessionStartMcp(register: CodememMcpRegistrar, ctx: ExtensionContext): void {
+	const cwd = ctx.cwd || process.cwd();
+	const error = register({ cwd, project: resolveProject(cwd) });
+	if (!error) return;
+	try {
+		const ui = (ctx as { ui?: { notify?: (m: string) => void } }).ui;
+		if (ui && typeof ui.notify === "function") {
+			ui.notify(error);
+			return;
+		}
+	} catch {
+		// fall through to console
+	}
+	console.warn(error);
 }
 
 function resolveProject(cwd: string, envProject?: string | null): string | null {
@@ -517,6 +535,7 @@ export default function codememPiExtension(pi: ExtensionAPI): void {
 	const runtime: ViewerRuntime = createViewerRuntime();
 	const state = createSessionState();
 	const recall = new RecallCorrelation();
+	const mcpRegistrar = createCodememMcpRegistrar(pi, config.toolsMode);
 	const client = new PiCodememClient(config, runtime, {
 		cwd: state.cwd,
 		project: state.project,
@@ -548,6 +567,7 @@ export default function codememPiExtension(pi: ExtensionAPI): void {
 	pi.on("session_start", (event, ctx) =>
 		onSessionStart(state, client, config, injector, pi, event, ctx),
 	);
+	pi.on("session_start", (_event, ctx) => onSessionStartMcp(mcpRegistrar, ctx));
 	pi.on("session_shutdown", (event, ctx) =>
 		onSessionShutdown(state, client, runtime, pi, event, ctx),
 	);

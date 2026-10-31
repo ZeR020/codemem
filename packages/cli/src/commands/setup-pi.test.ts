@@ -629,6 +629,29 @@ describe("installPi — --pi-mcp opt-in", () => {
 	});
 });
 
+describe("installPi — explicit tools mode is preserved", () => {
+	it.each(["native", "mcp-adapter", "mcp"] as const)(
+		"keeps an explicit %s mode and an unrelated mcp.json untouched",
+		(mode) => {
+			writeJson(join(piHome, "settings.json"), { packages: [] });
+			const mcp = {
+				mcpServers: {
+					codemem: { command: "npx", args: ["-y", "codemem", "mcp"] },
+					other: { command: "echo" },
+				},
+			};
+			writeJson(join(piHome, "mcp.json"), mcp);
+			writeJson(configPath, { pi: { tools_mode: mode, inject_prompts: false } });
+
+			expect(installPi({ force: false })).toBe(true);
+			expect(installPi({ force: false })).toBe(true);
+
+			expect(readJson(configPath).pi).toEqual({ tools_mode: mode, inject_prompts: false });
+			expect(readJson(join(piHome, "mcp.json"))).toEqual(mcp);
+		},
+	);
+});
+
 describe("installPi — parse failure abort", () => {
 	it("returns false and does not clobber an unparseable settings.json", () => {
 		const broken = "{ this is not valid json ";
