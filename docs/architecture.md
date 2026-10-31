@@ -309,6 +309,14 @@ Decisions clear on `session_start`. Ingest cursors are separate `codemem.cursor`
 
 Pack transport is profile-proof, then `POST /api/pack`, then `codemem pack --json`, then `pi-hook-inject`. The HTTP pack attempt times out at 2 seconds. `@codemem/core` is not loaded in the Pi process.
 
+### Pi recall-feedback exclusion
+
+At the Pi ingest boundary, exactly `mcp__codemem__memory_*` tool names become `codemem_memory_*` so the unchanged shared internal-tool matcher excludes them from extraction. Their result and error bodies are omitted from the ingest copy; the original Pi/model-visible result is untouched. Foreign-server names and prefix lookalikes keep their existing behavior. This does not change Pi's native default or add an MCP tools mode.
+
+A Pi-local graph retains at most 256 call nodes, following immediate `parentToolCallId` links from execution start. Recall taints containing ancestors; completed nodes remain until their outstanding descendants finish. Tainted aggregate result/error bodies are omitted while lifecycle metadata and unrelated child results remain available. At capacity, overflow stays closed for codemode results and retained known aggregates until a safe reset; the graph is never cleared to admit recalled content. Turn-end and settled boundaries defer resets while observed executions are outstanding; session replacement resets the graph. This is not a parser or a universal guarantee for arbitrary untracked non-codemode wrappers.
+
+Successful literal built-in `read` enrichment still appends file context and now returns the original `structuredContent` unchanged alongside the enriched content. Error reads and other tool names retain their existing behavior.
+
 ## Observer pipeline
 
 The observer turns raw session transcripts into typed, structured memories. It's the quality gate — everything that ends up in the store passes through here.
