@@ -207,6 +207,20 @@ function mcpJsonHasCodememEntry(path: string): boolean {
 	}
 }
 
+/** Best-effort user notice: the Pi UI when available, stderr otherwise. */
+function notifyUser(ctx: ExtensionContext, message: string): void {
+	try {
+		const ui = (ctx as { ui?: { notify?: (m: string) => void } }).ui;
+		if (ui && typeof ui.notify === "function") {
+			ui.notify(message);
+			return;
+		}
+	} catch {
+		// fall through to console
+	}
+	console.warn(message);
+}
+
 /**
  * D6: when native tools are registered but a codemem mcp.json entry also exists,
  * warn once so the user can pick a single surface via pi.tools_mode.
@@ -216,18 +230,10 @@ function warnDuplicateToolSurface(ctx: ExtensionContext, cwd: string): void {
 		const candidates = [join(resolvePiAgentDirForMcp(), "mcp.json"), join(cwd, ".pi", "mcp.json")];
 		const hit = candidates.some((p) => mcpJsonHasCodememEntry(p));
 		if (!hit) return;
-		const msg =
-			'codemem: both native tools and an mcp.json codemem entry are present. Pick one surface: set pi.tools_mode to "mcp" (extension-managed server) or "mcp-adapter" (adapter) to use MCP only, or remove the codemem entry from mcp.json to keep native tools.';
-		try {
-			const ui = (ctx as { ui?: { notify?: (m: string) => void } }).ui;
-			if (ui && typeof ui.notify === "function") {
-				ui.notify(msg);
-				return;
-			}
-		} catch {
-			// fall through to console
-		}
-		console.warn(msg);
+		notifyUser(
+			ctx,
+			'codemem: both native tools and an mcp.json codemem entry are present. Pick one surface: set pi.tools_mode to "mcp" (extension-managed server) to use MCP only, or remove the codemem entry from mcp.json to keep native tools.',
+		);
 	} catch {
 		// best-effort; never break session_start
 	}
@@ -238,16 +244,7 @@ function onSessionStartMcp(register: CodememMcpRegistrar, ctx: ExtensionContext)
 	const cwd = ctx.cwd || process.cwd();
 	const error = register({ cwd, project: resolveProject(cwd) });
 	if (!error) return;
-	try {
-		const ui = (ctx as { ui?: { notify?: (m: string) => void } }).ui;
-		if (ui && typeof ui.notify === "function") {
-			ui.notify(error);
-			return;
-		}
-	} catch {
-		// fall through to console
-	}
-	console.warn(error);
+	notifyUser(ctx, error);
 }
 
 function resolveProject(cwd: string, envProject?: string | null): string | null {
@@ -343,6 +340,7 @@ async function onSessionStart(
 	state.seenEventKeys = loadCursorsFromSession(ctx, sessionId);
 	client.rekey(sessionId, cwd, project);
 	injector.rekey(sessionId);
+	if (config.toolsModeNotice) notifyUser(ctx, config.toolsModeNotice);
 	if (config.toolsMode === "native") {
 		warnDuplicateToolSurface(ctx, cwd);
 	}
@@ -535,7 +533,6 @@ export default function codememPiExtension(pi: ExtensionAPI): void {
 	const runtime: ViewerRuntime = createViewerRuntime();
 	const state = createSessionState();
 	const recall = new RecallCorrelation();
-	const mcpRegistrar = createCodememMcpRegistrar(pi, config.toolsMode);
 	const client = new PiCodememClient(config, runtime, {
 		cwd: state.cwd,
 		project: state.project,
@@ -559,7 +556,7 @@ export default function codememPiExtension(pi: ExtensionAPI): void {
 		},
 	});
 
-	// MCP modes leave tool delivery to Pi or the adapter.
+	// The mcp mode leaves tool delivery to Pi.
 	if (config.toolsMode === "native") {
 		registerMemoryTools(pi, client);
 	}
@@ -567,7 +564,10 @@ export default function codememPiExtension(pi: ExtensionAPI): void {
 	pi.on("session_start", (event, ctx) =>
 		onSessionStart(state, client, config, injector, pi, event, ctx),
 	);
-	pi.on("session_start", (_event, ctx) => onSessionStartMcp(mcpRegistrar, ctx));
+	if (config.toolsMode === "mcp") {
+		const mcpRegistrar = createCodememMcpRegistrar(pi);
+		pi.on("session_start", (_event, ctx) => onSessionStartMcp(mcpRegistrar, ctx));
+	}
 	pi.on("session_shutdown", (event, ctx) =>
 		onSessionShutdown(state, client, runtime, pi, event, ctx),
 	);

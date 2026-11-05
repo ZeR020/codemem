@@ -1,7 +1,7 @@
 /**
  * memory_session_search tool tests (design D5/D6): native-mode registration +
  * result rendering, viewer-unreachable CLI fallback returning the same result
- * shape, and adapter-mode absence (single-surface guarantee).
+ * shape, and legacy adapter-value absence (single-surface guarantee).
  *
  * Harness mirrors tools.native-http.test.ts: fetch stubs + execImpl fake, no
  * real server, no real CLI spawn.
@@ -275,8 +275,8 @@ describe("memory_session_search viewer-unreachable fallback", () => {
 	);
 });
 
-describe("memory_session_search adapter mode", () => {
-	it("registers no native session-search tool when tools_mode is mcp-adapter", () => {
+describe("memory_session_search legacy tools mode", () => {
+	it("registers no native session-search tool when tools_mode is a legacy adapter value", () => {
 		vi.stubEnv("CODEMEM_PI_TOOLS_MODE", "mcp-adapter");
 		const tools: Array<{ name: string }> = [];
 		const pi = {
@@ -284,8 +284,8 @@ describe("memory_session_search adapter mode", () => {
 			registerTool: (def: { name: string }) => tools.push(def),
 			appendEntry: () => {},
 		};
-		// Factory-level check: adapter mode is gated in index.ts, before
-		// registerMemoryTools runs (single-surface guarantee).
+		// Factory-level check: legacy adapter values map to mcp in config.ts, which
+		// gates registerMemoryTools in index.ts (single-surface guarantee).
 		codememPiExtension(pi as never);
 		expect(tools.some((tool) => tool.name === "memory_session_search")).toBe(false);
 	});

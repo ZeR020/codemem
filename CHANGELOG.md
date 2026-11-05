@@ -4,7 +4,7 @@
 
 ### Changed
 
-- **Breaking:** `@codemem/pi-extension` requires Pi `>=1.1.0 <2`; upgrade an older host with `pi update`. Absent/empty tool mode and fresh setup now use Pi's built-in MCP with codemode exposure (15 underlying tools, no adapter or MCP file required). Existing explicit `native` / `mcp-adapter` settings stay pinned; set `pi.tools_mode` to `"mcp"` to switch or `"native"` to roll back, then reload Pi. No stored-data migration. See [Pi host compatibility](docs/versioning.md#pi-host-compatibility) and [migration guidance](docs/plugin-reference.md#mcp-default-and-precedence).
+- **Breaking:** `@codemem/pi-extension` requires Pi `>=1.1.0 <2`; upgrade an older host with `pi update`. Absent/empty tool mode and fresh setup now use Pi's built-in MCP with codemode exposure (15 underlying tools, no MCP file required). The legacy `mcp-adapter` tools mode and the `codemem setup --pi-mcp` opt-in are removed: only `native` and `mcp` remain, and stored `mcp-adapter`/`adapter`/`mcp_adapter` values (file or env) resolve to `mcp` with a removal notice, never to direct tools. Existing explicit `native` settings stay pinned; set `pi.tools_mode` to `"mcp"` to switch or `"native"` to roll back, then reload Pi. Users of the third-party `pi-mcp-adapter` should remove it — it disables Pi's built-in MCP, which `mcp` mode requires — or choose `native`. No stored-data migration. See [Pi host compatibility](docs/versioning.md#pi-host-compatibility) and [migration guidance](docs/plugin-reference.md#mcp-default-and-precedence).
 
 ## [0.47.3] - 2026-10-28
 

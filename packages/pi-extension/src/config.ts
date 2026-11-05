@@ -8,10 +8,12 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-export type PiToolsMode = "native" | "mcp-adapter" | "mcp";
+export type PiToolsMode = "native" | "mcp";
 
 export type PiExtensionConfig = {
 	toolsMode: PiToolsMode;
+	/** Non-null when a stored legacy adapter value mapped to "mcp"; delivered at session start. */
+	toolsModeNotice: string | null;
 	injectPrompts: boolean;
 	fileContext: boolean;
 	viewerHost: string;
@@ -28,6 +30,7 @@ export type PiExtensionConfig = {
 
 const DEFAULTS: PiExtensionConfig = {
 	toolsMode: "mcp",
+	toolsModeNotice: null,
 	injectPrompts: true,
 	fileContext: true,
 	viewerHost: "127.0.0.1",
@@ -154,20 +157,30 @@ function readConfigFile(): Record<string, unknown> {
 	}
 }
 
-function resolveToolsMode(fileValue: unknown, envValue: string | undefined): PiToolsMode {
+const LEGACY_ADAPTER_TOOLS_MODE_NOTICE =
+	'codemem: the "mcp-adapter" tools mode was removed; stored "mcp-adapter", "adapter", and "mcp_adapter" values (file or env) now resolve to "mcp" (extension-managed MCP) and are left unchanged on disk. Set pi.tools_mode to "native" for the 15 direct tools. If the third-party pi-mcp-adapter is installed, remove it: it disables the built-in MCP in Pi that "mcp" mode requires.';
+
+function resolveToolsMode(
+	fileValue: unknown,
+	envValue: string | undefined,
+): { mode: PiToolsMode; notice: string | null } {
 	const env = envValue?.trim().toLowerCase();
-	if (env === "mcp-adapter" || env === "mcp_adapter" || env === "adapter") return "mcp-adapter";
-	if (env === "native") return "native";
-	if (env === "mcp") return "mcp";
+	if (env === "mcp-adapter" || env === "mcp_adapter" || env === "adapter") {
+		return { mode: "mcp", notice: LEGACY_ADAPTER_TOOLS_MODE_NOTICE };
+	}
+	if (env === "native") return { mode: "native", notice: null };
+	if (env === "mcp") return { mode: "mcp", notice: null };
 	const file =
 		typeof fileValue === "string" ? fileValue.trim().toLowerCase().replace(/_/g, "-") : "";
-	if (file === "mcp-adapter" || file === "adapter") return "mcp-adapter";
-	if (file === "native") return "native";
-	if (file === "mcp") return "mcp";
+	if (file === "mcp-adapter" || file === "adapter") {
+		return { mode: "mcp", notice: LEGACY_ADAPTER_TOOLS_MODE_NOTICE };
+	}
+	if (file === "native") return { mode: "native", notice: null };
+	if (file === "mcp") return { mode: "mcp", notice: null };
 	// Absent/blank selects the default surface; unknown or invalid values keep the legacy native fallback.
 	const unset = fileValue == null || (typeof fileValue === "string" && file === "");
-	if (unset) return DEFAULTS.toolsMode;
-	return "native";
+	if (unset) return { mode: DEFAULTS.toolsMode, notice: null };
+	return { mode: "native", notice: null };
 }
 
 function resolveBool(
@@ -195,8 +208,14 @@ export function loadPiExtensionConfig(env: NodeJS.ProcessEnv = process.env): PiE
 			? (file.pi as Record<string, unknown>)
 			: {};
 
+	const { mode: toolsMode, notice: toolsModeNotice } = resolveToolsMode(
+		piBlock.tools_mode ?? piBlock.toolsMode,
+		env.CODEMEM_PI_TOOLS_MODE,
+	);
+
 	return {
-		toolsMode: resolveToolsMode(piBlock.tools_mode ?? piBlock.toolsMode, env.CODEMEM_PI_TOOLS_MODE),
+		toolsMode,
+		toolsModeNotice,
 		injectPrompts: resolveBool(
 			env.CODEMEM_PI_INJECT_PROMPTS ?? env.CODEMEM_INJECT_CONTEXT,
 			piBlock.inject_prompts ?? piBlock.injectPrompts,

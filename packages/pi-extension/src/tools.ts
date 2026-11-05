@@ -1392,7 +1392,7 @@ export function registerMemoryTools(pi: ExtensionAPI, client: PiCodememClient): 
 	return registered;
 }
 
-/** No-op helper for tests asserting tool absence in adapter mode. */
+/** Static native-tool roster for tests asserting tool presence or absence. */
 export function expectedToolNames(): string[] {
 	return [
 		"memory_search",

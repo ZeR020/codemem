@@ -137,7 +137,7 @@ describe("extension factory lifecycle", () => {
 		codememPiExtension(pi as never);
 		expect(tools.map((t) => t.name).toSorted()).toEqual(expectedToolNames().toSorted());
 	});
-	it("skips native tools when tools_mode is mcp-adapter", () => {
+	it("maps a legacy mcp-adapter value to mcp with no direct tools", () => {
 		vi.stubEnv("CODEMEM_PI_TOOLS_MODE", "mcp-adapter");
 		const { pi, tools } = createMockPi();
 		codememPiExtension(pi as never);

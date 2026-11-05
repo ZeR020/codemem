@@ -74,7 +74,7 @@ describe("Pi host compatibility", () => {
 		expect(tools.map((tool) => tool.name).toSorted()).toEqual(NATIVE_TOOL_NAMES);
 	});
 
-	it("keeps mcp-adapter mode free of native tools", () => {
+	it("maps a legacy mcp-adapter value to mcp with no native tools", () => {
 		process.env.CODEMEM_PI_TOOLS_MODE = "mcp-adapter";
 		const { pi, handlers, tools } = createMockPi();
 		codememPiExtension(pi as never);

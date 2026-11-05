@@ -2,7 +2,6 @@
 
 import { resolve } from "node:path";
 import type { ExtensionAPI, McpServerConfig } from "@earendil-works/pi-coding-agent";
-import type { PiToolsMode } from "./config.js";
 import { resolveViewerDbPath } from "./viewer.js";
 
 const SERVER_NAME = "codemem";
@@ -57,12 +56,10 @@ export type CodememMcpRegistrar = (target: McpTarget) => string | null;
 /** Re-register only when the effective config changes; a failed attempt retries next session. */
 export function createCodememMcpRegistrar(
 	pi: ExtensionAPI,
-	mode: PiToolsMode,
 	env: NodeJS.ProcessEnv = process.env,
 ): CodememMcpRegistrar {
 	let registeredConfig: string | null = null;
 	return (target) => {
-		if (mode !== "mcp") return null;
 		if (typeof pi.registerMcpServer !== "function") {
 			return 'codemem: pi.tools_mode is "mcp", but this Pi host has no MCP registration API. Update Pi (1.1.0 or newer) or set pi.tools_mode to "native" explicitly; no direct tools were registered.';
 		}

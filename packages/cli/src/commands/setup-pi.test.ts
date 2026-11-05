@@ -1,8 +1,8 @@
 /**
- * Tests for codemem setup — pi target (packages entry, observer derivation, --pi-mcp).
+ * Tests for codemem setup — pi target (packages entry, observer derivation).
  *
  * Covers: fresh install, idempotent second run, relocated home (PI_CODING_AGENT_DIR),
- * adapter present/absent, and no-secret-persistence into codemem config.
+ * explicit tools-mode preservation (including legacy adapter values), and no-secret-persistence into codemem config.
  */
 
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -16,7 +16,6 @@ import {
 	installPi,
 	isPiDetected,
 	isPiExtensionPackageEntry,
-	isPiMcpAdapterDetected,
 	piConfigDir,
 	setupCommand,
 } from "./setup.js";
@@ -545,88 +544,16 @@ describe("installPi — observer partial overrides", () => {
 	});
 });
 
-describe("installPi — --pi-mcp opt-in", () => {
-	it("default run writes no mcp.json even when the adapter is installed", () => {
+describe("installPi — no adapter opt-in", () => {
+	it("writes no mcp.json even when a legacy adapter package is installed", () => {
 		writeJson(join(piHome, "settings.json"), {
 			packages: ["npm:pi-mcp-adapter@2.19.0"],
 		});
 
-		expect(installPi({ force: false, piMcp: false })).toBe(true);
+		expect(installPi({ force: false })).toBe(true);
 		expect(existsSync(join(piHome, "mcp.json"))).toBe(false);
 		const config = readJson(configPath);
 		expect(config.pi).toEqual({ tools_mode: "mcp" });
-	});
-
-	it("with --pi-mcp and adapter present: writes mcp.json and sets tools_mode mcp-adapter", () => {
-		writeJson(join(piHome, "settings.json"), {
-			packages: ["npm:pi-mcp-adapter@2.19.0"],
-		});
-
-		expect(installPi({ force: false, piMcp: true })).toBe(true);
-
-		const mcp = readJson(join(piHome, "mcp.json"));
-		expect(mcp).toEqual({
-			mcpServers: {
-				codemem: {
-					command: "npx",
-					args: ["-y", "codemem", "mcp"],
-				},
-			},
-		});
-		const config = readJson(configPath);
-		expect(config.pi).toEqual({ tools_mode: "mcp-adapter" });
-	});
-
-	it("with --pi-mcp and adapter absent: writes nothing MCP-related, keeps the mcp default, and explains the legacy prerequisite", () => {
-		writeJson(join(piHome, "settings.json"), { packages: [] });
-		const warns: string[] = [];
-		const spy = vi.spyOn(p.log, "warn").mockImplementation((msg: string) => {
-			warns.push(String(msg));
-		});
-
-		expect(installPi({ force: false, piMcp: true })).toBe(true);
-
-		spy.mockRestore();
-		expect(existsSync(join(piHome, "mcp.json"))).toBe(false);
-		const config = readJson(configPath);
-		expect(config.pi).toEqual({ tools_mode: "mcp" });
-		expect(warns.join("\n")).toMatch(/pi-mcp-adapter/i);
-		expect(warns.join("\n")).toMatch(/built-in MCP default needs no adapter/i);
-	});
-
-	it("detects the adapter via an extensions/ directory name", () => {
-		writeJson(join(piHome, "settings.json"), { packages: [] });
-		mkdirSync(join(piHome, "extensions", "pi-mcp-adapter"), { recursive: true });
-
-		expect(isPiMcpAdapterDetected(piHome)).toBe(true);
-
-		expect(installPi({ force: false, piMcp: true })).toBe(true);
-		expect(existsSync(join(piHome, "mcp.json"))).toBe(true);
-	});
-
-	it("does not duplicate the mcp.json codemem entry on re-run", () => {
-		writeJson(join(piHome, "settings.json"), {
-			packages: ["npm:pi-mcp-adapter@2.0.0"],
-		});
-		writeJson(join(piHome, "mcp.json"), {
-			mcpServers: {
-				other: { command: "echo" },
-				codemem: { command: "npx", args: ["-y", "codemem", "mcp"] },
-			},
-		});
-		// Start from native so the re-run must flip tools_mode even when mcp entry exists.
-		writeJson(configPath, { pi: { tools_mode: "native" } });
-
-		expect(installPi({ force: false, piMcp: true })).toBe(true);
-
-		const mcp = readJson(join(piHome, "mcp.json"));
-		const servers = mcp.mcpServers as Record<string, unknown>;
-		expect(Object.keys(servers).sort()).toEqual(["codemem", "other"]);
-		expect(servers.other).toEqual({ command: "echo" });
-		// Adapter present on --pi-mcp re-run must flip tools_mode even when the
-		// mcp entry was already written (no-duplicate path).
-		const config = readJson(configPath);
-		expect(config.pi).toEqual({ tools_mode: "mcp-adapter" });
 	});
 });
 
@@ -688,10 +615,19 @@ describe("installPi — parse failure abort", () => {
 });
 
 describe("setup command options", () => {
-	it("declares --pi-only, --pi-mcp, and --pi-extension-path", () => {
+	it("declares --pi-only and --pi-extension-path with no adapter opt-in", () => {
 		const longs = setupCommand.options.map((o) => o.long);
 		expect(longs).toContain("--pi-only");
-		expect(longs).toContain("--pi-mcp");
+		expect(longs).not.toContain("--pi-mcp");
 		expect(longs).toContain("--pi-extension-path");
+	});
+
+	it("rejects --pi-mcp as an unknown option", async () => {
+		// Commander 15 has no copy/clone; the file-local singleton mutation is safe
+		// because vitest isolates module state per test file and this is the last test.
+		const command = setupCommand.exitOverride().configureOutput({ writeErr: () => {} });
+		await expect(command.parseAsync(["--pi-mcp"], { from: "user" })).rejects.toMatchObject({
+			code: "commander.unknownOption",
+		});
 	});
 });
