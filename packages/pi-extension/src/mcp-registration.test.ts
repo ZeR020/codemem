@@ -134,17 +134,9 @@ describe("codememMcpServerConfig", () => {
 });
 
 describe("createCodememMcpRegistrar", () => {
-	it("registers nothing outside explicit mcp mode", () => {
-		for (const mode of ["native", "mcp-adapter"] as const) {
-			const { pi, calls } = createMockPi();
-			expect(createCodememMcpRegistrar(pi, mode, { HOME: "/home/u" })(TARGET)).toBeNull();
-			expect(calls, mode).toEqual([]);
-		}
-	});
-
 	it("registers once and re-registers only on an effective target change", () => {
 		const { pi, calls } = createMockPi();
-		const register = createCodememMcpRegistrar(pi, "mcp", { HOME: "/home/u" });
+		const register = createCodememMcpRegistrar(pi, { HOME: "/home/u" });
 
 		expect(register({ cwd: "/work/a", project: "a" })).toBeNull();
 		expect(register({ cwd: "/work/a", project: "a" })).toBeNull();
@@ -164,7 +156,7 @@ describe("createCodememMcpRegistrar", () => {
 	it("re-registers when inherited config, runtime, database, or actor values change", () => {
 		const { pi, calls } = createMockPi();
 		const env: NodeJS.ProcessEnv = { HOME: "/home/u", CODEMEM_DB: "/db/one.sqlite" };
-		const register = createCodememMcpRegistrar(pi, "mcp", env);
+		const register = createCodememMcpRegistrar(pi, env);
 
 		expect(register(TARGET)).toBeNull();
 		for (const [key, value] of [
@@ -184,7 +176,7 @@ describe("createCodememMcpRegistrar", () => {
 
 	it("reports a host without the registration API instead of direct tools", () => {
 		const { pi, calls } = createMockPi(false);
-		const error = createCodememMcpRegistrar(pi, "mcp", {})(TARGET);
+		const error = createCodememMcpRegistrar(pi, {})(TARGET);
 
 		expect(error).toContain("no MCP registration API");
 		expect(error).toContain('"native"');
@@ -194,7 +186,7 @@ describe("createCodememMcpRegistrar", () => {
 
 	it("reports a rejected registration and retries on the next session", () => {
 		const { pi, calls } = createMockPi("throws");
-		const register = createCodememMcpRegistrar(pi, "mcp", {});
+		const register = createCodememMcpRegistrar(pi, {});
 
 		const first = register(TARGET);
 		expect(first).toContain("could not register the codemem MCP server");

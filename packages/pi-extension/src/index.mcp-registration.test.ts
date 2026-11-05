@@ -170,18 +170,35 @@ describe("explicit mcp surface", () => {
 		expect(envOf(registration).CODEMEM_PROJECT).toBe("plain-target");
 	});
 
-	it("keeps direct-tool counts at 15 native, 0 mcp, and 0 mcp-adapter", async () => {
-		for (const [mode, direct] of [
-			["native", 15],
-			["mcp", 0],
-			["mcp-adapter", 0],
+	it("keeps direct-tool counts at 15 native, 0 mcp, and 0 for legacy adapter values", async () => {
+		for (const [mode, direct, registrations] of [
+			["native", 15, 0],
+			["mcp", 0, 1],
+			["mcp-adapter", 0, 1],
 		] as const) {
 			vi.stubEnv("CODEMEM_PI_TOOLS_MODE", mode);
 			const harness = createHarness();
 			await emit(harness, "session_start", { reason: "startup" }, sessionCtx(makeTarget(mode)));
 			expect(harness.tools, mode).toHaveLength(direct);
-			expect(harness.registrations, mode).toHaveLength(mode === "mcp" ? 1 : 0);
+			expect(harness.registrations, mode).toHaveLength(registrations);
 		}
+	});
+
+	it("delivers the legacy adapter notice at session start", async () => {
+		vi.stubEnv("CODEMEM_PI_TOOLS_MODE", "mcp-adapter");
+		const harness = createHarness();
+		const notices: string[] = [];
+		const ctx = {
+			...sessionCtx(makeTarget("legacy-notice")),
+			ui: { notify: (message: string) => notices.push(message) },
+		};
+
+		await emit(harness, "session_start", { reason: "startup" }, ctx);
+
+		expect(notices.join("\n")).toContain("mcp-adapter");
+		expect(notices.join("\n")).toContain('"native"');
+		expect(harness.tools).toHaveLength(0);
+		expect(harness.registrations).toHaveLength(1);
 	});
 });
 
