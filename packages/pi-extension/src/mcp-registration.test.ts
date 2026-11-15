@@ -2,6 +2,7 @@
 import { resolve } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it } from "vitest";
+import type { PiToolExposure } from "./config.js";
 import {
 	codememMcpServerConfig,
 	createCodememMcpRegistrar,
@@ -42,8 +43,12 @@ function createMockPi(register: boolean | "throws" = true) {
 const TARGET: McpTarget = { cwd: "/work/app", project: "app" };
 
 /** The registration is always stdio; narrow the SDK union before reading its fields. */
-function stdioConfig(target: McpTarget, env: NodeJS.ProcessEnv) {
-	const config = codememMcpServerConfig(target, env);
+function stdioConfig(
+	target: McpTarget,
+	env: NodeJS.ProcessEnv,
+	toolExposure: PiToolExposure = "hybrid",
+) {
+	const config = codememMcpServerConfig(target, env, toolExposure);
 	if (!("command" in config)) throw new Error("expected a stdio MCP server config");
 	return config;
 }
@@ -61,7 +66,39 @@ describe("codememMcpServerConfig", () => {
 			cwd: "/work/app",
 			env: { CODEMEM_PROJECT: "app", HOME: "/home/u" },
 			exposure: "codemode",
+			toolExposure: {
+				memory_remember: "direct",
+				memory_search: "direct",
+				memory_session_search: "direct",
+			},
 		});
+	});
+
+	it("declares exactly the three bare hybrid tools and omits the key under codemode", () => {
+		const hybrid = {
+			memory_remember: "direct",
+			memory_search: "direct",
+			memory_session_search: "direct",
+		};
+		for (const [toolExposure, expected] of [
+			["hybrid", hybrid],
+			["codemode", undefined],
+		] as const) {
+			const config = stdioConfig(TARGET, { HOME: "/home/u" }, toolExposure);
+			expect(config.exposure, toolExposure).toBe("codemode");
+			expect(config.toolExposure, toolExposure).toEqual(expected);
+			// Omitted entirely, not present as an undefined key.
+			expect(Object.hasOwn(config, "toolExposure"), toolExposure).toBe(expected !== undefined);
+		}
+	});
+
+	it("keeps the inherited environment identical under both exposure values", () => {
+		const target: McpTarget = { cwd: "/work/app", project: "project $HOME" };
+		const env = { HOME: "/home/u", CODEMEM_ACTOR_ID: "actor$1", CODEMEM_CONFIG: "/cfg/a$b.json" };
+
+		expect(stdioConfig(target, env, "codemode").env).toEqual(
+			stdioConfig(target, env, "hybrid").env,
+		);
 	});
 
 	it("resolves ~ and relative database paths through the session target", () => {
@@ -175,23 +212,46 @@ describe("createCodememMcpRegistrar", () => {
 	});
 
 	it("reports a host without the registration API instead of direct tools", () => {
-		const { pi, calls } = createMockPi(false);
-		const error = createCodememMcpRegistrar(pi, {})(TARGET);
+		for (const toolExposure of ["hybrid", "codemode"] as const) {
+			const { pi, calls } = createMockPi(false);
+			const error = createCodememMcpRegistrar(pi, {}, toolExposure)(TARGET);
 
-		expect(error).toContain("no MCP registration API");
-		expect(error).toContain('"native"');
-		expect(error).toMatch(/no direct tools/i);
-		expect(calls).toEqual([]);
+			expect(error, toolExposure).toContain("no MCP registration API");
+			expect(error, toolExposure).toContain('"native"');
+			expect(error, toolExposure).toMatch(/no direct tools/i);
+			expect(calls).toEqual([]);
+		}
 	});
 
 	it("reports a rejected registration and retries on the next session", () => {
-		const { pi, calls } = createMockPi("throws");
-		const register = createCodememMcpRegistrar(pi, {});
+		for (const toolExposure of ["hybrid", "codemode"] as const) {
+			const { pi, calls } = createMockPi("throws");
+			const register = createCodememMcpRegistrar(pi, {}, toolExposure);
 
-		const first = register(TARGET);
-		expect(first).toContain("could not register the codemem MCP server");
-		expect(first).toContain("invalid codemem server config");
-		expect(register(TARGET)).toContain("could not register");
-		expect(calls).toHaveLength(2);
+			const first = register(TARGET);
+			expect(first, toolExposure).toContain("could not register the codemem MCP server");
+			expect(first, toolExposure).toContain("invalid codemem server config");
+			expect(register(TARGET), toolExposure).toContain("could not register");
+			expect(calls).toHaveLength(2);
+		}
+	});
+
+	it("registers once per effective target under both exposure values", () => {
+		for (const toolExposure of ["hybrid", "codemode"] as const) {
+			const { pi, calls } = createMockPi();
+			const register = createCodememMcpRegistrar(pi, { HOME: "/home/u" }, toolExposure);
+
+			expect(register({ cwd: "/work/a", project: "a" }), toolExposure).toBeNull();
+			expect(register({ cwd: "/work/a", project: "a" }), toolExposure).toBeNull();
+			expect(calls, toolExposure).toHaveLength(1);
+			expect(calls[0]?.config.toolExposure, toolExposure).toEqual(
+				toolExposure === "hybrid"
+					? { memory_remember: "direct", memory_search: "direct", memory_session_search: "direct" }
+					: undefined,
+			);
+
+			expect(register({ cwd: "/work/a", project: "b" }), toolExposure).toBeNull();
+			expect(calls, toolExposure).toHaveLength(2);
+		}
 	});
 });

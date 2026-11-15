@@ -184,6 +184,80 @@ describe("explicit mcp surface", () => {
 		}
 	});
 
+	it("follows pi.tool_exposure for the registration with zero direct tools", async () => {
+		const hybrid = {
+			memory_remember: "direct",
+			memory_search: "direct",
+			memory_session_search: "direct",
+		};
+		let dir = 0;
+		for (const [toolExposure, expected] of [
+			[undefined, hybrid],
+			["", hybrid],
+			["hybrid", hybrid],
+			[" CODEMODE ", undefined],
+			// Unknown env falls through to the file, and an absent file resolves to hybrid.
+			["bogus", hybrid],
+		] as const) {
+			if (toolExposure === undefined) delete process.env.CODEMEM_PI_TOOL_EXPOSURE;
+			else vi.stubEnv("CODEMEM_PI_TOOL_EXPOSURE", toolExposure);
+			dir += 1;
+			const harness = createHarness();
+			await emit(
+				harness,
+				"session_start",
+				{ reason: "startup" },
+				sessionCtx(makeTarget(`exposure-${dir}`)),
+			);
+
+			expect(harness.tools, String(toolExposure)).toEqual([]);
+			expect(harness.registrations, String(toolExposure)).toHaveLength(1);
+			const config = harness.registrations[0]?.config as Record<string, unknown>;
+			expect(config.exposure, String(toolExposure)).toBe("codemode");
+			expect(config.toolExposure, String(toolExposure)).toEqual(expected);
+			expect(Object.hasOwn(config, "toolExposure"), String(toolExposure)).toBe(
+				expected !== undefined,
+			);
+		}
+	});
+
+	it("keeps a legacy adapter value on the exposure knob with zero direct tools", async () => {
+		vi.stubEnv("CODEMEM_PI_TOOLS_MODE", "mcp-adapter");
+		vi.stubEnv("CODEMEM_PI_TOOL_EXPOSURE", "codemode");
+		const harness = createHarness();
+
+		await emit(
+			harness,
+			"session_start",
+			{ reason: "startup" },
+			sessionCtx(makeTarget("legacy-codemode")),
+		);
+
+		expect(harness.tools).toEqual([]);
+		expect(harness.registrations).toHaveLength(1);
+		const config = harness.registrations[0]?.config as Record<string, unknown>;
+		expect(config.exposure).toBe("codemode");
+		expect(Object.hasOwn(config, "toolExposure")).toBe(false);
+	});
+
+	it("keeps 15 native tools and no registration under both exposure values", async () => {
+		for (const toolExposure of ["hybrid", "codemode"] as const) {
+			vi.stubEnv("CODEMEM_PI_TOOLS_MODE", "native");
+			vi.stubEnv("CODEMEM_PI_TOOL_EXPOSURE", toolExposure);
+			const harness = createHarness();
+
+			await emit(
+				harness,
+				"session_start",
+				{ reason: "startup" },
+				sessionCtx(makeTarget(`native-${toolExposure}`)),
+			);
+
+			expect(harness.tools, toolExposure).toHaveLength(15);
+			expect(harness.registrations, toolExposure).toEqual([]);
+		}
+	});
+
 	it("delivers the legacy adapter notice at session start", async () => {
 		vi.stubEnv("CODEMEM_PI_TOOLS_MODE", "mcp-adapter");
 		const harness = createHarness();
@@ -223,6 +297,27 @@ describe("mcp target handoff", () => {
 		await emit(harness, "session_start", { reason: "resume" }, ctx);
 		expect(harness.registrations).toHaveLength(2);
 		expect(envOf(harness.registrations[1]).CODEMEM_PROJECT).toBe("explicit-project");
+	});
+
+	it("keeps the target handoff identical under both exposure values", async () => {
+		const repoRoot = makeTarget("exposure-target");
+		mkdirSync(join(repoRoot, ".git"), { recursive: true });
+
+		for (const toolExposure of ["hybrid", "codemode"] as const) {
+			vi.stubEnv("CODEMEM_PI_TOOL_EXPOSURE", toolExposure);
+			const harness = createHarness();
+
+			await emit(harness, "session_start", { reason: "startup" }, sessionCtx(repoRoot));
+
+			const config = harness.registrations[0]?.config as Record<string, unknown>;
+			expect(config.cwd, toolExposure).toBe(repoRoot);
+			expect(config.args, toolExposure).toEqual([
+				"mcp",
+				"--db-path",
+				resolveViewerDbPath(repoRoot),
+			]);
+			expect(envOf(harness.registrations[0]).CODEMEM_PROJECT, toolExposure).toBe("exposure-target");
+		}
 	});
 
 	it("preserves a git-root project with trailing whitespace verbatim", async () => {

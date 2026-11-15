@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { type ExecCodememFn, PiCodememClient } from "./client.js";
-import { defaultPiExtensionConfig } from "./config.js";
-import { createPiInjector, type PiContextMessage } from "./inject.js";
+import { defaultPiExtensionConfig, type PiExtensionConfig } from "./config.js";
+import { createPiInjector, MCP_DISCOVERY_HINT, type PiContextMessage } from "./inject.js";
 import { CODEMEM_MEMORIES_HEADER } from "./payloads.js";
 import { createViewerRuntime } from "./viewer.js";
 
@@ -31,8 +31,13 @@ function makeExecSpy(queue: QueuedResponse[]) {
 	return { calls, execImpl, fetchCount };
 }
 
-function makeInjector(execImpl: ExecCodememFn, configOverrides: Record<string, unknown> = {}) {
-	const config = defaultPiExtensionConfig({ viewerEnabled: false, ...configOverrides });
+/** Memory-decision tests run in native mode so no discovery hint joins the copy; hint tests opt into mcp. */
+function makeInjector(execImpl: ExecCodememFn, configOverrides: Partial<PiExtensionConfig> = {}) {
+	const config = defaultPiExtensionConfig({
+		viewerEnabled: false,
+		toolsMode: "native",
+		...configOverrides,
+	});
 	const client = new PiCodememClient(config, createViewerRuntime(), { execImpl });
 	let seq = 0;
 	const injector = createPiInjector({
@@ -51,7 +56,7 @@ function makeInjector(execImpl: ExecCodememFn, configOverrides: Record<string, u
 
 /** Fresh message objects per call — the context event hands the hook a throwaway copy. */
 function userMsg(
-	text: string,
+	text: string | undefined,
 	timestamp?: number,
 	content?: PiContextMessage["content"],
 ): PiContextMessage {
@@ -76,7 +81,8 @@ function spannedPackBody(pack_text: string, items: unknown[]): string {
 	});
 }
 
-function latestText(message: PiContextMessage): string {
+function latestText(message: PiContextMessage | undefined): string {
+	if (!message) throw new Error("expected a context message");
 	if (typeof message.content === "string") return message.content;
 	if (Array.isArray(message.content)) {
 		return message.content
@@ -88,6 +94,14 @@ function latestText(message: PiContextMessage): string {
 			.join("\n");
 	}
 	return "";
+}
+
+/** Exact bytes appendBlockToMessage adds for the discovery hint. */
+const HINT_BLOCK = `\n\n${MCP_DISCOVERY_HINT}`;
+
+/** Occurrences of the fixed discovery hint in a request-copy message. */
+function hintCount(message: PiContextMessage | undefined): number {
+	return latestText(message).split(MCP_DISCOVERY_HINT).length - 1;
 }
 
 afterEach(() => {
@@ -369,5 +383,203 @@ describe("createPiInjector retained-token ceiling", () => {
 			expect(fetchCount()).toBe(1);
 			vi.unstubAllEnvs();
 		}
+	});
+});
+
+describe("createPiInjector mcp discovery hint", () => {
+	it("latches the first copy's latest user message, precedes the pack, and replays identical bytes", async () => {
+		expect(MCP_DISCOVERY_HINT).not.toContain("\n");
+		expect(MCP_DISCOVERY_HINT).toContain('searchTools("<query>", {namespace: "mcp__codemem"})');
+
+		const { execImpl, fetchCount } = makeExecSpy([
+			spannedPackBody("pack one", []),
+			spannedPackBody("pack two", []),
+		]);
+		const { injector } = makeInjector(execImpl, { toolsMode: "mcp" });
+
+		const firstTurn = [userMsg("first", 1_000)];
+		await injector.inject(firstTurn);
+		expect(fetchCount()).toBe(1);
+		const firstBytes = latestText(firstTurn[0]);
+		expect(firstBytes).toContain(MCP_DISCOVERY_HINT);
+		expect(firstBytes.indexOf(MCP_DISCOVERY_HINT)).toBeLessThan(
+			firstBytes.indexOf(CODEMEM_MEMORIES_HEADER),
+		);
+
+		// A later user message does not move the latched hint or change the carrier's bytes.
+		const secondTurn = turn();
+		await injector.inject(secondTurn);
+		expect(fetchCount()).toBe(2);
+		expect(latestText(secondTurn[0])).toBe(firstBytes);
+		expect(hintCount(secondTurn[0])).toBe(1);
+		expect(hintCount(secondTurn[1])).toBe(0);
+		expect(latestText(secondTurn[1])).toContain("pack two");
+
+		// Same history again: replay only, exactly one hint, no accumulation.
+		const thirdTurn = turn();
+		await injector.inject(thirdTurn);
+		expect(fetchCount()).toBe(2);
+		expect(latestText(thirdTurn[0])).toBe(firstBytes);
+		expect(hintCount(thirdTurn[0])).toBe(1);
+	});
+
+	it("appends to string and array copies without touching the host's messages", async () => {
+		const { execImpl } = makeExecSpy([spannedPackBody("", []), spannedPackBody("", [])]);
+		const { injector } = makeInjector(execImpl, { toolsMode: "mcp" });
+
+		const persistedString = userMsg("plain prompt", 1_000);
+		const stringCopy = structuredClone(persistedString);
+		await injector.inject([stringCopy]);
+		expect(stringCopy.content).toBe(`plain prompt${HINT_BLOCK}`);
+		expect(persistedString.content).toBe("plain prompt");
+
+		const persistedArray = userMsg(undefined, 2_000, [
+			{ type: "text", text: "look at this" },
+			{ type: "image", data: "img", mimeType: "image/png" },
+		]);
+		const arrayCopy = structuredClone(persistedArray);
+		const imagePart = (arrayCopy.content as Array<Record<string, unknown>>)[1];
+		await injector.inject([arrayCopy]);
+		const content = arrayCopy.content as Array<Record<string, unknown>>;
+		expect(content).toHaveLength(3);
+		expect(content[1]).toBe(imagePart); // image part never rebuilt
+		expect(content[2]).toEqual({ type: "text", text: MCP_DISCOVERY_HINT });
+		expect((persistedArray.content as unknown[]).length).toBe(2);
+	});
+
+	it("still carries the hint when the new pack is fully deduplicated", async () => {
+		const item = { id: 7, fingerprint: FINGERPRINT_A, spans: [{ start: 0, end: 6 }] };
+		const { execImpl, fetchCount } = makeExecSpy([
+			spannedPackBody("ITEM A", [item]),
+			spannedPackBody("ITEM A", [item]),
+		]);
+		const { injector } = makeInjector(execImpl, { toolsMode: "mcp" });
+
+		const firstTurn = [userMsg("first", 1_000)];
+		await injector.inject(firstTurn);
+
+		const secondTurn = turn();
+		await injector.inject(secondTurn);
+		expect(fetchCount()).toBe(2);
+		expect(hintCount(secondTurn[0])).toBe(1);
+		expect(latestText(secondTurn[1])).toBe("second"); // dedup leaves no block, no second hint
+	});
+
+	it("keeps the hint when both pack transports fail", async () => {
+		const { execImpl, fetchCount } = makeExecSpy([new Error("cli down"), new Error("cli down")]);
+		const { injector } = makeInjector(execImpl, { toolsMode: "mcp" });
+
+		const firstTurn = [userMsg("first", 1_000)];
+		await injector.inject(firstTurn);
+		expect(fetchCount()).toBe(2);
+		expect(latestText(firstTurn[0])).toBe(`first${HINT_BLOCK}`);
+
+		const replay = userMsg("first", 1_000);
+		await injector.inject([replay]);
+		expect(fetchCount()).toBe(2);
+		expect(latestText(replay)).toBe(`first${HINT_BLOCK}`);
+	});
+
+	it("attaches even when the retained-token ceiling stops every fetch", async () => {
+		vi.stubEnv("CODEMEM_INJECT_RETAINED_TOKEN_BUDGET", "1");
+		const { execImpl, fetchCount } = makeExecSpy([]);
+		const { injector } = makeInjector(execImpl, { toolsMode: "mcp" });
+
+		const messages = [userMsg("first", 1_000)];
+		await injector.inject(messages);
+		expect(fetchCount()).toBe(0);
+		expect(latestText(messages[0])).toBe(`first${HINT_BLOCK}`);
+	});
+});
+
+describe("createPiInjector mcp discovery hint lifecycle", () => {
+	it("one-shot compaction re-latches to the surviving message without a fetch", async () => {
+		const { execImpl, fetchCount } = makeExecSpy([spannedPackBody("pack one", [])]);
+		const { injector } = makeInjector(execImpl, { toolsMode: "mcp" });
+		await injector.inject([userMsg("first", 1_000)]);
+
+		injector.noteCompaction();
+		const compacted = [userMsg("second", 2_000)];
+		await injector.inject(compacted);
+		expect(fetchCount()).toBe(1); // one-shot: replay only
+		expect(latestText(compacted[0])).toBe(`second${HINT_BLOCK}`);
+	});
+
+	it("one-shot compaction that keeps the carrier does not duplicate the hint", async () => {
+		const { execImpl, fetchCount } = makeExecSpy([spannedPackBody("pack one", [])]);
+		const { injector } = makeInjector(execImpl, { toolsMode: "mcp" });
+		const firstTurn = [userMsg("first", 1_000)];
+		await injector.inject(firstTurn);
+		const firstBytes = latestText(firstTurn[0]);
+
+		injector.noteCompaction();
+		const compacted = turn();
+		await injector.inject(compacted);
+		expect(fetchCount()).toBe(1);
+		expect(latestText(compacted[0])).toBe(firstBytes);
+		expect(hintCount(compacted[1])).toBe(0);
+	});
+
+	it("re-latches when an ordinary request drops the carrier", async () => {
+		const { execImpl, fetchCount } = makeExecSpy([
+			spannedPackBody("pack one", []),
+			spannedPackBody("pack two", []),
+		]);
+		const { injector } = makeInjector(execImpl, { toolsMode: "mcp" });
+		await injector.inject([userMsg("first", 1_000)]);
+
+		const windowed = [userMsg("second", 2_000)];
+		await injector.inject(windowed);
+		expect(fetchCount()).toBe(2); // ordinary windowing does not arm the compaction skip
+		const text = latestText(windowed[0]);
+		expect(text.startsWith(`second${HINT_BLOCK}`)).toBe(true);
+		expect(hintCount(windowed[0])).toBe(1);
+		expect(text).toContain("pack two");
+	});
+
+	it("re-keys the latch on session_start even for the same session id", async () => {
+		const { execImpl } = makeExecSpy([
+			spannedPackBody("pack one", []),
+			spannedPackBody("pack two", []),
+			spannedPackBody("pack three", []),
+		]);
+		const { injector } = makeInjector(execImpl, { toolsMode: "mcp" });
+		await injector.inject([userMsg("first", 1_000)]);
+
+		const secondTurn = turn();
+		await injector.inject(secondTurn);
+		expect(hintCount(secondTurn[0])).toBe(1);
+		expect(hintCount(secondTurn[1])).toBe(0);
+
+		injector.rekey("sess-inject-test"); // reload/resume: same id, fresh latch
+		const reloaded = turn();
+		await injector.inject(reloaded);
+		expect(hintCount(reloaded[0])).toBe(0);
+		expect(hintCount(reloaded[1])).toBe(1);
+	});
+
+	it("attaches nothing when the request copy has no user message", async () => {
+		const { execImpl, fetchCount } = makeExecSpy([]);
+		const { injector } = makeInjector(execImpl, { toolsMode: "mcp" });
+		const messages = [{ role: "assistant", content: "hello" }];
+		await injector.inject(messages);
+		expect(fetchCount()).toBe(0);
+		expect(latestText(messages[0])).toBe("hello");
+	});
+
+	it("attaches under both mcp exposures and never in native mode", async () => {
+		for (const toolExposure of ["hybrid", "codemode"] as const) {
+			const { execImpl } = makeExecSpy([spannedPackBody("", [])]);
+			const { injector } = makeInjector(execImpl, { toolsMode: "mcp", toolExposure });
+			const messages = [userMsg(`q-${toolExposure}`, 1_000)];
+			await injector.inject(messages);
+			expect(latestText(messages[0]), toolExposure).toBe(`q-${toolExposure}${HINT_BLOCK}`);
+		}
+
+		const { execImpl } = makeExecSpy([spannedPackBody("", [])]);
+		const { injector } = makeInjector(execImpl);
+		const nativeMessages = [userMsg("first", 1_000)];
+		await injector.inject(nativeMessages);
+		expect(latestText(nativeMessages[0])).toBe("first");
 	});
 });

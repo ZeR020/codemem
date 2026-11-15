@@ -57,6 +57,9 @@ type InjectUser = {
 };
 
 const INJECT_NOTHING: InjectDecision = { block: "", fingerprints: [] };
+export const MCP_DISCOVERY_HINT =
+	'codemem: discover memory tools via codemode searchTools("<query>", {namespace: "mcp__codemem"})';
+const HEADER_TOKENS = estimateTokens(CODEMEM_MEMORIES_HEADER);
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return value != null && typeof value === "object" && !Array.isArray(value);
@@ -189,6 +192,18 @@ function collectUsers(
 		});
 }
 
+function attachDiscoveryHint(
+	users: InjectUser[],
+	hintKey: string | null,
+	toolsMode: PiExtensionConfig["toolsMode"],
+): string | null {
+	if (toolsMode !== "mcp") return null;
+	const carrier = users.find((user) => user.key === hintKey) ?? users[users.length - 1];
+	if (!carrier) return null;
+	appendBlockToMessage(carrier.message, MCP_DISCOVERY_HINT);
+	return carrier.key;
+}
+
 /** Compaction: drop cache entries whose user messages are no longer present. */
 function dropDecisionsForAbsentMessages(
 	decisions: Map<string, InjectDecision>,
@@ -265,7 +280,11 @@ async function fetchDecision(
 	}
 }
 
-export function createPiInjector(options: {
+export function createPiInjector({
+	client,
+	config,
+	discriminator,
+}: {
 	client: PiCodememClient;
 	config: PiExtensionConfig;
 	/**
@@ -274,15 +293,14 @@ export function createPiInjector(options: {
 	 */
 	discriminator: (message: PiContextMessage) => string | number;
 }): PiInjector {
-	const { client, config, discriminator } = options;
 	/** Decision key (stableMessageEntryId) → frozen decision. */
 	const decisions = new Map<string, InjectDecision>();
 	let compactionPending = false;
 	let sessionId: string | null = null;
+	let hintKey: string | null = null;
 	const retainedTokenBudget = resolveRetainedTokenBudget(
 		process.env.CODEMEM_INJECT_RETAINED_TOKEN_BUDGET,
 	);
-	const headerTokens = estimateTokens(CODEMEM_MEMORIES_HEADER);
 
 	async function inject(messages: PiContextMessage[], signal?: AbortSignal): Promise<void> {
 		if (!sessionId) return;
@@ -292,6 +310,9 @@ export function createPiInjector(options: {
 		const users = collectUsers(messages, sessionId, discriminator);
 		if (oneShotCompaction) dropDecisionsForAbsentMessages(decisions, users);
 		if (!users.length) return;
+
+		// Keep discovery independent of pack failures, memory budgets, and the compaction fetch skip.
+		hintKey = attachDiscoveryHint(users, hintKey, config.toolsMode);
 
 		const attached = new Set<PiContextMessage>();
 		const retained = new Set<string>();
@@ -308,7 +329,7 @@ export function createPiInjector(options: {
 		if (!latest) return;
 		if (decisions.has(latest.key)) return;
 
-		const budget = packRequestBudget(config, retainedTokenBudget, headerTokens, retainedTokens);
+		const budget = packRequestBudget(config, retainedTokenBudget, HEADER_TOKENS, retainedTokens);
 		if (!budget) return;
 
 		const decision = await fetchDecision(
@@ -335,6 +356,7 @@ export function createPiInjector(options: {
 		rekey(nextSessionId: string) {
 			sessionId = nextSessionId;
 			decisions.clear();
+			hintKey = null;
 			compactionPending = false;
 		},
 	};

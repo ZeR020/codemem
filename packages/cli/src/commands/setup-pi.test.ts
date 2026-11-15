@@ -598,6 +598,20 @@ describe("installPi — explicit tools mode is preserved", () => {
 		expect(readJson(configPath).pi).toEqual({ tools_mode: expected, toolsMode: "native" });
 		expect(existsSync(join(piHome, "mcp.json"))).toBe(false);
 	});
+
+	it("writes no tool exposure value and preserves an explicit one", () => {
+		writeJson(join(piHome, "settings.json"), { packages: [] });
+		writeJson(configPath, { pi: { tool_exposure: "codemode" } });
+
+		expect(installPi({ force: false })).toBe(true);
+		expect(installPi({ force: false })).toBe(true);
+
+		const pi = readJson(configPath).pi as Record<string, unknown>;
+		expect(pi.tool_exposure).toBe("codemode");
+		expect(pi).not.toHaveProperty("toolExposure");
+		expect(pi.tools_mode).toBe("mcp");
+		expect(existsSync(join(piHome, "mcp.json"))).toBe(false);
+	});
 });
 
 describe("installPi — parse failure abort", () => {
