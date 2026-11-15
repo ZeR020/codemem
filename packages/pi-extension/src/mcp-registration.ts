@@ -2,9 +2,17 @@
 
 import { resolve } from "node:path";
 import type { ExtensionAPI, McpServerConfig } from "@earendil-works/pi-coding-agent";
+import type { PiToolExposure } from "./config.js";
 import { resolveViewerDbPath } from "./viewer.js";
 
 const SERVER_NAME = "codemem";
+
+// Pi matches server-offered names here, not its namespaced model declarations.
+const HYBRID_TOOL_EXPOSURE = {
+	memory_remember: "direct",
+	memory_search: "direct",
+	memory_session_search: "direct",
+} as const;
 
 /** Env the codemem child derives its config and identity target from. */
 const TARGET_ENV_KEYS = [
@@ -35,6 +43,7 @@ export function escapeMcpEnvValue(value: string): string {
 export function codememMcpServerConfig(
 	target: McpTarget,
 	env: NodeJS.ProcessEnv = process.env,
+	toolExposure: PiToolExposure = "hybrid",
 ): McpServerConfig {
 	const childEnv: Record<string, string> = {};
 	const project = target.project;
@@ -48,6 +57,7 @@ export function codememMcpServerConfig(
 		cwd: resolve(target.cwd),
 		env: childEnv,
 		exposure: "codemode",
+		...(toolExposure === "hybrid" ? { toolExposure: { ...HYBRID_TOOL_EXPOSURE } } : {}),
 	};
 }
 
@@ -57,6 +67,7 @@ export type CodememMcpRegistrar = (target: McpTarget) => string | null;
 export function createCodememMcpRegistrar(
 	pi: ExtensionAPI,
 	env: NodeJS.ProcessEnv = process.env,
+	toolExposure: PiToolExposure = "hybrid",
 ): CodememMcpRegistrar {
 	let registeredConfig: string | null = null;
 	return (target) => {
@@ -64,7 +75,7 @@ export function createCodememMcpRegistrar(
 			return 'codemem: pi.tools_mode is "mcp", but this Pi host has no MCP registration API. Update Pi (1.1.0 or newer) or set pi.tools_mode to "native" explicitly; no direct tools were registered.';
 		}
 		try {
-			const config = codememMcpServerConfig(target, env);
+			const config = codememMcpServerConfig(target, env, toolExposure);
 			const signature = JSON.stringify(config);
 			if (signature === registeredConfig) return null;
 			pi.registerMcpServer(SERVER_NAME, config);

@@ -24,7 +24,7 @@ codemem is persistent coding memory across sessions, machines, and teammates for
 - **Automatic injection for OpenCode 1 and 2** — the plugin injects context into every prompt, no manual steps; the OpenCode 2 integration is beta
 - **Claude Code plugin support** — install from the codemem marketplace source
 - **Multi-agent** — OpenCode, Claude Code, Codex, and pi share one project-scoped store
-- **Pi coding agent** — session capture, automatic recall, and 15 memory tools through Pi's built-in MCP and codemode by default; explicit native tools remain available
+- **Pi coding agent** — session capture, automatic recall, and 15 memory tools through Pi's built-in MCP by default (3 direct, 12 codemode-discoverable); explicit native tools remain available
 - **Built-in viewer** — browse memories, sessions, and observer output in a local web UI
 - **Remote MCP access** — advanced single-user self-hosting can expose an OAuth-protected Streamable HTTP MCP endpoint to configured remote clients; keep the localhost viewer private ([guide](docs/remote-mcp-oauth.md))
 
@@ -269,9 +269,11 @@ codemem stats
 codemem db raw-events-status
 ```
 
-The extension captures Pi activity, recalls into the latest user message of the request copy, attaches context after a successful built-in `read`, and delivers all 15 `memory_*` tools through Pi's built-in MCP with codemode exposure by default. This includes `memory_session_search` over stored Pi user/assistant conversation text, scoped to the current project unless explicitly overridden. No `mcp.json` is needed. Observer setup can fill unset settings from Pi API-key providers only. Pi OAuth-only credentials cannot be auto-derived for the observer; configure an observer connection separately ([observer auth](docs/user-guide.md#observer-auth-configuration)).
+The extension captures Pi activity, recalls into the latest user message of the request copy, attaches context after a successful built-in `read`, and delivers all 15 `memory_*` tools through Pi's built-in MCP. By default, Pi directly declares `memory_remember`, `memory_search`, and `memory_session_search`; the other 12 are discovered through codemode. Session search covers stored Pi user/assistant conversation text, scoped to the current project unless explicitly overridden. No `mcp.json` is needed. Observer setup can fill unset settings from Pi API-key providers only. Pi OAuth-only credentials cannot be auto-derived for the observer; configure an observer connection separately ([observer auth](docs/user-guide.md#observer-auth-configuration)).
 
 Fresh setup writes `pi.tools_mode: "mcp"`; an absent or empty mode also selects `mcp`. Existing setups pinned to `native` stay native: setup does not migrate explicit choices, and stored legacy `mcp-adapter` values resolve to `mcp` with a removal notice. To switch, set `"pi": { "tools_mode": "mcp" }` in codemem config and reload Pi; set `"native"` to roll back to 15 direct tools. See [MCP default and precedence](docs/plugin-reference.md#mcp-default-and-precedence).
+
+Within `mcp` mode, `pi.tool_exposure: "codemode"` (or `CODEMEM_PI_TOOL_EXPOSURE=codemode`) opts out of the three direct declarations; the default is `hybrid`. Hybrid makes the first prompt wait for the MCP connection, up to Pi's 10-second startup wait. One static request-copy hint teaches codemode discovery even when recall finds no memories; `CODEMEM_PI_INJECT_PROMPTS=0` disables both prompt recall and this hint.
 
 Pre-install Pi session history is not imported automatically. Backfill it with `codemem pi-import-sessions`, then search stored user/assistant text with `codemem pi-session-search <query>`.
 
@@ -429,7 +431,7 @@ codemem setup --opencode-only
 
 This updates your OpenCode config to install the plugin and register the MCP server. Restart OpenCode to activate.
 
-Pi uses this same MCP server through its extension-managed default, with codemode exposure; explicit `native` keeps direct tools. `memory_session_search` searches stored Pi user/assistant transcript text (not memories, metadata, or tool payloads) with the same query bounds as the CLI and viewer route. This raw-transcript search is distinct from visibility-filtered memory retrieval. See [Pi extension](docs/plugin-reference.md#pi-extension).
+Pi uses this same MCP server through its extension-managed default: three tools declared directly, twelve codemode-discoverable; explicit `native` keeps 15 direct extension tools. `memory_session_search` searches stored Pi user/assistant transcript text (not memories, metadata, or tool payloads) with the same query bounds as the CLI and viewer route. This raw-transcript search is distinct from visibility-filtered memory retrieval. See [Pi extension](docs/plugin-reference.md#pi-extension).
 
 The standalone `codemem-mcp-ts` binary runs the same stdio server used by `codemem mcp`. Viewer autostart is on by default for both invocation paths; set `CODEMEM_VIEWER=0` or `CODEMEM_VIEWER_AUTO=0` to disable. MCP autostart and the `serve start`/`stop`/`restart` lifecycle identify a running viewer through `GET /api/health` (service discriminator `codemem-viewer`), with one bounded `GET /api/stats` compatibility probe when an older viewer returns `404`.
 

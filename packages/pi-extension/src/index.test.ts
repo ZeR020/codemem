@@ -12,6 +12,7 @@ import codememPiExtension, {
 	formatPiInjectionBlock,
 	stableMessageEntryId,
 } from "./index.js";
+import { MCP_DISCOVERY_HINT } from "./inject.js";
 import { buildViewerIdentityTarget, resolveViewerDbPath } from "./viewer.js";
 
 // Viewer startup bypasses __setTestExecImpl and calls spawn directly.
@@ -102,6 +103,26 @@ function matchingProfile(cwd: string) {
 		identity_target: buildViewerIdentityTarget(process.env, cwd),
 	});
 }
+/** Exact bytes the injector appends for the discovery hint. */
+const HINT_BLOCK = `\n\n${MCP_DISCOVERY_HINT}`;
+
+/** Viewer/pack/raw-events responses for a proven target with one pack item. */
+function servingPackFetch(cwd: string, packText: string) {
+	return vi.fn(async (input: RequestInfo | URL) => {
+		const url = String(input);
+		if (url.includes("/api/prompt-pack-profile")) return matchingProfile(cwd);
+		if (url.includes("/api/pack")) {
+			return jsonOk({
+				pack_text: packText,
+				items: [1],
+				metrics: { total_items: 1, pack_tokens: 10 },
+			});
+		}
+		if (url.includes("/api/raw-events/status")) return jsonOk({ ingest: { available: true } });
+		return { ok: false, status: 404, json: async () => ({}), text: async () => "" };
+	});
+}
+
 describe("extension factory lifecycle", () => {
 	beforeEach(() => {
 		vi.stubEnv("CODEMEM_VIEWER_AUTO", "0");
@@ -713,7 +734,7 @@ describe("tool_call identity", () => {
 describe("injection (context)", () => {
 	afterEach(resetPiExtensionTest);
 
-	it("appends the pack to the latest user message on the context copy and returns undefined", async () => {
+	it("appends the pack and discovery hint to the latest user message on the context copy", async () => {
 		vi.stubEnv("CODEMEM_PI_INJECT_PROMPTS", "1");
 		const packText = "• past decision about auth";
 		const cwd = "/tmp/codemem-pi-test";
@@ -757,6 +778,7 @@ describe("injection (context)", () => {
 		expect(messages[0]?.content).toContain("how does auth work?");
 		expect(messages[0]?.content).toContain("## codemem memories");
 		expect(messages[0]?.content).toContain(packText);
+		expect(messages[0]?.content).toContain(MCP_DISCOVERY_HINT);
 	});
 	it("injectPrompts off attaches nothing and the handler returns undefined", async () => {
 		vi.stubEnv("CODEMEM_PI_INJECT_PROMPTS", "0");
@@ -785,10 +807,11 @@ describe("injection (context)", () => {
 
 		expect(result).toBeUndefined();
 		expect(messages[0]?.content).toBe("hello");
+		expect(messages[0]?.content).not.toContain("searchTools");
 		expect(packCalls).toBe(0);
 	});
 
-	it("returns undefined (no mutation) when pack empty / fetch fails", async () => {
+	it("empty pack / failed retrieval still carries only the discovery hint", async () => {
 		vi.stubGlobal(
 			"fetch",
 			vi.fn(async () => {
@@ -807,13 +830,61 @@ describe("injection (context)", () => {
 		const messages = [{ role: "user", content: "hello", timestamp: 1_700_000_000_003 }];
 		const result = await handlers.get("context")?.[0]?.({ type: "context", messages }, ctx);
 		expect(result).toBeUndefined();
-		expect(messages[0]?.content).toBe("hello");
+		expect(messages[0]?.content).toBe(`hello${HINT_BLOCK}`);
 	});
 
 	it("formatPiInjectionBlock never produces a persistent message shape", () => {
 		const block = formatPiInjectionBlock("x", 1000);
 		expect(block).not.toMatch(/"customType"/);
 		expect(typeof block).toBe("string");
+	});
+});
+
+describe("injection mcp hint replay", () => {
+	afterEach(resetPiExtensionTest);
+
+	it("replays identical request-copy bytes and appends no session entry", async () => {
+		vi.stubEnv("CODEMEM_PI_INJECT_PROMPTS", "1");
+		const cwd = "/tmp/codemem-pi-test";
+		vi.stubGlobal("fetch", servingPackFetch(cwd, "pack-marker"));
+
+		const { pi, handlers, appended } = createMockPi();
+		codememPiExtension(pi as never);
+		const ctx = createMockCtx();
+		await handlers.get("session_start")?.[0]?.({ type: "session_start", reason: "startup" }, ctx);
+		const appendedAtStart = appended.length;
+
+		const first = [{ role: "user", content: "hello", timestamp: 1_700_000_000_010 }];
+		await handlers.get("context")?.[0]?.({ type: "context", messages: first }, ctx);
+		const firstBytes = String(first[0]?.content);
+		const second = [{ role: "user", content: "hello", timestamp: 1_700_000_000_010 }];
+		await handlers.get("context")?.[0]?.({ type: "context", messages: second }, ctx);
+
+		expect(String(second[0]?.content)).toBe(firstBytes);
+		expect(firstBytes.split(MCP_DISCOVERY_HINT)).toHaveLength(2); // exactly one hint line
+		expect(appended.length).toBe(appendedAtStart); // injection persists nothing
+	});
+
+	it("adds no hint in native mode", async () => {
+		vi.stubEnv("CODEMEM_PI_TOOLS_MODE", "native");
+		vi.stubEnv("CODEMEM_PI_INJECT_PROMPTS", "1");
+		const packText = "native pack";
+		const cwd = "/tmp/codemem-pi-test";
+		vi.stubGlobal("fetch", servingPackFetch(cwd, packText));
+
+		const { pi, handlers } = createMockPi();
+		codememPiExtension(pi as never);
+		const ctx = createMockCtx();
+		await handlers.get("session_start")?.[0]?.({ type: "session_start", reason: "startup" }, ctx);
+
+		const messages = [{ role: "user", content: "native question", timestamp: 1_700_000_000_011 }];
+		await handlers.get("context")?.[0]?.({ type: "context", messages }, ctx);
+
+		const cfg = defaultPiExtensionConfig();
+		expect(messages[0]?.content).toBe(
+			`native question\n\n${formatPiInjectionBlock(packText, cfg.injectMaxChars)}`,
+		);
+		expect(messages[0]?.content).not.toContain("searchTools");
 	});
 });
 
@@ -896,7 +967,7 @@ describe("injection hostile framing", () => {
 
 		const cfg = defaultPiExtensionConfig();
 		expect(messages[0]?.content).toBe(
-			`recall memory\n\n${formatPiInjectionBlock(hostile, cfg.injectMaxChars)}`,
+			`recall memory${HINT_BLOCK}\n\n${formatPiInjectionBlock(hostile, cfg.injectMaxChars)}`,
 		);
 	});
 });

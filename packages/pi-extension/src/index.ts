@@ -565,7 +565,7 @@ export default function codememPiExtension(pi: ExtensionAPI): void {
 		onSessionStart(state, client, config, injector, pi, event, ctx),
 	);
 	if (config.toolsMode === "mcp") {
-		const mcpRegistrar = createCodememMcpRegistrar(pi);
+		const mcpRegistrar = createCodememMcpRegistrar(pi, process.env, config.toolExposure);
 		pi.on("session_start", (_event, ctx) => onSessionStartMcp(mcpRegistrar, ctx));
 	}
 	pi.on("session_shutdown", (event, ctx) =>

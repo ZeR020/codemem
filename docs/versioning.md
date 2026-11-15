@@ -227,7 +227,8 @@ must upgrade before installing. `pi update` replaces the Pi host;
 `pi update --extensions` only reconciles installed packages. A Nix installation
 cannot update itself with `pi update`; use the official installer flow or
 `nix profile upgrade pi`. Absent/empty tool mode and fresh setup now select
-Pi's built-in MCP with codemode exposure for all 15 `memory_*` tools. No
+Pi's built-in MCP with hybrid exposure: `memory_remember`, `memory_search`, and
+`memory_session_search` are declared directly; the other 12 tools are codemode-discoverable. No
 setup-managed MCP file is needed. The legacy `mcp-adapter` tools mode is
 removed: only `native` and `mcp` remain, stored legacy values resolve to `mcp`
 with a removal notice, and third-party `pi-mcp-adapter` users should remove
@@ -235,6 +236,10 @@ that adapter (it disables the built-in MCP `mcp` mode requires) or choose
 `native`. Older setup-pinned `native` users stay native. Set `pi.tools_mode`
 to `"mcp"` to switch, or `"native"` to roll back, then reload Pi.
 Stored memories require no migration; manual MCP configuration remains user-owned.
+`pi.tool_exposure` / `CODEMEM_PI_TOOL_EXPOSURE` can select `codemode` to opt out
+of direct declarations; native mode is unaffected. Hybrid makes the first prompt
+wait for the MCP connection (Pi's 10-second startup wait). Both MCP variants carry
+one request-copy discovery hint, gated by prompt injection, never persisted.
 See [MCP migration and precedence](plugin-reference.md#mcp-default-and-precedence).
 
 ## Transition notes

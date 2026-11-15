@@ -1,7 +1,7 @@
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { defaultPiExtensionConfig, loadPiExtensionConfig } from "./config.js";
 
 describe("loadPiExtensionConfig", () => {
@@ -164,5 +164,75 @@ describe("legacy adapter tools-mode migration", () => {
 			writeMode(value);
 			expect(notice(), String(value)).toBeNull();
 		}
+	});
+});
+
+describe("tool exposure knob", () => {
+	const prev = { ...process.env };
+	let path = "";
+
+	beforeEach(() => {
+		path = join(mkdtempSync(join(tmpdir(), "codemem-pi-exposure-")), "config.json");
+		process.env.CODEMEM_CONFIG = path;
+		delete process.env.CODEMEM_PI_TOOL_EXPOSURE;
+	});
+
+	afterEach(() => {
+		for (const key of Object.keys(process.env)) {
+			if (!(key in prev)) delete process.env[key];
+		}
+		for (const [key, value] of Object.entries(prev)) {
+			if (value === undefined) delete process.env[key];
+			else process.env[key] = value;
+		}
+	});
+
+	/** Write a pi block; undefined env leaves the environment variable unset. */
+	const resolve = (pi: Record<string, unknown>, envValue?: string) => {
+		writeFileSync(path, JSON.stringify({ pi }));
+		if (envValue === undefined) delete process.env.CODEMEM_PI_TOOL_EXPOSURE;
+		else process.env.CODEMEM_PI_TOOL_EXPOSURE = envValue;
+		return loadPiExtensionConfig(process.env);
+	};
+
+	it.each([
+		["absent", {}, "hybrid"],
+		["blank snake", { tool_exposure: "" }, "hybrid"],
+		["blank camel", { toolExposure: "   " }, "hybrid"],
+		["nullish snake", { tool_exposure: null }, "hybrid"],
+		["blank snake over camel", { tool_exposure: "", toolExposure: "codemode" }, "hybrid"],
+		["nullish snake then camel", { tool_exposure: null, toolExposure: "codemode" }, "codemode"],
+		["camel only", { toolExposure: " HYBRID " }, "hybrid"],
+		["trimmed codemode", { tool_exposure: " CODEMODE " }, "codemode"],
+		["unknown", { tool_exposure: "bogus" }, "codemode"],
+		["invalid number", { tool_exposure: 5 }, "codemode"],
+	] as const)("resolves a %s file value to %s", (label, pi, expected) => {
+		const cfg = resolve(pi);
+		expect(cfg.toolExposure, label).toBe(expected);
+		// Unknown exposure values never carry an actionable notice.
+		expect(cfg.toolsModeNotice, label).toBeNull();
+	});
+
+	it.each([
+		["hybrid", "codemode", "codemode"],
+		["codemode", "hybrid", "hybrid"],
+		["hybrid", " CODEMODE ", "codemode"],
+		["hybrid", "bogus", "hybrid"],
+		["", "bogus", "hybrid"],
+		["bogus", "codemode", "codemode"],
+	] as const)(
+		"file %s with env %s resolves %s (recognized env wins, unknown env falls through)",
+		(fileValue, envValue, expected) => {
+			const cfg = resolve({ tool_exposure: fileValue }, envValue);
+			expect(cfg.toolExposure).toBe(expected);
+			expect(cfg.toolsModeNotice).toBeNull();
+		},
+	);
+
+	it("resolves the knob in native mode without changing the tools mode", () => {
+		const cfg = resolve({ tools_mode: "native", tool_exposure: "codemode" });
+		expect(cfg.toolsMode).toBe("native");
+		expect(cfg.toolExposure).toBe("codemode");
+		expect(defaultPiExtensionConfig().toolExposure).toBe("hybrid");
 	});
 });

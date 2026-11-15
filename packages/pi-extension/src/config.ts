@@ -10,10 +10,14 @@ import { join } from "node:path";
 
 export type PiToolsMode = "native" | "mcp";
 
+export type PiToolExposure = "hybrid" | "codemode";
+
 export type PiExtensionConfig = {
 	toolsMode: PiToolsMode;
 	/** Non-null when a stored legacy adapter value mapped to "mcp"; delivered at session start. */
 	toolsModeNotice: string | null;
+	/** mcp mode only: `hybrid` declares three tools directly, `codemode` declares none. */
+	toolExposure: PiToolExposure;
 	injectPrompts: boolean;
 	fileContext: boolean;
 	viewerHost: string;
@@ -31,6 +35,7 @@ export type PiExtensionConfig = {
 const DEFAULTS: PiExtensionConfig = {
 	toolsMode: "mcp",
 	toolsModeNotice: null,
+	toolExposure: "hybrid",
 	injectPrompts: true,
 	fileContext: true,
 	viewerHost: "127.0.0.1",
@@ -183,6 +188,18 @@ function resolveToolsMode(
 	return { mode: "native", notice: null };
 }
 
+// Match tools_mode: only recognized environment overrides displace the file value.
+function resolveToolExposure(fileValue: unknown, envValue: string | undefined): PiToolExposure {
+	const env = envValue?.trim().toLowerCase();
+	if (env === "hybrid" || env === "codemode") return env;
+	const file = typeof fileValue === "string" ? fileValue.trim().toLowerCase() : "";
+	if (file === "hybrid" || file === "codemode") return file;
+	// Absent/blank keeps hybrid; unknown or invalid values keep the pre-hybrid codemode exposure.
+	const unset = fileValue == null || (typeof fileValue === "string" && file === "");
+	if (unset) return DEFAULTS.toolExposure;
+	return "codemode";
+}
+
 function resolveBool(
 	envValue: string | undefined,
 	fileValue: unknown,
@@ -212,10 +229,15 @@ export function loadPiExtensionConfig(env: NodeJS.ProcessEnv = process.env): PiE
 		piBlock.tools_mode ?? piBlock.toolsMode,
 		env.CODEMEM_PI_TOOLS_MODE,
 	);
+	const toolExposure = resolveToolExposure(
+		piBlock.tool_exposure ?? piBlock.toolExposure,
+		env.CODEMEM_PI_TOOL_EXPOSURE,
+	);
 
 	return {
 		toolsMode,
 		toolsModeNotice,
+		toolExposure,
 		injectPrompts: resolveBool(
 			env.CODEMEM_PI_INJECT_PROMPTS ?? env.CODEMEM_INJECT_CONTEXT,
 			piBlock.inject_prompts ?? piBlock.injectPrompts,

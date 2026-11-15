@@ -164,6 +164,16 @@ async function waitFor(
 	throw new Error(`timed out waiting for ${description}`);
 }
 
+/** Emit a real request-time context event; returns the copy's first message content. */
+async function contextCopy(session: Session, content: string): Promise<string> {
+	const messages: Array<{ role: "user"; content: string; timestamp: number }> = [
+		{ role: "user", content, timestamp: 1_700_000_000_001 },
+	];
+	const copy = await session.extensionRunner.emitContext(messages);
+	const first = copy[0] as { content?: unknown } | undefined;
+	return typeof first?.content === "string" ? first.content : "";
+}
+
 function directMemoryTools(session: Session): string[] {
 	return session
 		.getAllTools()
@@ -257,6 +267,8 @@ describe("pi package-entry removal", () => {
 				() => cliCalls(fixture.cliLog).some((call) => call.startsWith("pi-hook-ingest")),
 				"session_start ingest",
 			);
+			// A real context event proves the extension attaches the mcp hint before removal.
+			expect(await contextCopy(installed.session, "installed hint probe")).toContain("searchTools");
 		} finally {
 			await shutdown(installed.session);
 		}
@@ -287,6 +299,8 @@ describe("pi package-entry removal", () => {
 			).toBe(false);
 			expect(directMemoryTools(restarted.session)).toEqual([]);
 			expect(JSON.stringify(restarted.errors)).not.toContain(REGISTER_DIAGNOSTIC);
+			// Removal drops the hint and injection with the registration; the copy passes through.
+			expect(await contextCopy(restarted.session, "removed hint probe")).toBe("removed hint probe");
 			expect(cliCalls(fixture.cliLog).length).toBe(callsBeforeRestart); // no ingest after removal
 			expect(readFileSync(fixture.mcpJsonPath, "utf8")).toBe(manualBytes);
 			const reopened = new MemoryStore(fixture.dbPath);
